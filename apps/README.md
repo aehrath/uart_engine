@@ -107,6 +107,13 @@ status field, toggle, progress indicator, and log surface uses the shared
 rounded geometry and alignment rules. Native windows request high-DPI backing
 surfaces and rasterize their fonts at physical display resolution.
 
+The native dashboards share their command and size presets, font management,
+dropdown, bounded log, palette, panels, buttons, toggles, status fields, and
+clipboard-aware entry implementation through the `apps/common/dashboard_*`
+components. The Python client mirrors those same responsibilities in
+`python/dashboard_*` modules so visual and behavioral changes have an obvious
+counterpart instead of accumulating in one application file.
+
 The **Ring** selector changes the active circular receive capacity from 256 B
 through 64 KiB. The independent **DMA** selector changes a receive transaction
 from 32 B through 4 KiB. Native logs retain 256 lines; use the mouse wheel over

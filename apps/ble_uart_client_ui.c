@@ -1,9 +1,10 @@
 /** @file
  * @brief Portable raylib/raygui BLE HCI UART client application. */
 #include "raylib.h"
-#include "dashboard_font.h"
+#include "dashboard_config.h"
 #include "dashboard_dropdown.h"
 #include "dashboard_log.h"
+#include "dashboard_ui.h"
 #include "h4_wire.h"
 #include "serial_port.h"
 #include "test_transfer_protocol.h"
@@ -23,164 +24,6 @@
 #define CONNECTION_PROBE_SIZE 128U
 #define CONNECTION_PROBE_TIMEOUT_SECONDS 2.5
 
-static Font uiFont;
-static AppDashboardFontSet_t dashboardFonts;
-
-static const Color COLOR_CANVAS = {10, 15, 28, 255};
-static const Color COLOR_PANEL = {20, 28, 46, 255};
-static const Color COLOR_PANEL_RAISED = {27, 37, 59, 255};
-static const Color COLOR_BORDER = {49, 65, 92, 255};
-static const Color COLOR_TEXT = {232, 239, 249, 255};
-static const Color COLOR_MUTED = {143, 158, 181, 255};
-static const Color COLOR_CYAN = {45, 212, 191, 255};
-static const Color COLOR_BLUE = {76, 148, 255, 255};
-static const Color COLOR_PURPLE = {167, 139, 250, 255};
-
-/** Load the bundled sans-serif UI font and configure raygui to use it. */
-static void loadUiFont(void) {
-    const char *path = TextFormat("%s%s", GetApplicationDirectory(),
-                                  UART_DMA_UI_FONT_FILE);
-    const char *displayPath = TextFormat("%s%s", GetApplicationDirectory(),
-                                         UART_DMA_UI_DISPLAY_FONT_FILE);
-    AppDashboardFont_Load(&dashboardFonts, path, displayPath);
-    uiFont = AppDashboardFont_Regular(&dashboardFonts, 15);
-    GuiSetFont(uiFont);
-    GuiSetStyle(DEFAULT, TEXT_SIZE, AppDashboardFont_RenderSize(15));
-    GuiSetStyle(DEFAULT, BORDER_WIDTH, 1);
-    GuiSetStyle(DEFAULT, TEXT_PADDING, 10);
-    GuiSetStyle(DEFAULT, BORDER_COLOR_NORMAL, ColorToInt(COLOR_BORDER));
-    GuiSetStyle(DEFAULT, BASE_COLOR_NORMAL, ColorToInt(COLOR_PANEL_RAISED));
-    GuiSetStyle(DEFAULT, TEXT_COLOR_NORMAL, ColorToInt(COLOR_TEXT));
-    GuiSetStyle(DEFAULT, BORDER_COLOR_FOCUSED, ColorToInt(COLOR_CYAN));
-    GuiSetStyle(DEFAULT, BASE_COLOR_FOCUSED, ColorToInt((Color){35, 50, 76, 255}));
-    GuiSetStyle(DEFAULT, TEXT_COLOR_FOCUSED, ColorToInt(WHITE));
-    GuiSetStyle(DEFAULT, BORDER_COLOR_PRESSED, ColorToInt(COLOR_BLUE));
-    GuiSetStyle(DEFAULT, BASE_COLOR_PRESSED, ColorToInt((Color){42, 63, 96, 255}));
-    GuiSetStyle(DEFAULT, TEXT_COLOR_PRESSED, ColorToInt(WHITE));
-    GuiSetStyle(DEFAULT, BORDER_COLOR_DISABLED, ColorToInt((Color){43, 52, 70, 255}));
-    GuiSetStyle(DEFAULT, BASE_COLOR_DISABLED, ColorToInt((Color){24, 30, 43, 255}));
-    GuiSetStyle(DEFAULT, TEXT_COLOR_DISABLED, ColorToInt((Color){91, 104, 124, 255}));
-    GuiSetStyle(DROPDOWNBOX, BASE_COLOR_NORMAL, ColorToInt((Color){14, 22, 38, 255}));
-    GuiSetStyle(DROPDOWNBOX, TEXT_COLOR_NORMAL, ColorToInt((Color){241, 246, 255, 255}));
-    GuiSetStyle(DROPDOWNBOX, BASE_COLOR_FOCUSED, ColorToInt((Color){103, 232, 249, 255}));
-    GuiSetStyle(DROPDOWNBOX, TEXT_COLOR_FOCUSED, ColorToInt((Color){7, 22, 28, 255}));
-    GuiSetStyle(DROPDOWNBOX, BASE_COLOR_PRESSED, ColorToInt(COLOR_BLUE));
-    GuiSetStyle(DROPDOWNBOX, TEXT_COLOR_PRESSED, ColorToInt(WHITE));
-    GuiSetStyle(TEXTBOX, BORDER_WIDTH, 0);
-    GuiSetStyle(TEXTBOX, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
-    GuiSetStyle(TEXTBOX, TEXT_PADDING, 10);
-    GuiSetStyle(TEXTBOX, BASE_COLOR_NORMAL, ColorToInt(BLANK));
-    GuiSetStyle(TEXTBOX, BASE_COLOR_FOCUSED, ColorToInt(BLANK));
-    GuiSetStyle(TEXTBOX, BASE_COLOR_PRESSED, ColorToInt(BLANK));
-    GuiSetStyle(STATUSBAR, BORDER_WIDTH, 0);
-    GuiSetStyle(STATUSBAR, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
-    GuiSetStyle(STATUSBAR, TEXT_PADDING, 10);
-    GuiSetStyle(STATUSBAR, BASE_COLOR_NORMAL, ColorToInt(BLANK));
-
-}
-
-/** Draw antialiased text using the shared UI typeface. */
-static void drawUiText(const char *text, int x, int y, int size, Color color) {
-    const Font font = AppDashboardFont_Regular(&dashboardFonts, size);
-    DrawTextEx(font, text, (Vector2){(float)x, (float)y},
-               (float)AppDashboardFont_RenderSize(size), 0.0f, color);
-}
-
-/** Draw title and metric text using the technical display face. */
-static void drawDisplayText(const char *text, int x, int y, int size, Color color) {
-    const Font font = AppDashboardFont_Bold(&dashboardFonts, size);
-    DrawTextEx(font, text, (Vector2){(float)x, (float)y},
-               (float)AppDashboardFont_RenderSize(size), 0.5f, color);
-}
-
-/** Draw one rounded dashboard panel with an optional section title. */
-static void drawPanel(Rectangle bounds, const char *title) {
-    DrawRectangleRounded(bounds, 0.08f, 10, COLOR_PANEL);
-    DrawRectangleRoundedLinesEx(bounds, 0.08f, 10, 1.0f, COLOR_BORDER);
-    if (title != NULL) {
-        drawDisplayText(title, (int)bounds.x + 20, (int)bounds.y + 15,
-                        14, COLOR_MUTED);
-    }
-}
-
-/** Draw one client telemetry card and report a completed click. */
-static bool drawMetricCard(Rectangle bounds, const char *label,
-                           const char *value, Color accent) {
-    const bool hovered = CheckCollisionPointRec(GetMousePosition(), bounds);
-    DrawRectangleRounded(bounds, 0.30f, 12, COLOR_PANEL_RAISED);
-    if (hovered) {
-        DrawRectangleRoundedLinesEx(bounds, 0.30f, 12, 1.0f, accent);
-    }
-    DrawRectangleRounded((Rectangle){bounds.x + 18.0f, bounds.y + 14.0f,
-                                     4.0f, 55.0f},
-                         1.0f, 8, accent);
-    drawDisplayText(label, (int)bounds.x + 34, (int)bounds.y + 14, 12, COLOR_MUTED);
-    drawDisplayText(value, (int)bounds.x + 34, (int)bounds.y + 42, 22, COLOR_TEXT);
-    return hovered && IsMouseButtonReleased(MOUSE_BUTTON_LEFT);
-}
-
-/** Draw a rounded high-contrast action button and report a completed click. */
-static bool brightButton(Rectangle bounds, const char *label, bool enabled) {
-    const bool hovered = enabled && CheckCollisionPointRec(GetMousePosition(), bounds);
-    const bool pressed = hovered && IsMouseButtonDown(MOUSE_BUTTON_LEFT);
-    const Color fill = !enabled ? (Color){39, 49, 67, 255}
-        : pressed ? (Color){34, 197, 181, 255}
-        : hovered ? (Color){103, 232, 249, 255}
-        : (Color){45, 212, 191, 255};
-    DrawRectangleRounded(bounds, 16.0f / bounds.height, 12, fill);
-    const int fontSize = AppDashboardFont_RenderSize(16);
-    const Font font = AppDashboardFont_Bold(&dashboardFonts, 16);
-    AppDashboardFont_DrawCentered(
-        font, label, bounds, (float)fontSize,
-        enabled ? (Color){7, 22, 28, 255} : (Color){94, 107, 127, 255});
-    return enabled && hovered && IsMouseButtonReleased(MOUSE_BUTTON_LEFT);
-}
-
-/** Draw the shared slightly-rounded field surface. */
-static void drawFieldSurface(Rectangle bounds, bool focused) {
-    DrawRectangleRounded(bounds, 16.0f / bounds.height, 12, COLOR_PANEL_RAISED);
-    DrawRectangleRoundedLinesEx(bounds, 16.0f / bounds.height, 12, 1.0f,
-                                focused ? COLOR_CYAN : COLOR_BORDER);
-}
-
-/** Draw one left-aligned, non-editable field. */
-static void drawStatusField(Rectangle bounds, const char *text) {
-    drawFieldSurface(bounds, false);
-    GuiStatusBar((Rectangle){bounds.x + 1.0f, bounds.y + 1.0f,
-                             bounds.width - 2.0f, bounds.height - 2.0f}, text);
-}
-
-/** Draw the shared rounded receive-mode toggle and report a state change. */
-static bool toggleControl(Rectangle bounds, const char *label,
-                          bool *value, bool enabled) {
-    const bool hovered = enabled && CheckCollisionPointRec(GetMousePosition(), bounds);
-    const Rectangle track = {bounds.x, bounds.y + 2.0f, 38.0f, 20.0f};
-    const Color trackColor = *value && enabled ? COLOR_CYAN
-        : hovered ? (Color){50, 72, 111, 255} : (Color){37, 52, 81, 255};
-    DrawRectangleRounded(track, 1.0f, 12, trackColor);
-    DrawCircle((int)(track.x + (*value ? 29.0f : 9.0f)),
-               (int)(track.y + 10.0f), 8.0f,
-               *value && enabled ? (Color){7, 22, 28, 255} : COLOR_MUTED);
-    drawUiText(label, (int)bounds.x + 46, (int)bounds.y + 2, 15,
-               enabled ? COLOR_TEXT : (Color){94, 107, 127, 255});
-    if (hovered && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
-        *value = !*value;
-        return true;
-    }
-    return false;
-}
-
-/** HCI command preset displayed in the graphical command picker. */
-typedef struct {
-    /** Human-readable label. */
-    const char *name;
-    /** Command opcode in host byte order. */
-    uint16_t opcode;
-    /** Preset parameter bytes. */
-    uint8_t parameters[8];
-    /** Valid parameter count. */
-    size_t parameterLength;
-} Preset_t;
 
 /** Fixed-height rolling traffic log displayed by the UI. */
 typedef struct {
@@ -245,126 +88,6 @@ typedef struct {
     /** Active connection verification state. */
     ConnectionHandshake_t *handshake;
 } ClientFrameContext_t;
-
-/** One selectable large deterministic-transfer size. */
-typedef struct {
-    /** Label shared with the Python client. */
-    const char *label;
-    /** Logical payload size in bytes. */
-    uint32_t size;
-} BulkSizePreset_t;
-
-/** One runtime receive-buffer choice. */
-typedef struct {
-    /** Human-readable size. */
-    const char *label;
-    /** Capacity in bytes. */
-    size_t size;
-} BufferSizePreset_t;
-
-static const Preset_t presets[] = {
-    {"HCI Reset",          0x0C03U, {0U},            0U},
-    {"Read Local Version", 0x1001U, {0U},            0U},
-    {"Read BD_ADDR",       0x1009U, {0U},            0U},
-    {"LE Read Buffer Size",0x2002U, {0U},            0U},
-    {"LE Enable Scan",     0x200CU, {0x01U, 0x00U}, 2U},
-    {"LE Disable Scan",    0x200CU, {0x00U, 0x00U}, 2U},
-};
-static const char *const presetOptions[] = {
-    "HCI Reset", "Read Local Version", "Read BD_ADDR",
-    "LE Read Buffer Size", "LE Enable Scan", "LE Disable Scan",
-};
-
-/** Large-transfer choices mirrored by the Python UI. */
-static const BulkSizePreset_t bulkSizePresets[] = {
-    {"16 KiB",  16U * 1024U},
-    {"64 KiB",  64U * 1024U},
-    {"128 KiB", 128U * 1024U},
-    {"512 KiB", 512U * 1024U},
-    {"1 MiB",   1U * 1024U * 1024U},
-    {"2 MiB",   2U * 1024U * 1024U},
-    {"4 MiB",   4U * 1024U * 1024U},
-    {"8 MiB",   8U * 1024U * 1024U},
-    {"16 MiB", 16U * 1024U * 1024U},
-};
-
-/** Semicolon-separated labels consumed by raygui's dropdown control. */
-static const char *const bulkSizeOptions[] = {
-    "16 KiB", "64 KiB", "128 KiB", "512 KiB", "1 MiB",
-    "2 MiB", "4 MiB", "8 MiB", "16 MiB",
-};
-
-static const BufferSizePreset_t ringBufferPresets[] = {
-    {"256 B", 256U}, {"1 KiB", 1024U}, {"4 KiB", 4096U},
-    {"16 KiB", 16U * 1024U}, {"64 KiB", 64U * 1024U},
-};
-static const char *const ringBufferOptions[] = {
-    "256 B", "1 KiB", "4 KiB", "16 KiB", "64 KiB",
-};
-static const BufferSizePreset_t dmaBufferPresets[] = {
-    {"32 B", 32U}, {"64 B", 64U}, {"128 B", 128U}, {"256 B", 256U},
-    {"512 B", 512U}, {"1 KiB", 1024U}, {"4 KiB", 4096U},
-};
-static const char *const dmaBufferOptions[] = {
-    "32 B", "64 B", "128 B", "256 B", "512 B", "1 KiB", "4 KiB",
-};
-
-/** Return whether the platform's standard clipboard modifier is held. */
-static bool clipboardModifierDown(void) {
-#if defined(__APPLE__)
-    return IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER);
-#else
-    return IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
-#endif
-}
-
-/** Replace a single-line field with printable clipboard text. */
-static void pasteClipboardText(char *text, size_t capacity) {
-    const char *const clipboard = GetClipboardText();
-    if (clipboard == NULL || capacity == 0U) {
-        return;
-    }
-    size_t output = 0U;
-    for (size_t input = 0U; clipboard[input] != '\0' && output + 1U < capacity;
-         input++) {
-        const unsigned char value = (unsigned char)clipboard[input];
-        if (value >= 0x20U && value != 0x7FU) {
-            text[output++] = (char)value;
-        }
-    }
-    text[output] = '\0';
-}
-
-/** Draw a raygui text box with portable whole-field clipboard shortcuts.
- *
- * Cmd is used on macOS and Ctrl on Windows and Linux. C copies the complete
- * active field, X copies and clears it, and V replaces it with clipboard text.
- */
-static void drawClipboardTextBox(Rectangle bounds, char *text, size_t capacity,
-                                 bool *editing) {
-    const bool modifier = *editing && clipboardModifierDown();
-    const bool copy = modifier && IsKeyPressed(KEY_C);
-    const bool cut = modifier && IsKeyPressed(KEY_X);
-    const bool paste = modifier && IsKeyPressed(KEY_V);
-    const bool shortcut = copy || cut || paste;
-
-    if (copy || cut) {
-        SetClipboardText(text);
-    }
-    if (cut) {
-        text[0] = '\0';
-    } else if (paste) {
-        pasteClipboardText(text, capacity);
-    }
-
-    drawFieldSurface(bounds, *editing);
-    const Rectangle content = {bounds.x + 1.0f, bounds.y + 1.0f,
-                               bounds.width - 2.0f, bounds.height - 2.0f};
-    /* Suppress normal character insertion on the shortcut frame. */
-    if (GuiTextBox(content, text, (int)capacity, shortcut ? false : *editing)) {
-        *editing = !*editing;
-    }
-}
 
 /** Append a formatted line, evicting the oldest line when full. */
 static void appendLog(TrafficLog_t *log, const char *format, ...) {
@@ -582,13 +305,6 @@ static void logFrame(const uint8_t *frame, size_t length, bool crcValid,
     }
 }
 
-/** Copy a selected command preset into editable text fields. */
-static void presetToFields(int presetIndex, char *opcode, size_t opcodeSize,
-                           char *parameters, size_t parameterSize) {
-    const Preset_t *preset = &presets[presetIndex];
-    (void)snprintf(opcode, opcodeSize, "%04X", preset->opcode);
-    AppH4_FormatHex(parameters, parameterSize, preset->parameters, preset->parameterLength);
-}
 
 /** Initialize the UI's incremental test-transfer state. */
 static void startTestTransfer(TestSender_t *sender, AppSerialPort_t *port,
@@ -674,7 +390,7 @@ int main(void) {
     InitWindow(windowWidth, windowHeight, windowTitle);
     SetWindowMinSize(980, 820);
     SetTargetFPS(60);
-    loadUiFont();
+    AppDashboardUi_Init(UART_DMA_UI_FONT_FILE, UART_DMA_UI_DISPLAY_FONT_FILE);
 
     AppSerialPort_t serial = {0};
     AppSerialPort_Init(&serial);
@@ -711,7 +427,7 @@ int main(void) {
     int bulkSizeIndex = 5;
     int ringSizeIndex = 3;
     int dmaSizeIndex = 3;
-    presetToFields(0, opcodeText, sizeof(opcodeText), parametersText, sizeof(parametersText));
+    AppDashboardConfig_PresetToFields(0, opcodeText, sizeof(opcodeText), parametersText, sizeof(parametersText));
     appendLog(&log, "Ready. Start ble_uart_server and enter its printed port.");
     static uint8_t receiveRing[64U * 1024U];
 
@@ -721,10 +437,10 @@ int main(void) {
             size_t receivedThisFrame = 0U;
             int received = 0;
             do {
-                const size_t ringRemaining = ringBufferPresets[ringSizeIndex].size
+                const size_t ringRemaining = APP_DASHBOARD_RING_SIZES[ringSizeIndex].size
                     - receivedThisFrame;
-                const size_t readCapacity = dmaBufferPresets[dmaSizeIndex].size
-                    < ringRemaining ? dmaBufferPresets[dmaSizeIndex].size : ringRemaining;
+                const size_t readCapacity = APP_DASHBOARD_DMA_SIZES[dmaSizeIndex].size
+                    < ringRemaining ? APP_DASHBOARD_DMA_SIZES[dmaSizeIndex].size : ringRemaining;
                 received = AppSerialPort_Read(
                     &serial, incoming, readCapacity);
                 if (received <= 0) {
@@ -738,7 +454,7 @@ int main(void) {
                     &parser, &receiveRing[receivedThisFrame], (size_t)received,
                     logFrame, &frameContext);
                 receivedThisFrame += (size_t)received;
-            } while (receivedThisFrame < ringBufferPresets[ringSizeIndex].size);
+            } while (receivedThisFrame < APP_DASHBOARD_RING_SIZES[ringSizeIndex].size);
             if (received < 0) {
                 appendLog(&log, "ERROR  Serial connection lost");
                 AppSerialPort_Close(&serial);
@@ -784,8 +500,8 @@ int main(void) {
         char heading[96];
         (void)snprintf(heading, sizeof(heading), "BLE UART HCI Client  v%s",
                        UART_DMA_APP_VERSION);
-        drawDisplayText(heading, 28, 22, 28, COLOR_TEXT);
-        drawUiText("PORTABLE H4 CONSOLE  /  CRC16-CCITT  /  LIVE PACKET TELEMETRY",
+        AppDashboardUi_DrawDisplayText(heading, 28, 22, 28, COLOR_TEXT);
+        AppDashboardUi_DrawText("PORTABLE H4 CONSOLE  /  CRC16-CCITT  /  LIVE PACKET TELEMETRY",
                    30, 62, 12, COLOR_MUTED);
 
         char txMetric[32];
@@ -797,32 +513,32 @@ int main(void) {
                        (unsigned int)log.receivedPackets);
         (void)snprintf(irqMetric, sizeof(irqMetric), "%u",
                        (unsigned int)log.absoluteIrqCount);
-        if (drawMetricCard((Rectangle){24, 100, 259, 84}, "RX PACKETS",
+        if (AppDashboardUi_MetricCard((Rectangle){24, 100, 259, 84}, "RX PACKETS",
                            rxMetric, COLOR_BLUE)) {
             log.receivedPackets = 0U;
         }
-        if (drawMetricCard((Rectangle){295, 100, 259, 84}, "TX PACKETS",
+        if (AppDashboardUi_MetricCard((Rectangle){295, 100, 259, 84}, "TX PACKETS",
                            txMetric, COLOR_CYAN)) {
             log.transmittedPackets = 0U;
         }
-        if (drawMetricCard((Rectangle){566, 100, 259, 84}, "RX IRQ CALLS",
+        if (AppDashboardUi_MetricCard((Rectangle){566, 100, 259, 84}, "RX IRQ CALLS",
                            irqMetric, COLOR_PURPLE)) {
             log.absoluteIrqCount = 0U;
         }
-        (void)drawMetricCard((Rectangle){837, 100, 259, 84}, "TRANSPORT",
+        (void)AppDashboardUi_MetricCard((Rectangle){837, 100, 259, 84}, "TRANSPORT",
                              handshake.pending ? "VERIFYING" : serial.connected
                                  ? (log.byteIrqMode ? "BYTE IRQ" : "DMA + IDLE")
                                  : "OFFLINE",
                              serial.connected ? COLOR_CYAN : COLOR_MUTED);
 
-        drawPanel((Rectangle){24, 204, 1072, 136}, "CONNECTION");
+        AppDashboardUi_DrawPanel((Rectangle){24, 204, 1072, 136}, "CONNECTION");
         GuiLabel((Rectangle){44, 247, 50, 38}, "Port");
-        drawClipboardTextBox((Rectangle){96, 247, 426, 38}, portText,
+        AppDashboardUi_TextBox((Rectangle){96, 247, 426, 38}, portText,
                              sizeof(portText), &portEdit);
         GuiLabel((Rectangle){542, 247, 52, 38}, "Baud");
-        drawClipboardTextBox((Rectangle){598, 247, 138, 38}, baudText,
+        AppDashboardUi_TextBox((Rectangle){598, 247, 138, 38}, baudText,
                              sizeof(baudText), &baudEdit);
-        if (brightButton((Rectangle){756, 247, 170, 38},
+        if (AppDashboardUi_Button((Rectangle){756, 247, 170, 38},
                          serial.connected ? "Disconnect" : "Connect", true)) {
             if (serial.connected) {
                 AppSerialPort_Close(&serial);
@@ -852,12 +568,12 @@ int main(void) {
                 }
             }
         }
-        drawStatusField((Rectangle){44, 298, 414, 28}, statusText);
-        drawUiText("Ring", 480, 305, 12, COLOR_MUTED);
-        drawUiText("DMA", 640, 305, 12, COLOR_MUTED);
-        drawUiText("Native clipboard shortcuts enabled", 46, 329, 12, COLOR_MUTED);
+        AppDashboardUi_StatusField((Rectangle){44, 298, 414, 28}, statusText);
+        AppDashboardUi_DrawText("Ring", 480, 305, 12, COLOR_MUTED);
+        AppDashboardUi_DrawText("DMA", 640, 305, 12, COLOR_MUTED);
+        AppDashboardUi_DrawText("Native clipboard shortcuts enabled", 46, 329, 12, COLOR_MUTED);
         const bool connectionReady = serial.connected && handshake.verified;
-        const bool rxModeChanged = toggleControl(
+        const bool rxModeChanged = AppDashboardUi_Toggle(
             (Rectangle){958, 254, 118, 24}, "Per-byte IRQ",
             &log.byteIrqMode, connectionReady);
         if (rxModeChanged) {
@@ -866,20 +582,20 @@ int main(void) {
                       log.byteIrqMode ? "per-byte IRQ" : "DMA batches");
         }
 
-        drawPanel((Rectangle){24, 360, 1072, 216}, "HCI COMMAND BUILDER");
+        AppDashboardUi_DrawPanel((Rectangle){24, 360, 1072, 216}, "HCI COMMAND BUILDER");
         GuiLabel((Rectangle){44, 397, 64, 38}, "Preset");
         if (presetIndex != previousPreset) {
-            presetToFields(presetIndex, opcodeText, sizeof(opcodeText),
+            AppDashboardConfig_PresetToFields(presetIndex, opcodeText, sizeof(opcodeText),
                            parametersText, sizeof(parametersText));
             previousPreset = presetIndex;
         }
         GuiLabel((Rectangle){496, 397, 66, 38}, "Opcode");
-        drawClipboardTextBox((Rectangle){566, 397, 164, 38}, opcodeText,
+        AppDashboardUi_TextBox((Rectangle){566, 397, 164, 38}, opcodeText,
                              sizeof(opcodeText), &opcodeEdit);
         GuiLabel((Rectangle){44, 452, 132, 38}, "Parameters");
-        drawClipboardTextBox((Rectangle){180, 452, 646, 38}, parametersText,
+        AppDashboardUi_TextBox((Rectangle){180, 452, 646, 38}, parametersText,
                              sizeof(parametersText), &parametersEdit);
-        if (brightButton((Rectangle){850, 452, 226, 38}, "Send command",
+        if (AppDashboardUi_Button((Rectangle){850, 452, 226, 38}, "Send command",
                          connectionReady)) {
             char *end = NULL;
             const unsigned long opcode = strtoul(opcodeText, &end, 16);
@@ -895,9 +611,9 @@ int main(void) {
             }
         }
         GuiLabel((Rectangle){44, 512, 132, 38}, "Raw H4 bytes");
-        drawClipboardTextBox((Rectangle){180, 512, 646, 38}, rawText,
+        AppDashboardUi_TextBox((Rectangle){180, 512, 646, 38}, rawText,
                              sizeof(rawText), &rawEdit);
-        if (brightButton((Rectangle){850, 512, 226, 38}, "Append CRC + send",
+        if (AppDashboardUi_Button((Rectangle){850, 512, 226, 38}, "Append CRC + send",
                          connectionReady)) {
             uint8_t raw[APP_H4_MAX_FRAME_SIZE - 2U];
             const size_t rawLength = AppH4_ParseHex(rawText, raw, sizeof(raw));
@@ -908,16 +624,16 @@ int main(void) {
             }
         }
 
-        drawPanel((Rectangle){24, 596, 1072, 124}, "TEST TRANSMISSIONS");
-        if (brightButton((Rectangle){44, 638, 220, 42}, "Send 128-byte packet",
+        AppDashboardUi_DrawPanel((Rectangle){24, 596, 1072, 124}, "TEST TRANSMISSIONS");
+        if (AppDashboardUi_Button((Rectangle){44, 638, 220, 42}, "Send 128-byte packet",
                          connectionReady)) {
             startTestTransfer(&testSender, &serial, &log, 128U);
         }
         GuiLabel((Rectangle){292, 640, 92, 38}, "Block size");
-        if (brightButton((Rectangle){548, 638, 218, 42}, "Send selected block",
+        if (AppDashboardUi_Button((Rectangle){548, 638, 218, 42}, "Send selected block",
                          connectionReady && !testSender.active)) {
             startTestTransfer(&testSender, &serial, &log,
-                              bulkSizePresets[bulkSizeIndex].size);
+                              APP_DASHBOARD_BULK_SIZES[bulkSizeIndex].size);
         }
         const float progress = testSender.totalSize == 0U ? 0.0f
             : (float)testSender.offset / (float)testSender.totalSize;
@@ -929,44 +645,44 @@ int main(void) {
         (void)snprintf(progressText, sizeof(progressText), "%u / %u bytes",
                        (unsigned int)testSender.offset,
                        (unsigned int)testSender.totalSize);
-        drawUiText(progressText, 792, 665, 12, COLOR_MUTED);
+        AppDashboardUi_DrawText(progressText, 792, 665, 12, COLOR_MUTED);
 
-        drawPanel((Rectangle){24, 740, 1072, 196}, "LIVE UART TRAFFIC");
+        AppDashboardUi_DrawPanel((Rectangle){24, 740, 1072, 196}, "LIVE UART TRAFFIC");
         DrawRectangleRounded((Rectangle){44, 777, 1032, 142}, 16.0f / 142.0f, 12,
                              (Color){7, 11, 20, 255});
         AppDashboardLog_Draw(&log.messages,
                              (Rectangle){58, 786, 1004, 135},
-                             AppDashboardFont_Regular(&dashboardFonts, 12),
-                             (float)AppDashboardFont_RenderSize(12),
+                             AppDashboardUi_RegularFont(12),
+                             (float)AppDashboardUi_RenderSize(12),
                              15.0f, clientLogColor);
 
         /* Draw last so the expanded selector overlays the traffic panel. */
         (void)AppDashboard_UpwardDropdown(
-            (Rectangle){112, 397, 360, 38}, uiFont, presetOptions,
-            sizeof(presetOptions) / sizeof(presetOptions[0]),
+            (Rectangle){112, 397, 360, 38}, AppDashboardUi_Font(), APP_DASHBOARD_PRESET_OPTIONS,
+            APP_DASHBOARD_PRESET_COUNT,
             &presetIndex, &presetDropdown);
         (void)AppDashboard_UpwardDropdown(
-            (Rectangle){392, 638, 132, 42}, uiFont, bulkSizeOptions,
-            sizeof(bulkSizeOptions) / sizeof(bulkSizeOptions[0]),
+            (Rectangle){392, 638, 132, 42}, AppDashboardUi_Font(), APP_DASHBOARD_BULK_SIZE_OPTIONS,
+            APP_DASHBOARD_BULK_SIZE_COUNT,
             &bulkSizeIndex, &bulkSizeDropdown);
         const bool ringSizeChanged = AppDashboard_UpwardDropdown(
-            (Rectangle){520, 298, 100, 28}, uiFont, ringBufferOptions,
-            sizeof(ringBufferOptions) / sizeof(ringBufferOptions[0]),
+            (Rectangle){520, 298, 100, 28}, AppDashboardUi_Font(), APP_DASHBOARD_RING_SIZE_OPTIONS,
+            APP_DASHBOARD_RING_SIZE_COUNT,
             &ringSizeIndex, &ringSizeDropdown);
         const bool dmaSizeChanged = AppDashboard_UpwardDropdown(
-            (Rectangle){680, 298, 100, 28}, uiFont, dmaBufferOptions,
-            sizeof(dmaBufferOptions) / sizeof(dmaBufferOptions[0]),
+            (Rectangle){680, 298, 100, 28}, AppDashboardUi_Font(), APP_DASHBOARD_DMA_SIZE_OPTIONS,
+            APP_DASHBOARD_DMA_SIZE_COUNT,
             &dmaSizeIndex, &dmaSizeDropdown);
         if (ringSizeChanged || dmaSizeChanged) {
             appendLog(&log, "RX  Buffers: ring=%u bytes, DMA=%u bytes",
-                      (unsigned int)ringBufferPresets[ringSizeIndex].size,
-                      (unsigned int)dmaBufferPresets[dmaSizeIndex].size);
+                      (unsigned int)APP_DASHBOARD_RING_SIZES[ringSizeIndex].size,
+                      (unsigned int)APP_DASHBOARD_DMA_SIZES[dmaSizeIndex].size);
         }
         EndDrawing();
     }
 
     AppSerialPort_Close(&serial);
-    AppDashboardFont_Unload(&dashboardFonts);
+    AppDashboardUi_Shutdown();
     CloseWindow();
     return 0;
 }

@@ -11,37 +11,26 @@ from __future__ import annotations
 import queue
 import sys
 import threading
-from pathlib import Path
 from typing import Callable
 
 from ble_protocol import (
-    COMMAND_PRESETS,
     H4CrcStreamParser,
-    TEST_TRANSFER_SIZES,
     add_crc,
     build_hci_command,
     build_test_transfer_frames,
     parse_hex,
 )
 from serial_ports import available_ports
-
-RING_BUFFER_SIZES: tuple[tuple[str, int], ...] = (
-    ("256 B", 256), ("1 KiB", 1024), ("4 KiB", 4096),
-    ("16 KiB", 16 * 1024), ("64 KiB", 64 * 1024),
+from dashboard_config import (
+    COMMAND_PRESETS, DMA_BUFFER_SIZES, RING_BUFFER_SIZES, TEST_TRANSFER_SIZES,
 )
-DMA_BUFFER_SIZES: tuple[tuple[str, int], ...] = (
-    ("32 B", 32), ("64 B", 64), ("128 B", 128), ("256 B", 256),
-    ("512 B", 512), ("1 KiB", 1024), ("4 KiB", 4096),
+from dashboard_font import application_version, set_font_family
+from dashboard_log import append_log_text
+from dashboard_dropdown import RoundedCombo
+from dashboard_ui import (
+    RoundedActionButton, RoundedEntry, RoundedProgress, RoundedSurface,
+    RoundedToggle, configure_styles,
 )
-
-
-def application_version() -> str:
-    """Read the repository-wide semantic application version."""
-    try:
-        return (Path(__file__).resolve().parents[1] / "VERSION").read_text(
-            encoding="utf-8").strip()
-    except OSError:
-        return "unknown"
 
 
 def run_gui() -> None:
@@ -58,363 +47,6 @@ def run_gui() -> None:
     import tkinter.font as tkfont
     from tkinter import ttk
 
-    class RoundedActionButton(tk.Canvas):
-        """Bright keyboard-accessible rounded action button for the dark dashboard."""
-
-        def __init__(self, parent: tk.Misc, text: str, command: object,
-                     width: int = 190, height: int = 42) -> None:
-            super().__init__(parent, width=width, height=height,
-                             background="#141C2E", highlightthickness=0,
-                             borderwidth=0, takefocus=True)
-            self._text = text
-            self._command = command
-            self._state = tk.NORMAL
-            self._hovered = False
-            self._width = width
-            self._height = height
-            self.bind("<Enter>", lambda _event: self._set_hover(True))
-            self.bind("<Leave>", lambda _event: self._set_hover(False))
-            self.bind("<ButtonRelease-1>", self._activate)
-            self.bind("<Return>", self._activate)
-            self.bind("<space>", self._activate)
-            self._draw()
-
-        def _set_hover(self, hovered: bool) -> None:
-            self._hovered = hovered
-            self._draw()
-
-        def _draw(self) -> None:
-            self.delete("all")
-            enabled = self._state != tk.DISABLED
-            fill = "#67E8F9" if enabled and self._hovered else (
-                "#2DD4BF" if enabled else "#273143")
-            radius = 8
-            self.create_rectangle(radius, 0, self._width - radius, self._height,
-                                  fill=fill, outline=fill)
-            self.create_rectangle(0, radius, self._width, self._height - radius,
-                                  fill=fill, outline=fill)
-            self.create_oval(0, 0, radius * 2, radius * 2, fill=fill, outline=fill)
-            self.create_oval(self._width - radius * 2, 0, self._width, radius * 2,
-                             fill=fill, outline=fill)
-            self.create_oval(0, self._height - radius * 2, radius * 2, self._height,
-                             fill=fill, outline=fill)
-            self.create_oval(self._width - radius * 2, self._height - radius * 2,
-                             self._width, self._height, fill=fill, outline=fill)
-            self.create_text(self._width / 2, self._height / 2,
-                             text=self._text,
-                             fill="#07161C" if enabled else "#5E6B7F",
-                             font=(preferred_family, -16, "bold"))
-
-        def _activate(self, _event: object = None) -> None:
-            if self._state != tk.DISABLED and callable(self._command):
-                self._command()
-
-        def configure(self, cnf: object = None, **kwargs: object) -> object:
-            if "text" in kwargs:
-                self._text = str(kwargs.pop("text"))
-            if "state" in kwargs:
-                self._state = str(kwargs.pop("state"))
-            self._draw()
-            return super().configure(cnf, **kwargs)
-
-        config = configure
-
-    class RoundedToggle(tk.Canvas):
-        """Shared pill toggle used instead of a square platform checkbox."""
-
-        def __init__(self, parent: tk.Misc, text: str, variable: tk.BooleanVar,
-                     command: Callable[[], None], width: int = 120,
-                     height: int = 30) -> None:
-            super().__init__(parent, width=width, height=height,
-                             background="#141C2E", highlightthickness=0,
-                             borderwidth=0, cursor="hand2")
-            self._text = text
-            self._variable = variable
-            self._command = command
-            self._state = tk.NORMAL
-            self._width = width
-            self._height = height
-            self.bind("<ButtonRelease-1>", self._activate)
-            self._draw()
-
-        def _draw(self) -> None:
-            self.delete("all")
-            enabled = self._state != tk.DISABLED
-            selected = self._variable.get()
-            track = "#2DD4BF" if selected and enabled else "#253451"
-            knob = "#07161C" if selected and enabled else "#8F9EB5"
-            self.create_rectangle(10, 5, 28, 25, fill=track, outline=track)
-            self.create_oval(0, 5, 20, 25, fill=track, outline=track)
-            self.create_oval(18, 5, 38, 25, fill=track, outline=track)
-            knob_x = 19 if selected else 1
-            self.create_oval(knob_x, 7, knob_x + 16, 23, fill=knob, outline=knob)
-            self.create_text(46, self._height / 2, text=self._text, anchor=tk.W,
-                             fill="#E8EFF9" if enabled else "#5E6B7F",
-                             font=(preferred_family, -15))
-
-        def _activate(self, _event: object = None) -> None:
-            if self._state == tk.DISABLED:
-                return
-            self._variable.set(not self._variable.get())
-            self._draw()
-            self._command()
-
-        def configure(self, cnf: object = None, **kwargs: object) -> object:
-            if "state" in kwargs:
-                self._state = str(kwargs.pop("state"))
-                self._draw()
-            return super().configure(cnf, **kwargs)
-
-        config = configure
-
-    class RoundedProgress(tk.Canvas):
-        """Rounded progress indicator sharing the field corner geometry."""
-
-        def __init__(self, parent: tk.Misc, variable: tk.DoubleVar) -> None:
-            super().__init__(parent, background="#141C2E", highlightthickness=0,
-                             borderwidth=0)
-            self._variable = variable
-            self._variable.trace_add("write", lambda *_args: self._draw())
-            self.bind("<Configure>", lambda _event: self._draw())
-
-        def _draw(self) -> None:
-            self.delete("all")
-            width = max(1, self.winfo_width())
-            height = max(1, self.winfo_height())
-            progress = min(1.0, max(0.0, self._variable.get()))
-            radius = min(8, height // 2)
-
-            def pill(x1: float, color: str) -> None:
-                if x1 <= 0:
-                    return
-                local_radius = min(radius, int(x1 / 2))
-                self.create_rectangle(local_radius, 0, max(local_radius, x1-local_radius),
-                                      height, fill=color, outline=color)
-                self.create_oval(0, 0, local_radius*2, height,
-                                 fill=color, outline=color)
-                self.create_oval(max(0, x1-local_radius*2), 0, x1, height,
-                                 fill=color, outline=color)
-
-            pill(width, "#232D41")
-            pill(width * progress, "#4C94FF")
-
-    class RoundedSurface(tk.Frame):
-        """Canvas-backed rounded container matching the native dashboard panels."""
-
-        def __init__(self, parent: tk.Misc, *, fill: str, border: str,
-                     style: str, radius: int,
-                     content_padding: tuple[int, int]) -> None:
-            super().__init__(parent, background="#0A0F1C", borderwidth=0,
-                             highlightthickness=0)
-            self._fill = fill
-            self._border = border
-            self._radius = radius
-            self._canvas = tk.Canvas(self, background="#0A0F1C",
-                                     borderwidth=0, highlightthickness=0)
-            self._canvas.place(x=0, y=0, relwidth=1, relheight=1)
-            self.content = ttk.Frame(self, padding=content_padding, style=style)
-            self.content.pack(fill=tk.BOTH, expand=True, padx=1,
-                              pady=max(1, radius // 2))
-            self.bind("<Configure>", self._redraw)
-
-        def _rounded_rectangle(self, inset: int, radius: int, color: str) -> None:
-            width = max(1, self.winfo_width() - 1 - inset * 2)
-            height = max(1, self.winfo_height() - 1 - inset * 2)
-            x0, y0 = inset, inset
-            x1, y1 = inset + width, inset + height
-            radius = max(1, min(radius, width // 2, height // 2))
-            self._canvas.create_rectangle(x0 + radius, y0, x1 - radius, y1,
-                                          fill=color, outline=color)
-            self._canvas.create_rectangle(x0, y0 + radius, x1, y1 - radius,
-                                          fill=color, outline=color)
-            self._canvas.create_oval(x0, y0, x0 + radius * 2, y0 + radius * 2,
-                                     fill=color, outline=color)
-            self._canvas.create_oval(x1 - radius * 2, y0, x1, y0 + radius * 2,
-                                     fill=color, outline=color)
-            self._canvas.create_oval(x0, y1 - radius * 2, x0 + radius * 2, y1,
-                                     fill=color, outline=color)
-            self._canvas.create_oval(x1 - radius * 2, y1 - radius * 2, x1, y1,
-                                     fill=color, outline=color)
-
-        def _redraw(self, _event: object = None) -> None:
-            self._canvas.delete("all")
-            self._rounded_rectangle(0, self._radius, self._border)
-            self._rounded_rectangle(1, max(1, self._radius - 1), self._fill)
-
-    class RoundedEntry(tk.Frame):
-        """Single-line left-aligned field with the shared rounded surface."""
-
-        def __init__(self, parent: tk.Misc, variable: tk.StringVar,
-                     *, readonly: bool = False) -> None:
-            super().__init__(parent, background="#141C2E", borderwidth=0,
-                             highlightthickness=0)
-            self._canvas = tk.Canvas(self, background="#141C2E", borderwidth=0,
-                                     highlightthickness=0)
-            self._canvas.place(x=0, y=0, relwidth=1, relheight=1)
-            self.entry = tk.Entry(
-                self, textvariable=variable, background="#1B253B",
-                foreground="#E8EFF9", insertbackground="#E8EFF9",
-                readonlybackground="#1B253B", relief=tk.FLAT, borderwidth=0,
-                highlightthickness=0, font=(preferred_family, -15), justify=tk.LEFT)
-            self.entry.place(x=10, y=2, relwidth=1, width=-20,
-                             relheight=1, height=-4)
-            if readonly:
-                self.entry.configure(state="readonly")
-            self.entry.bind("<FocusIn>", lambda _event: self._draw(True))
-            self.entry.bind("<FocusOut>", lambda _event: self._draw(False))
-            self.bind("<Configure>", lambda _event: self._draw(False))
-
-        def _draw(self, focused: bool) -> None:
-            self._canvas.delete("all")
-            width = max(2, self.winfo_width() - 1)
-            height = max(2, self.winfo_height() - 1)
-            border = "#2DD4BF" if focused else "#405574"
-            radius = min(8, height // 2)
-            for inset, color in ((0, border), (1, "#1B253B")):
-                x0 = y0 = inset
-                x1, y1 = width - inset, height - inset
-                r = max(1, radius - inset)
-                self._canvas.create_rectangle(x0 + r, y0, x1 - r, y1,
-                                              fill=color, outline=color)
-                self._canvas.create_rectangle(x0, y0 + r, x1, y1 - r,
-                                              fill=color, outline=color)
-                self._canvas.create_oval(x0, y0, x0 + 2 * r, y0 + 2 * r,
-                                         fill=color, outline=color)
-                self._canvas.create_oval(x1 - 2 * r, y0, x1, y0 + 2 * r,
-                                         fill=color, outline=color)
-                self._canvas.create_oval(x0, y1 - 2 * r, x0 + 2 * r, y1,
-                                         fill=color, outline=color)
-                self._canvas.create_oval(x1 - 2 * r, y1 - 2 * r, x1, y1,
-                                         fill=color, outline=color)
-
-    class RoundedCombo(tk.Frame):
-        """Rounded dropdown with centered selections and a matching popup."""
-
-        def __init__(self, parent: tk.Misc, variable: tk.StringVar,
-                     values: tuple[str, ...] = (), *, editable: bool = False) -> None:
-            super().__init__(parent, background="#141C2E", borderwidth=0,
-                             highlightthickness=0)
-            self.variable = variable
-            self.values = tuple(values)
-            self.editable = editable
-            self.popup: tk.Toplevel | None = None
-            self._canvas = tk.Canvas(self, background="#141C2E", borderwidth=0,
-                                     highlightthickness=0, cursor="hand2")
-            self._canvas.place(x=0, y=0, relwidth=1, relheight=1)
-            self.entry = tk.Entry(
-                self, textvariable=variable, background="#1B253B",
-                foreground="#E8EFF9", insertbackground="#E8EFF9",
-                readonlybackground="#1B253B", relief=tk.FLAT, borderwidth=0,
-                highlightthickness=0, font=(preferred_family, -15),
-                justify=tk.LEFT if editable else tk.CENTER)
-            self.entry.place(x=10, y=2, relwidth=1, width=-42,
-                             relheight=1, height=-4)
-            if not editable:
-                self.entry.configure(state="readonly", cursor="hand2")
-                self.entry.bind("<Button-1>", self._open_popup)
-            self.entry.bind("<FocusIn>", lambda _event: self._draw(True))
-            self.entry.bind("<FocusOut>", lambda _event: self._draw(False))
-            self._canvas.bind("<Button-1>", self._open_popup)
-            self.bind("<Configure>", lambda _event: self._draw(False))
-
-        def __setitem__(self, key: str, value: object) -> None:
-            if key != "values":
-                raise KeyError(key)
-            self.values = tuple(str(item) for item in value)  # type: ignore[arg-type]
-
-        def _draw(self, focused: bool) -> None:
-            self._canvas.delete("all")
-            width = max(2, self.winfo_width() - 1)
-            height = max(2, self.winfo_height() - 1)
-            border = "#2DD4BF" if focused or self.popup is not None else "#405574"
-            radius = min(8, height // 2)
-            for inset, color in ((0, border), (1, "#1B253B")):
-                x0 = y0 = inset
-                x1, y1 = width - inset, height - inset
-                r = max(1, radius - inset)
-                self._canvas.create_rectangle(x0 + r, y0, x1 - r, y1,
-                                              fill=color, outline=color)
-                self._canvas.create_rectangle(x0, y0 + r, x1, y1 - r,
-                                              fill=color, outline=color)
-                for oval in ((x0, y0, x0 + 2*r, y0 + 2*r),
-                             (x1 - 2*r, y0, x1, y0 + 2*r),
-                             (x0, y1 - 2*r, x0 + 2*r, y1),
-                             (x1 - 2*r, y1 - 2*r, x1, y1)):
-                    self._canvas.create_oval(*oval, fill=color, outline=color)
-            arrow_x, arrow_y = width - 17, height // 2
-            self._canvas.create_polygon(arrow_x - 5, arrow_y - 3,
-                                        arrow_x + 5, arrow_y - 3,
-                                        arrow_x, arrow_y + 4,
-                                        fill="#E8EFF9", outline="")
-
-        def _open_popup(self, _event: object = None) -> str:
-            if not self.values or self.popup is not None:
-                return "break"
-            popup = tk.Toplevel(self)
-            self.popup = popup
-            popup.overrideredirect(True)
-            popup.configure(background="#0E1626")
-            row_height = 32
-            popup_height = row_height * len(self.values) + 4
-            popup.update_idletasks()
-            x = self.winfo_rootx()
-            y = self.winfo_rooty() + self.winfo_height() + 4
-            if y + popup_height > self.winfo_screenheight() - 8:
-                y = self.winfo_rooty() - popup_height - 4
-            popup.geometry(f"{self.winfo_width()}x{popup_height}+{x}+{y}")
-            canvas = tk.Canvas(popup, background="#0E1626", borderwidth=0,
-                               highlightthickness=0, cursor="hand2")
-            canvas.pack(fill=tk.BOTH, expand=True)
-
-            def draw_popup(hovered: int = -1) -> None:
-                canvas.delete("all")
-                for index, item in enumerate(self.values):
-                    y0 = 2 + index * row_height
-                    selected = item == self.variable.get()
-                    fill = "#67E8F9" if index == hovered else (
-                        "#4C94FF" if selected else "#141C2E")
-                    color = "#07161C" if index == hovered else "#F1F6FF"
-                    x0, x1 = 2, self.winfo_width() - 2
-                    y1, radius = y0 + row_height - 2, 6
-                    canvas.create_rectangle(x0 + radius, y0, x1 - radius, y1,
-                                            fill=fill, outline=fill)
-                    canvas.create_rectangle(x0, y0 + radius, x1, y1 - radius,
-                                            fill=fill, outline=fill)
-                    for oval in ((x0, y0, x0 + 2*radius, y0 + 2*radius),
-                                 (x1 - 2*radius, y0, x1, y0 + 2*radius),
-                                 (x0, y1 - 2*radius, x0 + 2*radius, y1),
-                                 (x1 - 2*radius, y1 - 2*radius, x1, y1)):
-                        canvas.create_oval(*oval, fill=fill, outline=fill)
-                    canvas.create_text(self.winfo_width() / 2,
-                                       y0 + (row_height - 2) / 2,
-                                       text=item, fill=color,
-                                       font=(preferred_family, -15))
-
-            def motion(event: tk.Event) -> None:
-                draw_popup(min(len(self.values) - 1,
-                               max(0, (event.y - 2) // row_height)))
-
-            def select(event: tk.Event) -> None:
-                index = min(len(self.values) - 1, max(0, (event.y - 2) // row_height))
-                self.variable.set(self.values[index])
-                self.event_generate("<<ComboboxSelected>>")
-                self._close_popup()
-
-            canvas.bind("<Motion>", motion)
-            canvas.bind("<Leave>", lambda _event: draw_popup())
-            canvas.bind("<ButtonRelease-1>", select)
-            popup.bind("<Escape>", lambda _event: self._close_popup())
-            popup.bind("<FocusOut>", lambda _event: self._close_popup())
-            draw_popup()
-            popup.focus_force()
-            self._draw(True)
-            return "break"
-
-        def _close_popup(self) -> None:
-            popup, self.popup = self.popup, None
-            if popup is not None and popup.winfo_exists():
-                popup.destroy()
-            self._draw(self.entry.focus_get() == self.entry)
 
     class BleUartApp:
         """Coordinates Tk widgets, serial I/O, parsing, and test transfers."""
@@ -482,75 +114,10 @@ def run_gui() -> None:
             self.root.after(40, self.drain_reader_queue)
             self.root.protocol("WM_DELETE_WINDOW", self.close)
 
-        def _configure_styles(self) -> None:
-            """Configure the shared dark instrument-panel visual system."""
-            style = ttk.Style(self.root)
-            if "clam" in style.theme_names():
-                style.theme_use("clam")
-            body = preferred_family
-            style.configure("App.TFrame", background="#0A0F1C")
-            style.configure("Panel.TFrame", background="#141C2E", borderwidth=0,
-                            relief=tk.FLAT)
-            style.configure("Card.TFrame", background="#1B253B")
-            style.configure("App.TLabel", background="#141C2E", foreground="#E8EFF9",
-                            font=(body, -15))
-            style.configure("Muted.TLabel", background="#141C2E", foreground="#8F9EB5",
-                            font=(body, -12))
-            style.configure("Section.TLabel", background="#141C2E", foreground="#8F9EB5",
-                            font=(body, -14, "bold"))
-            style.configure("CardLabel.TLabel", background="#1B253B", foreground="#8F9EB5",
-                            font=(body, -12, "bold"))
-            style.configure("CardValue.TLabel", background="#1B253B", foreground="#E8EFF9",
-                            font=(body, -22, "bold"))
-            style.configure("Status.TLabel", background="#1B253B", foreground="#E8EFF9",
-                            borderwidth=0, relief=tk.FLAT, padding=(10, 6), font=(body, -15))
-            style.configure("TButton", background="#253451", foreground="#F4F8FF",
-                            bordercolor="#405574", padding=(12, 9), font=(body, -16, "bold"))
-            style.map("TButton", background=[("active", "#32486F"), ("pressed", "#3B5B8E")])
-            style.configure("Accent.TButton", background="#356FD6", foreground="#FFFFFF",
-                            bordercolor="#4C94FF")
-            style.map("Accent.TButton", background=[("active", "#4385ED"),
-                                                     ("pressed", "#2F62BE")])
-            style.configure("TEntry", fieldbackground="#1B253B", foreground="#E8EFF9",
-                            insertcolor="#E8EFF9", bordercolor="#405574",
-                            lightcolor="#405574", darkcolor="#405574",
-                            focuscolor="#2DD4BF", borderwidth=1, relief=tk.FLAT,
-                            padding=7, font=(body, -15))
-            style.map("TEntry",
-                      bordercolor=[("focus", "#2DD4BF"), ("active", "#405574")],
-                      lightcolor=[("focus", "#2DD4BF"), ("active", "#405574")],
-                      darkcolor=[("focus", "#2DD4BF"), ("active", "#405574")])
-            style.configure("TCombobox", fieldbackground="#1B253B", foreground="#E8EFF9",
-                            background="#253451", arrowcolor="#8F9EB5",
-                            bordercolor="#405574", lightcolor="#405574",
-                            darkcolor="#405574", focuscolor="#2DD4BF",
-                            borderwidth=1, relief=tk.FLAT, padding=6, font=(body, -15))
-            style.map("TCombobox", fieldbackground=[("readonly", "#1B253B")],
-                      foreground=[("readonly", "#E8EFF9")],
-                      bordercolor=[("focus", "#2DD4BF"), ("active", "#405574")],
-                      lightcolor=[("focus", "#2DD4BF"), ("active", "#405574")],
-                      darkcolor=[("focus", "#2DD4BF"), ("active", "#405574")])
-            self.root.option_add("*TCombobox*Listbox.background", "#0E1626")
-            self.root.option_add("*TCombobox*Listbox.foreground", "#F1F6FF")
-            self.root.option_add("*TCombobox*Listbox.selectBackground", "#67E8F9")
-            self.root.option_add("*TCombobox*Listbox.selectForeground", "#07161C")
-            style.configure("TCheckbutton", background="#141C2E", foreground="#E8EFF9",
-                            font=(body, -15, "bold"), indicatorcolor="#1B253B",
-                            indicatorrelief=tk.FLAT)
-            style.map("TCheckbutton", background=[("active", "#141C2E")],
-                      indicatorcolor=[("selected", "#2DD4BF")])
-            style.configure("Transfer.Horizontal.TProgressbar", troughcolor="#232D41",
-                            background="#4C94FF", bordercolor="#232D41",
-                            lightcolor="#232D41", darkcolor="#232D41",
-                            borderwidth=0, relief=tk.FLAT, thickness=14)
-            style.configure("Dark.Vertical.TScrollbar", background="#253451",
-                            troughcolor="#070B14", bordercolor="#070B14",
-                            lightcolor="#253451", darkcolor="#253451",
-                            arrowcolor="#8F9EB5", borderwidth=0, relief=tk.FLAT)
 
         def _build_ui(self) -> None:
             """Create the shared telemetry-first client dashboard layout."""
-            self._configure_styles()
+            configure_styles(self.root)
             container = ttk.Frame(self.root, style="App.TFrame")
             container.pack(fill=tk.BOTH, expand=True)
 
@@ -769,16 +336,8 @@ def run_gui() -> None:
 
         def _append_log_text(self, message: str, kind: str) -> None:
             """Append and color one line while preserving manual scroll position."""
-            following_tail = self.log.yview()[1] >= 0.999
-            self.log.configure(state=tk.NORMAL)
-            self.log.insert(tk.END, f"{message}\n", kind)
-            self.log_line_count += 1
-            if self.log_line_count > 256:
-                self.log.delete("1.0", "2.0")
-                self.log_line_count -= 1
-            if following_tail:
-                self.log.see(tk.END)
-            self.log.configure(state=tk.DISABLED)
+            self.log_line_count = append_log_text(
+                self.log, self.log_line_count, message, kind)
 
         def _configure_receive_buffers(self, _event: object = None) -> None:
             """Apply the selected local ring capacity and DMA transaction size."""
@@ -1235,6 +794,7 @@ def run_gui() -> None:
     preferred_family = "Space Grotesk" if "Space Grotesk" in available_families else (
         "Segoe UI" if sys.platform == "win32" else
         "Avenir Next" if sys.platform == "darwin" else "DejaVu Sans")
+    set_font_family(preferred_family)
     for named_font in ("TkDefaultFont", "TkTextFont", "TkMenuFont",
                        "TkCaptionFont", "TkSmallCaptionFont"):
         tkfont.nametofont(named_font).configure(family=preferred_family, size=-15)

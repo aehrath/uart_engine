@@ -19,6 +19,7 @@ from ble_protocol import (  # noqa: E402
     crc16_ccitt,
     parse_hex,
 )
+from dashboard_config import DMA_BUFFER_SIZES, RING_BUFFER_SIZES  # noqa: E402
 
 
 class ProtocolTests(unittest.TestCase):
@@ -58,6 +59,13 @@ class ProtocolTests(unittest.TestCase):
             ("8 MiB", 8 * 1024 * 1024),
             ("16 MiB", 16 * 1024 * 1024),
         ))
+
+    def test_receive_buffer_sizes_match_native_apps(self):
+        """Keep the Python ring and DMA selectors aligned with both C UIs."""
+        self.assertEqual(dict(RING_BUFFER_SIZES)["16 KiB"], 16 * 1024)
+        self.assertEqual(dict(RING_BUFFER_SIZES)["64 KiB"], 64 * 1024)
+        self.assertEqual(dict(DMA_BUFFER_SIZES)["256 B"], 256)
+        self.assertEqual(dict(DMA_BUFFER_SIZES)["4 KiB"], 4 * 1024)
 
     def test_rx_mode_command_and_event(self):
         """Verify typed mode requests and synchronized RXMD event decoding."""

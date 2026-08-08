@@ -179,7 +179,9 @@ if(UART_DMA_BUILD_PORTABLE_UI)
 
         add_executable(ble_uart_client_ui
             apps/ble_uart_client_ui.c
+            apps/common/dashboard_config.c
             apps/common/dashboard_font.c
+            apps/common/dashboard_ui.c
             apps/common/dashboard_dropdown.c
             apps/common/dashboard_log.c)
     target_include_directories(ble_uart_client_ui PRIVATE "${raygui_SOURCE_DIR}/src")
@@ -221,7 +223,9 @@ if(UART_DMA_BUILD_PORTABLE_UI)
     if(UNIX AND TARGET ble_uart_server)
         add_executable(ble_uart_server_ui
             apps/ble_uart_server_ui.c
+            apps/common/dashboard_config.c
             apps/common/dashboard_font.c
+            apps/common/dashboard_ui.c
             apps/common/dashboard_dropdown.c
             apps/common/dashboard_log.c)
         add_dependencies(ble_uart_server_ui ble_uart_server)

@@ -17,9 +17,12 @@ python3 -m venv .venv
 
 The repository's local `.venv` is excluded from version control.
 
-The application is separated into three modules: `ble_uart_app.py` contains the
-Tk UI, `ble_protocol.py` contains H4/CRC framing and test-message generation,
-and `serial_ports.py` handles port discovery.
+The application uses the same component boundaries as the C dashboards.
+`dashboard_config.py`, `dashboard_font.py`, `dashboard_dropdown.py`,
+`dashboard_log.py`, and `dashboard_ui.py` mirror the corresponding files in
+`apps/common`. `ble_protocol.py` contains H4/CRC framing and test-message
+generation, `serial_ports.py` handles port discovery, and `ble_uart_app.py`
+contains only the application controller and concrete client layout.
 
 Select the UART device and baud rate, connect, and either choose an HCI command
 preset or enter a raw H4 packet. The app adds the CRC automatically.

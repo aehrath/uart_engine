@@ -8,12 +8,13 @@ CMake.
 ```text
 include/uart_dma/       Public embedded-library headers
 src/                    FreeRTOS UART/DMA, ring buffer, CRC, and HCI parser
-apps/common/            Cross-platform serial-port and H4 wire helpers
+apps/common/            Shared protocol, serial, logging, font, config, and UI code
 apps/server/            Pseudo-UART and server-side serial ingress
 apps/ble_uart_*.c       C command-line and graphical app entry points
+python/dashboard_*.py   Python mirrors of the native dashboard components
 python/ble_protocol.py  Python H4 framing, CRC, parser, and test messages
 python/serial_ports.py  Python serial-port discovery
-python/ble_uart_app.py  Python graphical app entry point
+python/ble_uart_app.py  Python graphical controller and layout entry point
 demo/                   Embedded round-trip demo and macOS wrapper app
 tests/                  Native integration tests
 ```
