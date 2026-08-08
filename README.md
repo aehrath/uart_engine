@@ -64,3 +64,17 @@ default receive path uses circular DMA plus UART IDLE notification; the optional
 path stores each byte from RXNE in the same ring buffer. A typed HCI vendor
 command/event exchange keeps the server dashboard and connected client state in
 sync.
+
+The graphical server can also originate the same HCI, raw H4, 128-byte, and
+selectable large test traffic as the clients. Its live metrics include the
+actual number of receive-byte IRQ handler invocations.
+
+Application releases are numbered from the repository [`VERSION`](VERSION)
+file. Every dashboard displays that version in its window title and heading.
+The native dashboards bundle Noto Sans for consistent antialiased text, while
+the Python dashboard selects the corresponding native sans-serif UI family.
+
+IRQ counters are deliberately application-local rather than synchronized over
+HCI. Dashboards show a cumulative process-lifetime value, while logs show a
+fresh per-packet value once an ordinary packet—or an entire chunked test
+transmission—has completed.

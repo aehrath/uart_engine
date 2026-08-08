@@ -4,6 +4,7 @@
 #include "h4_wire.h"
 #include "serial_port.h"
 #include "test_transfer_protocol.h"
+#include "uart_dma/app_version.h"
 
 #define RAYGUI_IMPLEMENTATION
 #include "raygui.h"
@@ -17,6 +18,28 @@
 
 #define MAX_LOG_LINES       13U
 #define MAX_LOG_LENGTH      220U
+
+static Font uiFont;
+static bool customUiFont;
+
+/** Load the bundled sans-serif UI font and configure raygui to use it. */
+static void loadUiFont(void) {
+    const char *path = TextFormat("%s%s", GetApplicationDirectory(),
+                                  UART_DMA_UI_FONT_FILE);
+    uiFont = LoadFontEx(path, 28, NULL, 0);
+    customUiFont = uiFont.texture.id != 0U;
+    if (!customUiFont) {
+        uiFont = GetFontDefault();
+    }
+    SetTextureFilter(uiFont.texture, TEXTURE_FILTER_BILINEAR);
+    GuiSetFont(uiFont);
+    GuiSetStyle(DEFAULT, TEXT_SIZE, 15);
+}
+
+/** Draw antialiased text using the shared UI typeface. */
+static void drawUiText(const char *text, int x, int y, int size, Color color) {
+    DrawTextEx(uiFont, text, (Vector2){(float)x, (float)y}, (float)size, 0.0f, color);
+}
 
 /** HCI command preset displayed in the graphical command picker. */
 typedef struct {
@@ -38,6 +61,18 @@ typedef struct {
     size_t count;
     /** Authoritative receive mode reported by the connected server. */
     bool byteIrqMode;
+    /** Receive mode currently active while a toggle request is in flight. */
+    bool receiveByteIrqActive;
+    /** App-local absolute count of per-byte receive-handler calls. */
+    uint32_t absoluteIrqCount;
+    /** Receive-handler calls used by the most recently completed transmission. */
+    uint32_t transmissionIrqCount;
+    /** Per-byte receive calls accumulated across a chunked test transmission. */
+    uint32_t testIrqCalls;
+    /** Whether an inbound test transmission is currently being accumulated. */
+    bool testIrqActive;
+    /** Next logical byte offset that produces a compact receive-progress log. */
+    uint32_t testLogNextProgress;
 } TrafficLog_t;
 
 /** Incremental state for a nonblocking deterministic test transfer. */
@@ -170,10 +205,12 @@ static bool sendFramedEx(AppSerialPort_t *port, TrafficLog_t *log,
     }
     const uint16_t crc = AppH4_Crc16(h4Packet, h4Length);
     const BleHciCrcTrailer_t trailer = {BleHciWire_ToBe16(crc)};
+    uint8_t wirePacket[BLE_HCI_MAX_WIRE_PACKET + sizeof(trailer)];
+    memcpy(wirePacket, h4Packet, h4Length);
+    memcpy(&wirePacket[h4Length], &trailer, sizeof(trailer));
     char hex[MAX_LOG_LENGTH - 24U];
     AppH4_FormatHex(hex, sizeof(hex), h4Packet, h4Length);
-    if (!AppSerialPort_Write(port, h4Packet, h4Length) ||
-        !AppSerialPort_Write(port, &trailer, sizeof(trailer))) {
+    if (!AppSerialPort_Write(port, wirePacket, h4Length + sizeof(trailer))) {
         appendLog(log, "ERROR  Serial write failed");
         return false;
     }
@@ -216,23 +253,85 @@ static void logFrame(const uint8_t *frame, size_t length, bool crcValid,
                      void *context) {
     TrafficLog_t *const log = context;
     const size_t h4Length = length - 2U;
-    char hex[MAX_LOG_LENGTH - 56U];
-    AppH4_FormatHex(hex, sizeof(hex), frame, length);
     BleHciPacketIndicator_t indicator;
     memcpy(&indicator, frame, sizeof(indicator));
     bool byteIrqMode = false;
-    if (crcValid && AppH4RxModeEvent_Decode(frame, length, &byteIrqMode)) {
+    bool testFrame = false;
+    uint8_t testFlags = 0U;
+    uint32_t testTotal = 0U;
+    uint32_t testOffset = 0U;
+    uint16_t testChunk = 0U;
+    if (h4Length >= sizeof(BleHciAclHeader_t) + sizeof(TestTransferHeader_t)) {
+        BleHciAclHeader_t acl;
+        TestTransferHeader_t transfer;
+        memcpy(&acl, frame, sizeof(acl));
+        memcpy(&transfer, &frame[sizeof(acl)], sizeof(transfer));
+        testFrame = acl.indicator.value == BLE_HCI_H4_ACL &&
+            (BleHciWire_FromLe16(acl.fields.handle_flags_le) & 0x0FFFU) ==
+                TEST_TRANSFER_HANDLE &&
+            transfer.version == 1U &&
+            memcmp(transfer.signature, "TEST", sizeof(transfer.signature)) == 0;
+        testFlags = transfer.flags;
+        testTotal = TestTransfer_TotalSize(&transfer);
+        testOffset = TestTransfer_Offset(&transfer);
+        testChunk = TestTransfer_ChunkSize(&transfer);
+    }
+    bool irqCompletion = !testFrame;
+    if (testFrame && (testFlags & TEST_TRANSFER_FLAG_START) != 0U) {
+        log->testIrqCalls = 0U;
+        log->testIrqActive = true;
+        log->testLogNextProgress = TEST_TRANSFER_PROGRESS_STEP;
+    }
+    if (testFrame && log->testIrqActive && log->receiveByteIrqActive) {
+        log->testIrqCalls += (uint32_t)length;
+    }
+    if (testFrame && log->testIrqActive &&
+        (testFlags & TEST_TRANSFER_FLAG_END) != 0U) {
+        log->transmissionIrqCount = log->testIrqCalls;
+        log->testIrqActive = false;
+        irqCompletion = true;
+    } else if (!testFrame) {
+        log->transmissionIrqCount = log->receiveByteIrqActive
+            ? (uint32_t)length : 0U;
+    }
+    const bool suppressBytes = testFrame && testTotal > 128U;
+    if (suppressBytes) {
+        const uint32_t received = testOffset + testChunk;
+        if ((testFlags & TEST_TRANSFER_FLAG_START) != 0U) {
+            appendLog(log, "RX  TEST start: %u bytes", (unsigned int)testTotal);
+        }
+        if ((testFlags & TEST_TRANSFER_FLAG_END) != 0U) {
+            appendLog(log, "RX  TEST complete: %u/%u bytes",
+                      (unsigned int)received, (unsigned int)testTotal);
+        } else if (received >= log->testLogNextProgress) {
+            appendLog(log, "RX  TEST progress: %u/%u bytes (%u%%)",
+                      (unsigned int)received, (unsigned int)testTotal,
+                      (unsigned int)((received * 100ULL) / testTotal));
+            log->testLogNextProgress += TEST_TRANSFER_PROGRESS_STEP;
+        }
+    } else if (crcValid && AppH4RxModeEvent_Decode(frame, length, &byteIrqMode)) {
         log->byteIrqMode = byteIrqMode;
+        log->receiveByteIrqActive = byteIrqMode;
         appendLog(log, "RX  Mode synchronized: %s",
                   byteIrqMode ? "per-byte IRQ" : "DMA + IDLE");
-    } else if (indicator.value == APP_H4_EVENT &&
-               h4Length >= sizeof(BleHciEventHeader_t)) {
-        BleHciEventHeader_t header;
-        memcpy(&header, frame, sizeof(header));
-        appendLog(log, "RX  %s  [%s, Event %02X]", hex,
-                  crcValid ? "CRC OK" : "CRC BAD", header.fields.event_code);
     } else {
-        appendLog(log, "RX  %s  [%s]", hex, crcValid ? "CRC OK" : "CRC BAD");
+        char hex[MAX_LOG_LENGTH - 56U];
+        AppH4_FormatHex(hex, sizeof(hex), frame, length);
+        if (indicator.value == APP_H4_EVENT &&
+            h4Length >= sizeof(BleHciEventHeader_t)) {
+            BleHciEventHeader_t header;
+            memcpy(&header, frame, sizeof(header));
+            appendLog(log, "RX  %s  [%s, Event %02X]", hex,
+                      crcValid ? "CRC OK" : "CRC BAD", header.fields.event_code);
+        } else {
+            appendLog(log, "RX  %s  [%s]", hex,
+                      crcValid ? "CRC OK" : "CRC BAD");
+        }
+    }
+    if (irqCompletion) {
+        appendLog(log, "RX  IRQ complete: %u calls; app total=%u",
+                  (unsigned int)log->transmissionIrqCount,
+                  (unsigned int)log->absoluteIrqCount);
     }
 }
 
@@ -269,7 +368,7 @@ static void pumpTestTransfer(TestSender_t *sender, AppSerialPort_t *port,
     if (!sender->active) {
         return;
     }
-    for (unsigned int packet = 0U; packet < 32U && sender->offset < sender->totalSize; packet++) {
+    for (unsigned int packet = 0U; packet < 64U && sender->offset < sender->totalSize; packet++) {
         const uint32_t remaining = sender->totalSize - sender->offset;
         const uint16_t chunkSize = (uint16_t)(remaining < TEST_TRANSFER_CHUNK_DATA_SIZE
             ? remaining : TEST_TRANSFER_CHUNK_DATA_SIZE);
@@ -321,15 +420,19 @@ static void pumpTestTransfer(TestSender_t *sender, AppSerialPort_t *port,
 int main(void) {
     const int windowWidth = 960;
     const int windowHeight = 780;
-    InitWindow(windowWidth, windowHeight, "BLE UART Client");
+    char windowTitle[96];
+    (void)snprintf(windowTitle, sizeof(windowTitle), "BLE UART Client v%s",
+                   UART_DMA_APP_VERSION);
+    InitWindow(windowWidth, windowHeight, windowTitle);
     SetWindowMinSize(760, 600);
     SetTargetFPS(60);
+    loadUiFont();
 
     AppSerialPort_t serial = {0};
     AppSerialPort_Init(&serial);
     AppH4StreamParser_t parser;
     AppH4StreamParser_Init(&parser);
-    TrafficLog_t log = {{{0}}, 0U, false};
+    TrafficLog_t log = {{{0}}, 0U, false, false, 0U, 0U, 0U, false, 0U};
     TestSender_t testSender = {0U, 0U, 0U, 0U, false};
 #ifdef _WIN32
     char portText[128] = "COM3";
@@ -358,11 +461,14 @@ int main(void) {
 
     while (!WindowShouldClose()) {
         if (serial.connected) {
-            uint8_t incoming[512];
+            uint8_t incoming[16U * 1024U];
             const int received = AppSerialPort_Read(&serial, incoming, sizeof(incoming));
             if (received > 0) {
-                (void)AppH4StreamParser_Feed(&parser, incoming, (size_t)received,
-                                             logFrame, &log);
+                if (log.receiveByteIrqActive) {
+                    log.absoluteIrqCount += (uint32_t)received;
+                }
+                (void)AppH4StreamParser_Feed(
+                    &parser, incoming, (size_t)received, logFrame, &log);
             } else if (received < 0) {
                 appendLog(&log, "ERROR  Serial connection lost");
                 AppSerialPort_Close(&serial);
@@ -382,9 +488,12 @@ int main(void) {
 
         BeginDrawing();
         ClearBackground((Color){245, 247, 250, 255});
-        DrawText("BLE UART HCI Client", 24, 20, 26, (Color){25, 35, 55, 255});
-        DrawText("Portable C UI • H4 framing • CRC16-CCITT • live receive parser",
-                 24, 52, 16, (Color){90, 100, 120, 255});
+        char heading[96];
+        (void)snprintf(heading, sizeof(heading), "BLE UART HCI Client  v%s",
+                       UART_DMA_APP_VERSION);
+        drawUiText(heading, 24, 20, 26, (Color){25, 35, 55, 255});
+        drawUiText("Portable C UI | H4 framing | CRC16-CCITT | live receive parser",
+                   24, 52, 16, (Color){90, 100, 120, 255});
 
         GuiGroupBox((Rectangle){20, 84, 920, 106}, "Serial connection");
         GuiLabel((Rectangle){36, 103, 60, 24}, "Port");
@@ -415,8 +524,12 @@ int main(void) {
             }
         }
         GuiStatusBar((Rectangle){36, 145, 880, 26}, statusText);
-        DrawText("Cmd/Ctrl+C copy • X cut • V paste • baud up to 4000000",
-                 36, 134, 11, (Color){100, 110, 128, 255});
+        drawUiText("Cmd/Ctrl+C copy | X cut | V paste",
+                   36, 134, 11, (Color){100, 110, 128, 255});
+        char irqCountText[64];
+        (void)snprintf(irqCountText, sizeof(irqCountText), "IRQ calls: %u",
+                       (unsigned int)log.absoluteIrqCount);
+        drawUiText(irqCountText, 585, 134, 11, (Color){100, 110, 128, 255});
         const bool previousRxMode = log.byteIrqMode;
         if (!serial.connected) {
             GuiDisable();
@@ -496,7 +609,7 @@ int main(void) {
         (void)snprintf(progressText, sizeof(progressText), "%u / %u bytes",
                        (unsigned int)testSender.offset,
                        (unsigned int)testSender.totalSize);
-        DrawText(progressText, 642, 460, 14, (Color){80, 90, 108, 255});
+        drawUiText(progressText, 642, 460, 14, (Color){80, 90, 108, 255});
 
         GuiGroupBox((Rectangle){20, 514, 920, 246}, "UART traffic");
         DrawRectangle(34, 537, 892, 208, (Color){20, 25, 35, 255});
@@ -508,7 +621,7 @@ int main(void) {
                     : strncmp(log.lines[index], "RX", 2U) == 0
                         ? (Color){105, 225, 150, 255}
                         : (Color){190, 198, 210, 255};
-            DrawText(log.lines[index], 46, 547 + (int)index * 15, 13, color);
+            drawUiText(log.lines[index], 46, 547 + (int)index * 15, 13, color);
         }
 
         /* Draw last so the expanded selector overlays the traffic panel. */
@@ -520,6 +633,9 @@ int main(void) {
     }
 
     AppSerialPort_Close(&serial);
+    if (customUiFont) {
+        UnloadFont(uiFont);
+    }
     CloseWindow();
     return 0;
 }

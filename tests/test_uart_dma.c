@@ -161,7 +161,7 @@ static void testUartApiAndInterrupts(void) {
     PacketMessage_t message = UartDma_MessageFrom(arbitraryPayload,
                                                   sizeof(arbitraryPayload));
 
-    rxDmaRegisters.NDTR = 1024U;
+    rxDmaRegisters.NDTR = UART_DMA_RX_BUFFER_SIZE;
     UartDmaSystem_Init();
 
     assert(UartDma_GetRxMode() == UART_DMA_RX_MODE_DMA_IDLE);
@@ -169,6 +169,7 @@ static void testUartApiAndInterrupts(void) {
     assert((uartRegisters.CR1 & (1UL << 5)) == 0U);
     UartDma_SetRxMode(UART_DMA_RX_MODE_BYTE_IRQ);
     assert(UartDma_GetRxMode() == UART_DMA_RX_MODE_BYTE_IRQ);
+    assert(UartDma_GetRxInterruptCount() == 0U);
     assert((rxDmaRegisters.CR & 1UL) == 0U);
     assert((uartRegisters.CR1 & (1UL << 5)) != 0U);
 
@@ -185,6 +186,7 @@ static void testUartApiAndInterrupts(void) {
                                     &receivedLength));
     assert(receivedLength == sizeof(interruptBytes));
     assert(memcmp(receivedBytes, interruptBytes, sizeof(interruptBytes)) == 0);
+    assert(UartDma_GetRxInterruptCount() == sizeof(interruptBytes));
 
     UartDma_SetRxMode(UART_DMA_RX_MODE_DMA_IDLE);
     assert(UartDma_GetRxMode() == UART_DMA_RX_MODE_DMA_IDLE);

@@ -1,0 +1,10 @@
+#ifndef UART_DMA_APP_VERSION_H
+#define UART_DMA_APP_VERSION_H
+
+/** @file
+ * @brief Build-time application version generated from the repository VERSION file. */
+
+/** Human-readable semantic version shared by the native applications. */
+#define UART_DMA_APP_VERSION "@PROJECT_VERSION@"
+
+#endif

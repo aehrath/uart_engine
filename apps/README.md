@@ -78,7 +78,31 @@ On macOS and Linux, `ble_uart_server_ui` gives the continuous FreeRTOS server a
 matching graphical dashboard. It starts and stops the actual server engine,
 displays and copies the generated pseudo-UART path, counts received commands and
 transmitted events, and shows the live DMA/HCI log. Its **Per-byte IRQ** checkbox
-controls the same server state as either client UI.
+controls the same server state as either client UI. The **RX IRQ calls** card is
+the server app's cumulative count of RXNE byte interrupts actually serviced by
+the UART ISR. It is local to that server process and is not synchronized to the
+client dashboards.
+
+The dashboard also mirrors the client sending controls. It can transmit preset
+or custom typed HCI commands, arbitrary raw H4 packets, the 128-byte quick-test
+message, and selectable 16 KiB through 16 MiB deterministic ACL transfers to the
+connected client. Ordinary packets use the normal FreeRTOS TX queue and DMA
+engine. Large transfers retain the same typed 255-byte H4/CRC frames but mirror
+the fast client sender by coalescing them into 64 KiB serial batches, avoiding
+thousands of host scheduler wakeups and writes.
+
+Both native dashboards display the repository release version and use the same
+bundled antialiased Noto Sans font for legible, consistent controls and logs.
+
+Each graphical app owns its IRQ dashboard counter. The value is cumulative for
+that app process. Each ordinary packet resets a separate transmission counter;
+the packet's final log entry includes that count once. A chunked test message is
+treated as one full transmission, so its counter spans all chunks and appears
+only in the completion log entry.
+
+Large test transfers never hex-dump individual ACL chunks. The apps retain
+compact start, periodic progress, and completion records; the intentionally
+small 128-byte diagnostic message may still be displayed byte-for-byte.
 
 Receive-mode changes are synchronized in both directions. A client sends the
 typed vendor command `0xFC01`; the server applies it and returns an `RXMD`

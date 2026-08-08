@@ -60,6 +60,7 @@ static QueueHandle_t      xRxPacketQueueHandle = NULL;
 static QueueHandle_t      xTxPacketQueueHandle = NULL;
 static SemaphoreHandle_t  xTxDmaSemaphore      = NULL;
 static volatile UartDmaRxMode_t rxMode = UART_DMA_RX_MODE_DMA_IDLE;
+static volatile uint32_t rxInterruptCount;
 
 /* --- Priority Scheduling Matrix --- */
 #define PRIORITY_PRODUCER_TASK  (configMAX_PRIORITIES - 1) /* Critical Hardware Layer */
@@ -76,6 +77,7 @@ void vTxEngineTask(void *pvParameters);
 
 void UartDmaSystem_Init(void) {
     UartDmaRingBuffer_Reset();
+    rxInterruptCount = 0U;
     UartDma_SetRxMode(UART_DMA_RX_MODE_DMA_IDLE);
     /* 1. Allocate Inter-Process Communication Pipelines */
     xRxPacketQueueHandle = xQueueCreate(QUEUE_STORAGE_SIZE, sizeof(PacketMessage_t));
@@ -119,11 +121,16 @@ UartDmaRxMode_t UartDma_GetRxMode(void) {
     return rxMode;
 }
 
+uint32_t UartDma_GetRxInterruptCount(void) {
+    return rxInterruptCount;
+}
+
 void USART_IRQHandler(void) {
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
     if (rxMode == UART_DMA_RX_MODE_BYTE_IRQ &&
         (USART_HW->ISR & UART_ISR_RXNE_Msk) != 0U) {
+        rxInterruptCount++;
         UartDmaRingBuffer_WriteByte((uint8_t)USART_HW->RDR);
     }
 
@@ -155,6 +162,7 @@ void DMA_TX_Complete_IRQHandler(void) {
  * @param pvParameters Unused FreeRTOS task context. */
 void vProducerTask(void *pvParameters) {
     (void)pvParameters;
+    static PacketMessage_t newPacket;
 
     while (1) {
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
@@ -167,7 +175,6 @@ void vProducerTask(void *pvParameters) {
             ? UartDmaRingBuffer_GetWriteIndex()
             : UartDma_GetRxBufferSize() - DMA_RX_STREAM->NDTR;
 
-        PacketMessage_t newPacket;
         uint32_t dataLength = 0;
         const bool validLayout = UartDmaRingBuffer_ReadTo(
             currentWriteIndex, newPacket.payload, sizeof(newPacket.payload), &dataLength);
@@ -196,7 +203,7 @@ void vProducerTask(void *pvParameters) {
  * @param pvParameters Unused FreeRTOS task context. */
 void vConsumerTask(void *pvParameters) {
     (void)pvParameters;
-    PacketMessage_t receivedPacket;
+    static PacketMessage_t receivedPacket;
 
     while (1) {
         /* Blocks natively with zero CPU overhead until the DMA Producer pushes a data frame */
@@ -223,7 +230,7 @@ BaseType_t UartDma_SendPacket(const PacketMessage_t *message, TickType_t ticks_t
  * @param pvParameters Unused FreeRTOS task context. */
 void vTxEngineTask(void *pvParameters) {
     (void)pvParameters;
-    PacketMessage_t txMsg;
+    static PacketMessage_t txMsg;
 
     while (1) {
         if (xQueueReceive(xTxPacketQueueHandle, &txMsg, portMAX_DELAY) == pdTRUE) {

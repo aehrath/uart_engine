@@ -2,6 +2,7 @@
  * @brief Interactive and one-shot native BLE HCI UART command-line client. */
 #include "h4_wire.h"
 #include "serial_port.h"
+#include "test_transfer_protocol.h"
 
 #include <errno.h>
 #include <poll.h>
@@ -58,8 +59,10 @@ static bool sendFramed(AppSerialPort_t *port, const void *h4Packet, size_t h4Len
     printHex(&trailer, sizeof(trailer));
     printf("  CRC %04X\n", crc);
     fflush(stdout);
-    return AppSerialPort_Write(port, h4Packet, h4Length) &&
-           AppSerialPort_Write(port, &trailer, sizeof(trailer));
+    uint8_t wirePacket[BLE_HCI_MAX_WIRE_PACKET + sizeof(trailer)];
+    memcpy(wirePacket, h4Packet, h4Length);
+    memcpy(&wirePacket[h4Length], &trailer, sizeof(trailer));
+    return AppSerialPort_Write(port, wirePacket, h4Length + sizeof(trailer));
 }
 
 /** Construct and transmit one HCI Command packet. */
@@ -87,6 +90,39 @@ static void describeFrame(const uint8_t *frame, size_t frameLength,
                           bool crcValid, void *context) {
     (void)context;
     const size_t h4Length = frameLength - 2U;
+    static uint32_t nextTestProgress = TEST_TRANSFER_PROGRESS_STEP;
+    if (h4Length >= sizeof(BleHciAclHeader_t) + sizeof(TestTransferHeader_t)) {
+        BleHciAclHeader_t acl;
+        TestTransferHeader_t transfer;
+        memcpy(&acl, frame, sizeof(acl));
+        memcpy(&transfer, &frame[sizeof(acl)], sizeof(transfer));
+        const bool testFrame = acl.indicator.value == BLE_HCI_H4_ACL &&
+            (BleHciWire_FromLe16(acl.fields.handle_flags_le) & 0x0FFFU) ==
+                TEST_TRANSFER_HANDLE &&
+            transfer.version == 1U &&
+            memcmp(transfer.signature, "TEST", sizeof(transfer.signature)) == 0;
+        const uint32_t total = TestTransfer_TotalSize(&transfer);
+        if (testFrame && total > 128U) {
+            const uint32_t received = TestTransfer_Offset(&transfer) +
+                                      TestTransfer_ChunkSize(&transfer);
+            if ((transfer.flags & TEST_TRANSFER_FLAG_START) != 0U) {
+                nextTestProgress = TEST_TRANSFER_PROGRESS_STEP;
+                printf("RX   TEST start: %u bytes\n", (unsigned int)total);
+            }
+            if ((transfer.flags & TEST_TRANSFER_FLAG_END) != 0U) {
+                printf("RX   TEST complete: %u/%u bytes; CRC %s\n",
+                       (unsigned int)received, (unsigned int)total,
+                       crcValid ? "OK" : "BAD");
+            } else if (received >= nextTestProgress) {
+                printf("RX   TEST progress: %u/%u bytes (%u%%)\n",
+                       (unsigned int)received, (unsigned int)total,
+                       (unsigned int)((received * 100ULL) / total));
+                nextTestProgress += TEST_TRANSFER_PROGRESS_STEP;
+            }
+            fflush(stdout);
+            return;
+        }
+    }
     printf("RX   ");
     printHex(frame, frameLength);
     printf("  %s", crcValid ? "CRC OK" : "CRC BAD");
@@ -261,7 +297,7 @@ static int runOneShot(AppSerialPort_t *port, const char *commandName) {
         fputs("Timed out waiting for a BLE response.\n", stderr);
         return 1;
     }
-    uint8_t data[512];
+    uint8_t data[16U * 1024U];
     const int count = AppSerialPort_Read(port, data, sizeof(data));
     return count > 0 && AppH4StreamParser_Feed(
         &parser, data, (size_t)count, describeFrame, NULL) > 0U ? 0 : 1;
@@ -292,13 +328,11 @@ static int runInteractive(AppSerialPort_t *port) {
             return 1;
         }
         if ((inputs[1].revents & POLLIN) != 0) {
-            uint8_t data[512];
+            uint8_t data[16U * 1024U];
             const int count = AppSerialPort_Read(port, data, sizeof(data));
             if (count > 0) {
                 (void)AppH4StreamParser_Feed(
                     &parser, data, (size_t)count, describeFrame, NULL);
-                fputs("ble-uart> ", stdout);
-                fflush(stdout);
             }
         }
         if ((inputs[0].revents & POLLIN) != 0) {

@@ -11,6 +11,7 @@ from __future__ import annotations
 import queue
 import sys
 import threading
+from pathlib import Path
 
 from ble_protocol import (
     COMMAND_PRESETS,
@@ -28,6 +29,15 @@ from ble_protocol import (
 from serial_ports import available_ports
 
 
+def application_version() -> str:
+    """Read the repository-wide semantic application version."""
+    try:
+        return (Path(__file__).resolve().parents[1] / "VERSION").read_text(
+            encoding="utf-8").strip()
+    except OSError:
+        return "unknown"
+
+
 def run_gui() -> None:
     """Create the Tk application and run its main event loop.
 
@@ -39,6 +49,7 @@ def run_gui() -> None:
         raise SystemExit("pyserial is required. Run: python3 -m pip install -r python/requirements.txt") from error
 
     import tkinter as tk
+    import tkinter.font as tkfont
     from tkinter import ttk
 
     class BleUartApp:
@@ -50,7 +61,7 @@ def run_gui() -> None:
             @param root Tk root window owned by the caller.
             """
             self.root = root
-            self.root.title("BLE UART Client")
+            self.root.title(f"BLE UART Client v{application_version()}")
             self.root.geometry("960x780")
             self.root.minsize(760, 600)
             self.root.configure(background="#F5F7FA")
@@ -76,6 +87,12 @@ def run_gui() -> None:
             self.transfer_status_var = tk.StringVar(value="0 / 0 bytes")
             self.bulk_size_var = tk.StringVar(value="2 MiB")
             self.byte_irq_var = tk.BooleanVar(value=False)
+            self.irq_count_var = tk.StringVar(value="IRQ calls: 0")
+            self.irq_absolute_count = 0
+            self.receive_byte_irq_active = False
+            self.test_irq_active = False
+            self.test_irq_calls = 0
+            self.test_log_next_progress = 256 * 1024
 
             self._build_ui()
             self.refresh_ports()
@@ -105,12 +122,14 @@ def run_gui() -> None:
             container = ttk.Frame(self.root, padding=(20, 16), style="App.TFrame")
             container.pack(fill=tk.BOTH, expand=True)
 
-            tk.Label(container, text="BLE UART HCI Client", background="#F5F7FA",
-                     foreground="#192337", font=("TkDefaultFont", 20, "bold")).pack(anchor=tk.W)
+            tk.Label(container,
+                     text=f"BLE UART HCI Client  v{application_version()}",
+                     background="#F5F7FA", foreground="#192337",
+                     font=("Helvetica", 20, "bold")).pack(anchor=tk.W)
             tk.Label(container,
                      text="Portable Python UI • H4 framing • CRC16-CCITT • live receive parser",
                      background="#F5F7FA", foreground="#5A6478",
-                     font=("TkDefaultFont", 11)).pack(anchor=tk.W, pady=(2, 12))
+                     font=("Helvetica", 11)).pack(anchor=tk.W, pady=(2, 12))
 
             connection = ttk.LabelFrame(container, text="Serial connection", padding=(14, 10),
                                         style="App.TLabelframe")
@@ -129,8 +148,11 @@ def run_gui() -> None:
             self.connect_button.grid(row=0, column=4, ipadx=34)
             ttk.Label(connection,
                       text="Native copy/paste shortcuts • hardware baud rates up to 4000000",
-                      style="App.TLabel").grid(row=1, column=0, columnspan=4,
+                      style="App.TLabel").grid(row=1, column=0, columnspan=3,
                                                 sticky=tk.W, pady=(7, 4))
+            ttk.Label(connection, textvariable=self.irq_count_var,
+                      style="App.TLabel").grid(row=1, column=3, sticky=tk.E,
+                                                pady=(7, 4), padx=(0, 12))
             self.rx_mode_toggle = ttk.Checkbutton(
                 connection, text="Per-byte IRQ", variable=self.byte_irq_var,
                 command=self.send_rx_mode_request, state=tk.DISABLED)
@@ -304,7 +326,10 @@ def run_gui() -> None:
                 if port is None:
                     return
                 try:
-                    data = port.read(256)
+                    data = port.read(1)
+                    waiting = min(port.in_waiting, 16 * 1024 - len(data))
+                    if waiting:
+                        data += port.read(waiting)
                     if data:
                         self.rx_queue.put(("data", data))
                 except serial.SerialException as error:
@@ -330,15 +355,59 @@ def run_gui() -> None:
                         self.port_scan_running = False
                         self.log_notice(f"ERROR  Serial-port discovery failed: {value}", "ERROR")
                     elif kind == "data":
-                        for frame in self.parser.feed(value if isinstance(value, bytes) else b""):
+                        incoming = value if isinstance(value, bytes) else b""
+                        byte_irq_active = self.receive_byte_irq_active
+                        if byte_irq_active:
+                            self.irq_absolute_count += len(incoming)
+                        completed = self.parser.feed(incoming)
+                        self.irq_count_var.set(f"IRQ calls: {self.irq_absolute_count}")
+                        for frame in completed:
                             if frame.crc_valid and frame.rx_mode is not None:
-                                self.byte_irq_var.set(frame.rx_mode == RX_MODE_BYTE_IRQ)
+                                self.receive_byte_irq_active = (
+                                    frame.rx_mode == RX_MODE_BYTE_IRQ)
+                                self.byte_irq_var.set(self.receive_byte_irq_active)
                             crc_status = "CRC OK" if frame.crc_valid else (
                                 f"CRC BAD (got {frame.received_crc:04X}, expected {frame.computed_crc:04X})"
                             )
-                            self.log_line(
-                                "RX", frame.h4_packet + frame.received_crc.to_bytes(2, "big"),
-                                f"[{crc_status}, {frame.summary}]")
+                            flags = frame.test_transfer_flags
+                            irq_detail = ""
+                            if flags is not None and flags & 0x01:
+                                self.test_irq_active = True
+                                self.test_irq_calls = 0
+                                self.test_log_next_progress = 256 * 1024
+                            if flags is not None and self.test_irq_active and byte_irq_active:
+                                self.test_irq_calls += len(frame.h4_packet) + 2
+                            if flags is not None and self.test_irq_active and flags & 0x02:
+                                transmission_irqs = self.test_irq_calls
+                                self.test_irq_active = False
+                                irq_detail = (
+                                    f", IRQ complete: {transmission_irqs} calls; "
+                                    f"app total={self.irq_absolute_count}")
+                            elif flags is None:
+                                transmission_irqs = len(frame.h4_packet) + 2 if byte_irq_active else 0
+                                irq_detail = (
+                                    f", IRQ complete: {transmission_irqs} calls; "
+                                    f"app total={self.irq_absolute_count}")
+                            transfer = frame.test_transfer_info
+                            if transfer is not None and transfer[0] > 128:
+                                total, offset, chunk_size, transfer_flags = transfer
+                                received = offset + chunk_size
+                                if transfer_flags & 0x01:
+                                    self.log_notice(f"RX  TEST start: {total} bytes", "RX")
+                                if transfer_flags & 0x02:
+                                    self.log_notice(
+                                        f"RX  TEST complete: {received}/{total} bytes"
+                                        f"{irq_detail}", "RX")
+                                elif received >= self.test_log_next_progress:
+                                    self.log_notice(
+                                        f"RX  TEST progress: {received}/{total} bytes "
+                                        f"({received * 100 // total}%)", "RX")
+                                    self.test_log_next_progress += 256 * 1024
+                            else:
+                                self.log_line(
+                                    "RX", frame.h4_packet
+                                    + frame.received_crc.to_bytes(2, "big"),
+                                    f"[{crc_status}, {frame.summary}{irq_detail}]")
                     elif kind == "tx_progress":
                         sent, total = value if isinstance(value, tuple) else (0, 0)
                         self.transfer_progress.set(sent / total if total else 0.0)
@@ -417,14 +486,18 @@ def run_gui() -> None:
                 """Write generated test frames and post progress to the UI queue."""
                 sent = 0
                 next_progress = 256 * 1024
+                batch = bytearray()
                 try:
                     for frame in build_test_transfer_frames(total_size, identifier):
                         port = self.serial_port
                         if port is None:
                             return
-                        port.write(frame)
+                        batch.extend(frame)
                         chunk_size = int.from_bytes(frame[21:23], "little")
                         sent += chunk_size
+                        if len(batch) >= 64 * 1024 or sent == total_size:
+                            port.write(batch)
+                            batch.clear()
                         if sent >= next_progress:
                             self.rx_queue.put(("tx_progress", (sent, total_size)))
                             next_progress += 256 * 1024
@@ -456,6 +529,12 @@ def run_gui() -> None:
             self.root.destroy()
 
     root = tk.Tk()
+    preferred_family = ("Segoe UI" if sys.platform == "win32" else
+                        "Helvetica Neue" if sys.platform == "darwin" else
+                        "DejaVu Sans")
+    for named_font in ("TkDefaultFont", "TkTextFont", "TkMenuFont",
+                       "TkCaptionFont", "TkSmallCaptionFont"):
+        tkfont.nametofont(named_font).configure(family=preferred_family, size=11)
     BleUartApp(root)
     root.mainloop()
 

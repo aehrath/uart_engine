@@ -105,6 +105,12 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(frames[0][5:9], b"TEST")
         self.assertEqual(frames[0][10] & 0x01, 0x01)
         self.assertEqual(frames[-1][10] & 0x02, 0x02)
+        parser = H4CrcStreamParser()
+        parsed = [parser.feed(frame)[0] for frame in frames]
+        self.assertEqual(parsed[0].test_transfer_flags, 0x01)
+        self.assertEqual(parsed[-1].test_transfer_flags, 0x02)
+        self.assertEqual(parsed[0].test_transfer_info, (512, 0, 230, 0x01))
+        self.assertEqual(parsed[-1].test_transfer_info, (512, 460, 52, 0x02))
         self.assertTrue(all(crc16_ccitt(frame[:-2]) == int.from_bytes(frame[-2:], "big")
                             for frame in frames))
 

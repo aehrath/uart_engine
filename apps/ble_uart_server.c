@@ -9,6 +9,8 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -21,6 +23,7 @@
 #define UART_RXNE_FLAG       (1UL << 5)
 #define SERIAL_POLL_TICKS    pdMS_TO_TICKS(5U)
 #define MAX_WIRE_FRAME       UART_DMA_MAX_PACKET_SIZE
+#define TEST_TX_BATCH_SIZE   (64U * 1024U)
 
 static UART_TypeDef uartRegisters;
 static DMA_Stream_TypeDef rxDmaRegisters;
@@ -33,6 +36,11 @@ DMA_Stream_TypeDef *DMA_TX_STREAM = &txDmaRegisters;
 static int ptyMaster = -1;
 static uint32_t dmaWriteIndex;
 static volatile sig_atomic_t stopRequested;
+static volatile uint32_t outboundTestRequest;
+static volatile bool outboundTestActive;
+static uint32_t inboundTestIrqStart;
+static bool inboundTestIrqActive;
+static pthread_mutex_t ptyTxMutex = PTHREAD_MUTEX_INITIALIZER;
 
 /** Running verification state for the chunked deterministic transfer protocol. */
 typedef struct {
@@ -51,6 +59,42 @@ typedef struct {
 } TestTransferState_t;
 
 static TestTransferState_t testTransfer;
+
+/** Convert one hexadecimal digit to its numeric value. */
+static int hexNibble(char value) {
+    if (value >= '0' && value <= '9') {
+        return value - '0';
+    }
+    if (value >= 'a' && value <= 'f') {
+        return value - 'a' + 10;
+    }
+    if (value >= 'A' && value <= 'F') {
+        return value - 'A' + 10;
+    }
+    return -1;
+}
+
+/** Decode dashboard-provided compact hexadecimal H4 bytes. */
+static size_t parseDashboardPacket(const char *text, uint8_t *output,
+                                   size_t capacity) {
+    size_t length = 0U;
+    while (*text != '\0') {
+        while (*text == ' ' || *text == '\t' || *text == ':' || *text == ',') {
+            text++;
+        }
+        if (*text == '\0') {
+            break;
+        }
+        const int high = hexNibble(text[0]);
+        const int low = hexNibble(text[1]);
+        if (high < 0 || low < 0 || length == capacity) {
+            return SIZE_MAX;
+        }
+        output[length++] = (uint8_t)((high << 4) | low);
+        text += 2;
+    }
+    return length;
+}
 
 /** Record a termination request from a POSIX signal handler. */
 static void requestStop(int signalNumber) {
@@ -113,30 +157,104 @@ static void setRxMode(UartDmaRxMode_t mode, bool notifyClient) {
     }
 }
 
+/** Log this server process's completed-transmission IRQ statistics once. */
+static void reportRxIrqStats(uint32_t transmissionCount) {
+    const uint32_t absoluteCount = UartDma_GetRxInterruptCount();
+    printf("RX IRQ TRANSMISSION -> absolute=%u transmission=%u\n",
+           (unsigned int)absoluteCount, (unsigned int)transmissionCount);
+    fflush(stdout);
+}
+
+/** Recognize one chunk of the deterministic ACL transfer protocol. */
+static bool testTransferFrameFlags(const uint8_t *frame, uint16_t length,
+                                   uint8_t *flags) {
+    if (length < sizeof(BleHciAclHeader_t) + sizeof(TestTransferHeader_t) +
+                 sizeof(BleHciCrcTrailer_t)) {
+        return false;
+    }
+    BleHciAclHeader_t acl;
+    TestTransferHeader_t transfer;
+    memcpy(&acl, frame, sizeof(acl));
+    memcpy(&transfer, &frame[sizeof(acl)], sizeof(transfer));
+    if (acl.indicator.value != BLE_HCI_H4_ACL ||
+        (BleHciWire_FromLe16(acl.fields.handle_flags_le) & 0x0FFFU) !=
+            TEST_TRANSFER_HANDLE ||
+        transfer.version != 1U ||
+        memcmp(transfer.signature, "TEST", sizeof(transfer.signature)) != 0) {
+        return false;
+    }
+    *flags = transfer.flags;
+    return true;
+}
+
+/** Queue one dashboard-originated H4 packet for the server TX engine. */
+static void sendDashboardPacket(const char *encodedPacket) {
+    PacketMessage_t packet = {{0U}, 0U};
+    const size_t length = parseDashboardPacket(
+        encodedPacket, packet.payload, sizeof(packet.payload) - sizeof(BleHciCrcTrailer_t));
+    if (length == SIZE_MAX || length == 0U) {
+        puts("ERROR  Dashboard supplied invalid H4 hexadecimal bytes");
+        return;
+    }
+    packet.length = (uint32_t)length;
+    if (UartDma_SendPacket(&packet, pdMS_TO_TICKS(1000U)) == pdTRUE) {
+        printf("TX DMA <- dashboard H4 packet (%u bytes)\n", (unsigned int)length);
+    } else {
+        puts("ERROR  Dashboard H4 packet could not be queued");
+    }
+    fflush(stdout);
+}
+
 /** Adapter from serial-ingress callbacks to simulated DMA injection. */
 static void handleSerialFrame(const uint8_t *frame, uint16_t length, void *context) {
     (void)context;
+    const uint32_t before = UartDma_GetRxInterruptCount();
+    uint8_t testFlags = 0U;
+    const bool isTestTransfer = testTransferFrameFlags(frame, length, &testFlags);
+    if (isTestTransfer && (testFlags & TEST_TRANSFER_FLAG_START) != 0U) {
+        inboundTestIrqStart = before;
+        inboundTestIrqActive = true;
+    }
     injectDmaFrame(frame, length);
+    const uint32_t after = UartDma_GetRxInterruptCount();
+    if (isTestTransfer && inboundTestIrqActive) {
+        if ((testFlags & TEST_TRANSFER_FLAG_END) != 0U) {
+            reportRxIrqStats(after - inboundTestIrqStart);
+            inboundTestIrqActive = false;
+        }
+    } else {
+        reportRxIrqStats(after - before);
+    }
 }
 
-/** Write an entire DMA span to the pseudo-terminal master. */
-static void writeAll(const uint8_t *data, uint16_t size) {
-    uint16_t written = 0U;
+/** Write an entire byte span while the caller owns the pseudo-UART TX lock. */
+static bool writeAllUnlocked(const uint8_t *data, size_t size) {
+    size_t written = 0U;
     while (written < size && !stopRequested) {
-        const ssize_t result = write(ptyMaster, &data[written], (size_t)(size - written));
+        const ssize_t result = write(ptyMaster, &data[written], size - written);
         if (result > 0) {
-            written = (uint16_t)(written + (uint16_t)result);
+            written += (size_t)result;
         } else if (errno == EAGAIN || errno == EINTR) {
-            vTaskDelay(SERIAL_POLL_TICKS);
+            struct pollfd output = {ptyMaster, POLLOUT, 0};
+            (void)poll(&output, 1U, 10);
         } else {
-            break;
+            return false;
         }
     }
+    return written == size;
+}
+
+/** Write one complete span without interleaving another server transmission. */
+static bool writeAll(const uint8_t *data, size_t size) {
+    (void)pthread_mutex_lock(&ptyTxMutex);
+    const bool written = writeAllUnlocked(data, size);
+    (void)pthread_mutex_unlock(&ptyTxMutex);
+    return written;
 }
 
 /** Host implementation of the platform TX DMA hook. */
 void UartDma_PlatformTransmitDma(uint8_t *data, uint16_t size) {
-    writeAll(data, size);
+    (void)writeAll(data, size);
     DMA_TX_Complete_IRQHandler();
 }
 
@@ -189,7 +307,7 @@ static void onHciCommand(uint16_t opcode, uint8_t parameterLength,
 /** Read dashboard/terminal control lines without blocking the scheduler. */
 static void controlReaderTask(void *parameters) {
     (void)parameters;
-    char command[16];
+    char command[2048];
     size_t length = 0U;
     (void)fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK);
     while (!stopRequested) {
@@ -204,6 +322,23 @@ static void controlReaderTask(void *parameters) {
                     setRxMode(UART_DMA_RX_MODE_DMA_IDLE, true);
                 } else if (strcmp(command, "mode") == 0) {
                     sendRxModeState();
+                } else if (strcmp(command, "stats") == 0) {
+                    printf("RX IRQ COUNT -> %u\n",
+                           (unsigned int)UartDma_GetRxInterruptCount());
+                    fflush(stdout);
+                } else if (strncmp(command, "tx ", 3U) == 0) {
+                    sendDashboardPacket(&command[3]);
+                } else if (strncmp(command, "test ", 5U) == 0) {
+                    char *end = NULL;
+                    const unsigned long requested = strtoul(&command[5], &end, 10);
+                    if (*end != '\0' || requested == 0UL || requested > UINT32_MAX) {
+                        puts("ERROR  Dashboard supplied invalid test-transfer size");
+                    } else if (outboundTestActive || outboundTestRequest != 0U) {
+                        puts("ERROR  A server test transfer is already active");
+                    } else {
+                        outboundTestRequest = (uint32_t)requested;
+                    }
+                    fflush(stdout);
                 }
                 length = 0U;
             } else if (byte != '\r' && length + 1U < sizeof(command)) {
@@ -212,6 +347,106 @@ static void controlReaderTask(void *parameters) {
         } else {
             vTaskDelay(SERIAL_POLL_TICKS);
         }
+    }
+    vTaskDelete(NULL);
+}
+
+/** Generate dashboard-requested deterministic ACL traffic through TX DMA. */
+static void outboundTestTask(void *parameters) {
+    (void)parameters;
+    static TestTransferPacket_t acl;
+    static uint8_t wireBatch[TEST_TX_BATCH_SIZE];
+    uint16_t identifier = 0U;
+    while (!stopRequested) {
+        const uint32_t totalSize = outboundTestRequest;
+        if (totalSize == 0U) {
+            vTaskDelay(SERIAL_POLL_TICKS);
+            continue;
+        }
+        outboundTestRequest = 0U;
+        outboundTestActive = true;
+        identifier++;
+        if (identifier == 0U) {
+            identifier = 1U;
+        }
+        printf("TX DMA <- TEST message start id=%u size=%u bytes\n",
+               identifier, (unsigned int)totalSize);
+        fflush(stdout);
+
+        uint32_t offset = 0U;
+        uint32_t nextProgress = TEST_TRANSFER_PROGRESS_STEP;
+        size_t batchLength = 0U;
+        bool sent = true;
+        while (offset < totalSize && !stopRequested) {
+            const uint32_t remaining = totalSize - offset;
+            const uint16_t chunkSize = (uint16_t)(remaining < TEST_TRANSFER_CHUNK_DATA_SIZE
+                ? remaining : TEST_TRANSFER_CHUNK_DATA_SIZE);
+            const uint16_t aclLength = (uint16_t)(TEST_TRANSFER_HEADER_SIZE + chunkSize);
+            acl = (TestTransferPacket_t){
+                .h4 = {
+                    .indicator = {.value = BLE_HCI_H4_ACL},
+                    .fields = {
+                        .handle_flags_le = BleHciWire_ToLe16(TEST_TRANSFER_HANDLE),
+                        .data_length_le = BleHciWire_ToLe16(aclLength),
+                    },
+                },
+                .transfer = {
+                    .signature = {'T', 'E', 'S', 'T'},
+                    .version = 1U,
+                    .flags = (offset == 0U ? TEST_TRANSFER_FLAG_START : 0U)
+                           | (offset + chunkSize == totalSize ? TEST_TRANSFER_FLAG_END : 0U),
+                    .identifier_le = BleHciWire_ToLe16(identifier),
+                    .total_size_le = BleHciWire_ToLe32(totalSize),
+                    .offset_le = BleHciWire_ToLe32(offset),
+                    .chunk_size_le = BleHciWire_ToLe16(chunkSize),
+                },
+            };
+            for (uint16_t index = 0U; index < chunkSize; index++) {
+                acl.data[index] = TestTransfer_PatternByte(offset + index);
+            }
+
+            const size_t h4Length = sizeof(acl.h4) + aclLength;
+            const BleHciCrcTrailer_t trailer = {
+                BleHciWire_ToBe16(UartDma_ComputeCrc16((const uint8_t *)&acl, h4Length))
+            };
+            const size_t wireLength = h4Length + sizeof(trailer);
+            if (batchLength + wireLength > sizeof(wireBatch)) {
+                if (!writeAll(wireBatch, batchLength)) {
+                    sent = false;
+                    break;
+                }
+                batchLength = 0U;
+            }
+            memcpy(&wireBatch[batchLength], &acl, h4Length);
+            batchLength += h4Length;
+            memcpy(&wireBatch[batchLength], &trailer, sizeof(trailer));
+            batchLength += sizeof(trailer);
+
+            if (batchLength >= sizeof(wireBatch) - MAX_WIRE_FRAME &&
+                !writeAll(wireBatch, batchLength)) {
+                sent = false;
+                break;
+            }
+            if (batchLength >= sizeof(wireBatch) - MAX_WIRE_FRAME) {
+                batchLength = 0U;
+            }
+            offset += chunkSize;
+            if (offset >= nextProgress) {
+                printf("TX DMA <- TEST progress %u/%u bytes (%u%%)\n",
+                       (unsigned int)offset, (unsigned int)totalSize,
+                       (unsigned int)((offset * 100ULL) / totalSize));
+                fflush(stdout);
+                nextProgress += TEST_TRANSFER_PROGRESS_STEP;
+            }
+        }
+        if (sent && batchLength != 0U && !writeAll(wireBatch, batchLength)) {
+            sent = false;
+        }
+        printf("TX DMA <- TEST message %s id=%u size=%u bytes\n",
+               sent && offset == totalSize ? "complete" : "failed",
+               identifier, (unsigned int)offset);
+        fflush(stdout);
+        outboundTestActive = false;
     }
     vTaskDelete(NULL);
 }
@@ -331,9 +566,9 @@ static void onHciAcl(uint16_t handleFlags, uint16_t dataLength, const uint8_t *d
 /** FreeRTOS task that reads the pseudo-terminal and reassembles H4 frames. */
 static void serialReaderTask(void *parameters) {
     (void)parameters;
-    ServerSerialIngress_t ingress;
+    static ServerSerialIngress_t ingress;
     ServerSerialIngress_Init(&ingress);
-    uint8_t input[128];
+    static uint8_t input[16U * 1024U];
 
     while (!stopRequested) {
         const ssize_t count = read(ptyMaster, input, sizeof(input));
@@ -373,6 +608,11 @@ int main(void) {
         return 1;
     }
     if (xTaskCreate(controlReaderTask, "Mode_Control", configMINIMAL_STACK_SIZE + 128U,
+                    NULL, tskIDLE_PRIORITY + 1U, NULL) != pdPASS) {
+        PseudoUart_Close(ptyMaster);
+        return 1;
+    }
+    if (xTaskCreate(outboundTestTask, "Dashboard_TX", configMINIMAL_STACK_SIZE + 512U,
                     NULL, tskIDLE_PRIORITY + 1U, NULL) != pdPASS) {
         PseudoUart_Close(ptyMaster);
         return 1;

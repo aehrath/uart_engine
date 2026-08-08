@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.16)
 
-project(uart_dma LANGUAGES C)
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" UART_DMA_VERSION_TEXT)
+string(STRIP "${UART_DMA_VERSION_TEXT}" UART_DMA_VERSION_TEXT)
+project(uart_dma VERSION "${UART_DMA_VERSION_TEXT}" LANGUAGES C)
+
+configure_file(
+    config/app_version.h.in
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/uart_dma/app_version.h"
+    @ONLY
+)
 
 if(APPLE)
     enable_language(OBJC)
@@ -29,7 +37,10 @@ FetchContent_MakeAvailable(freertos_kernel)
 
 add_library(ble_hci_wire STATIC src/ble_hci_wire.c)
 target_compile_features(ble_hci_wire PRIVATE c_std_11)
-target_include_directories(ble_hci_wire PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
+target_include_directories(ble_hci_wire PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated"
+)
 
 if(MSVC)
     target_compile_options(ble_hci_wire PRIVATE /W4 /WX)
@@ -152,10 +163,14 @@ if(UART_DMA_BUILD_PORTABLE_UI)
         GIT_SHALLOW TRUE
     )
     FetchContent_MakeAvailable(raylib raygui)
+    set(UART_DMA_UI_FONT_SOURCE
+        "${raylib_SOURCE_DIR}/examples/text/resources/NotoSansTC-Regular.ttf")
 
     add_executable(ble_uart_client_ui apps/ble_uart_client_ui.c)
     target_include_directories(ble_uart_client_ui PRIVATE "${raygui_SOURCE_DIR}/src")
     target_link_libraries(ble_uart_client_ui PRIVATE raylib ble_uart_app_common)
+    target_compile_definitions(ble_uart_client_ui PRIVATE
+        UART_DMA_UI_FONT_FILE="NotoSansTC-Regular.ttf")
     target_compile_features(ble_uart_client_ui PRIVATE c_std_11)
 
     if(MSVC)
@@ -171,18 +186,26 @@ if(UART_DMA_BUILD_PORTABLE_UI)
             OUTPUT_NAME "BLE UART Client"
             MACOSX_BUNDLE_BUNDLE_NAME "BLE UART Client"
             MACOSX_BUNDLE_GUI_IDENTIFIER "com.example.ble-uart-client"
-            MACOSX_BUNDLE_BUNDLE_VERSION "1.0.0"
-            MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0"
+            MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+            MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
         )
     elseif(WIN32)
         set_target_properties(ble_uart_client_ui PROPERTIES WIN32_EXECUTABLE TRUE)
     endif()
+    add_custom_command(TARGET ble_uart_client_ui POST_BUILD
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${UART_DMA_UI_FONT_SOURCE}"
+                "$<TARGET_FILE_DIR:ble_uart_client_ui>/NotoSansTC-Regular.ttf"
+        COMMENT "Bundling the shared readable UI font"
+    )
 
     if(UNIX AND TARGET ble_uart_server)
         add_executable(ble_uart_server_ui apps/ble_uart_server_ui.c)
         add_dependencies(ble_uart_server_ui ble_uart_server)
         target_include_directories(ble_uart_server_ui PRIVATE "${raygui_SOURCE_DIR}/src")
-        target_link_libraries(ble_uart_server_ui PRIVATE raylib)
+        target_link_libraries(ble_uart_server_ui PRIVATE raylib ble_uart_app_common)
+        target_compile_definitions(ble_uart_server_ui PRIVATE
+            UART_DMA_UI_FONT_FILE="NotoSansTC-Regular.ttf")
         target_compile_features(ble_uart_server_ui PRIVATE c_std_11)
         target_compile_definitions(ble_uart_server_ui PRIVATE _DEFAULT_SOURCE)
         target_compile_options(ble_uart_server_ui PRIVATE -Wall -Wextra)
@@ -193,8 +216,8 @@ if(UART_DMA_BUILD_PORTABLE_UI)
                 OUTPUT_NAME "BLE UART Server"
                 MACOSX_BUNDLE_BUNDLE_NAME "BLE UART Server"
                 MACOSX_BUNDLE_GUI_IDENTIFIER "com.example.ble-uart-server"
-                MACOSX_BUNDLE_BUNDLE_VERSION "1.0.0"
-                MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0"
+                MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+                MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
             )
             add_custom_command(TARGET ble_uart_server_ui POST_BUILD
                 COMMAND "${CMAKE_COMMAND}" -E copy_if_different
@@ -203,6 +226,12 @@ if(UART_DMA_BUILD_PORTABLE_UI)
                 COMMENT "Bundling the continuous FreeRTOS BLE server engine"
             )
         endif()
+        add_custom_command(TARGET ble_uart_server_ui POST_BUILD
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${UART_DMA_UI_FONT_SOURCE}"
+                    "$<TARGET_FILE_DIR:ble_uart_server_ui>/NotoSansTC-Regular.ttf"
+            COMMENT "Bundling the shared readable UI font"
+        )
     endif()
 endif()
 
@@ -225,8 +254,8 @@ if(APPLE AND UART_DMA_BUILD_APP)
         OUTPUT_NAME "UART DMA Demo"
         MACOSX_BUNDLE_BUNDLE_NAME "UART DMA Demo"
         MACOSX_BUNDLE_GUI_IDENTIFIER "com.example.uart-dma-demo"
-        MACOSX_BUNDLE_BUNDLE_VERSION "1.0.0"
-        MACOSX_BUNDLE_SHORT_VERSION_STRING "1.0"
+        MACOSX_BUNDLE_BUNDLE_VERSION "${PROJECT_VERSION}"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "${PROJECT_VERSION}"
     )
 
     add_custom_command(TARGET uart_dma_demo_app POST_BUILD

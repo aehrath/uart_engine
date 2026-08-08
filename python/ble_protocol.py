@@ -198,6 +198,26 @@ class ParsedFrame:
             return self.h4_packet[7]
         return None
 
+    @property
+    def test_transfer_flags(self) -> int | None:
+        """Return deterministic ACL transfer flags, or `None` for other packets."""
+        info = self.test_transfer_info
+        return info[3] if info is not None else None
+
+    @property
+    def test_transfer_info(self) -> tuple[int, int, int, int] | None:
+        """Decode deterministic transfer total, offset, chunk size, and flags."""
+        if (self.packet_type == H4_ACL and len(self.h4_packet) >= 23
+                and (int.from_bytes(self.h4_packet[1:3], "little") & 0x0FFF)
+                    == TEST_TRANSFER_HANDLE
+                and self.h4_packet[5:9] == b"TEST" and self.h4_packet[9] == 1):
+            return (
+                int.from_bytes(self.h4_packet[13:17], "little"),
+                int.from_bytes(self.h4_packet[17:21], "little"),
+                int.from_bytes(self.h4_packet[21:23], "little"),
+                self.h4_packet[10],
+            )
+        return None
 
 class H4CrcStreamParser:
     """Incrementally decode H4 packets followed by the stack's two-byte CRC.
