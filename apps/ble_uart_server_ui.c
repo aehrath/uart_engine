@@ -34,6 +34,8 @@ typedef struct {
     pid_t processId;
     /** Nonblocking descriptor receiving combined stdout and stderr. */
     int outputDescriptor;
+    /** Descriptor sending mode-control lines to the child process. */
+    int inputDescriptor;
     /** Whether the child has not yet been reaped. */
     bool running;
     /** Whether termination has already been requested. */
@@ -54,6 +56,8 @@ typedef struct {
     unsigned int transmittedEvents;
     /** Most recent child exit status. */
     int exitStatus;
+    /** Authoritative mode parsed from the server engine log. */
+    bool byteIrqMode;
 } ServerState_t;
 
 /** Append one server log line, evicting the oldest line when full. */
@@ -75,6 +79,11 @@ static void handleServerLine(ServerLog_t *log, ServerState_t *state,
     if (port != NULL) {
         port += sizeof(portMarker) - 1U;
         (void)snprintf(state->port, sizeof(state->port), "%s", port);
+    }
+    if (strcmp(line, "RX MODE -> BYTE IRQ") == 0) {
+        state->byteIrqMode = true;
+    } else if (strcmp(line, "RX MODE -> DMA") == 0) {
+        state->byteIrqMode = false;
     }
     if (strncmp(line, "RX DMA -> HCI command", 21U) == 0 ||
         strstr(line, "TEST message start") != NULL) {
@@ -108,8 +117,13 @@ static void consumeProcessOutput(ServerProcess_t *process, ServerLog_t *log,
 /** Fork and connect the bundled continuous server engine. */
 static bool startServer(ServerProcess_t *process, ServerLog_t *log,
                         ServerState_t *state) {
-    int outputPipe[2];
-    if (pipe(outputPipe) != 0) {
+    int outputPipe[2] = {-1, -1};
+    int inputPipe[2] = {-1, -1};
+    if (pipe(outputPipe) != 0 || pipe(inputPipe) != 0) {
+        if (outputPipe[0] >= 0) {
+            close(outputPipe[0]);
+            close(outputPipe[1]);
+        }
         appendLog(log, "ERROR  Unable to create server output pipe");
         return false;
     }
@@ -127,23 +141,30 @@ static bool startServer(ServerProcess_t *process, ServerLog_t *log,
     if (child < 0) {
         close(outputPipe[0]);
         close(outputPipe[1]);
+        close(inputPipe[0]);
+        close(inputPipe[1]);
         appendLog(log, "ERROR  Unable to start BLE server process");
         return false;
     }
     if (child == 0) {
         close(outputPipe[0]);
+        close(inputPipe[1]);
         (void)dup2(outputPipe[1], STDOUT_FILENO);
         (void)dup2(outputPipe[1], STDERR_FILENO);
+        (void)dup2(inputPipe[0], STDIN_FILENO);
         close(outputPipe[1]);
+        close(inputPipe[0]);
         execl(helperPath, helperPath, (char *)NULL);
         perror("Unable to launch bundled BLE server engine");
         _exit(127);
     }
 
     close(outputPipe[1]);
+    close(inputPipe[0]);
     (void)fcntl(outputPipe[0], F_SETFL, fcntl(outputPipe[0], F_GETFL) | O_NONBLOCK);
     process->processId = child;
     process->outputDescriptor = outputPipe[0];
+    process->inputDescriptor = inputPipe[1];
     process->running = true;
     process->stopping = false;
     process->partialLength = 0U;
@@ -151,6 +172,7 @@ static bool startServer(ServerProcess_t *process, ServerLog_t *log,
     state->receivedCommands = 0U;
     state->transmittedEvents = 0U;
     state->exitStatus = 0;
+    state->byteIrqMode = false;
     appendLog(log, "Starting continuous FreeRTOS BLE server engine...");
     return true;
 }
@@ -189,6 +211,7 @@ static void pollServer(ServerProcess_t *process, ServerLog_t *log,
             handleServerLine(log, state, process->partialLine);
         }
         close(process->outputDescriptor);
+        close(process->inputDescriptor);
         process->running = false;
         process->stopping = false;
         state->exitStatus = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
@@ -196,6 +219,13 @@ static void pollServer(ServerProcess_t *process, ServerLog_t *log,
             ? "BLE server stopped cleanly"
             : "ERROR  BLE server engine exited unexpectedly");
     }
+}
+
+/** Send one receive-mode request to the running server engine. */
+static bool sendServerMode(ServerProcess_t *process, bool byteIrqMode) {
+    const char *const command = byteIrqMode ? "irq\n" : "dma\n";
+    return process->running &&
+           write(process->inputDescriptor, command, strlen(command)) == (ssize_t)strlen(command);
 }
 
 /** Render one dashboard metric card. */
@@ -216,8 +246,8 @@ int main(void) {
     SetWindowMinSize(760, 600);
     SetTargetFPS(60);
 
-    ServerProcess_t process = {0, -1, false, false, {0}, 0U};
-    ServerState_t state = {{0}, 0U, 0U, 0};
+    ServerProcess_t process = {0, -1, -1, false, false, {0}, 0U};
+    ServerState_t state = {{0}, 0U, 0U, 0, false};
     ServerLog_t log = {{{0}}, 0U};
     appendLog(&log, "Ready. Start the server to create a local pseudo-UART.");
 
@@ -256,7 +286,9 @@ int main(void) {
         drawMetricCard((Rectangle){327, 151, 284, 82}, "TX Command Complete events", txValue,
                        (Color){45, 185, 105, 255});
         drawMetricCard((Rectangle){630, 151, 306, 82}, "Transport",
-                       process.running ? "DMA active" : "Idle",
+                       process.running
+                           ? (state.byteIrqMode ? "Byte IRQ active" : "DMA active")
+                           : "Idle",
                        serverColor);
 
         GuiGroupBox((Rectangle){20, 253, 920, 103}, "Client connection");
@@ -269,8 +301,21 @@ int main(void) {
                 appendLog(&log, "Copied pseudo-UART port to clipboard");
             }
         }
-        GuiLabel((Rectangle){36, 315, 880, 24},
-                 "Paste this port into the Python app, C terminal client, or portable C client UI.");
+        GuiLabel((Rectangle){36, 315, 650, 24},
+                 "Paste this port into the Python app, C terminal client, or C client UI.");
+        const bool previousMode = state.byteIrqMode;
+        if (!process.running) {
+            GuiDisable();
+        }
+        const bool modeChanged = GuiCheckBox((Rectangle){748, 315, 20, 20},
+                                             "Per-byte IRQ", &state.byteIrqMode) != 0;
+        if (!process.running) {
+            GuiEnable();
+        }
+        if (modeChanged && !sendServerMode(&process, state.byteIrqMode)) {
+            state.byteIrqMode = previousMode;
+            appendLog(&log, "ERROR  Unable to send receive-mode request");
+        }
 
         GuiGroupBox((Rectangle){20, 374, 920, 306}, "Live DMA / HCI traffic");
         DrawRectangle(34, 398, 892, 266, (Color){20, 25, 35, 255});
@@ -291,6 +336,7 @@ int main(void) {
         requestServerStop(&process, &log);
         (void)waitpid(process.processId, NULL, 0);
         close(process.outputDescriptor);
+        close(process.inputDescriptor);
     }
     CloseWindow();
     return 0;

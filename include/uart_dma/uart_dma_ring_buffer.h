@@ -17,6 +17,14 @@ void UartDmaRingBuffer_Reset(void);
 uint8_t *UartDma_GetRxBuffer(void);
 /** Query the circular receive capacity. @return Buffer size in bytes. */
 uint32_t UartDma_GetRxBufferSize(void);
+/** Append one byte received through the UART RXNE interrupt path.
+ * @param byte Value read from the UART receive-data register. */
+void UartDmaRingBuffer_WriteByte(uint8_t byte);
+/** Align the software producer cursor when switching receive paths.
+ * @param write_index Next circular position to be written. */
+void UartDmaRingBuffer_SetWriteIndex(uint32_t write_index);
+/** Return the software producer cursor used by per-byte IRQ mode. */
+uint32_t UartDmaRingBuffer_GetWriteIndex(void);
 /** Copy unread bytes through a DMA write cursor into linear storage.
  * @param write_index Current producer position derived from DMA `NDTR`.
  * @param destination Destination for newly arrived bytes.

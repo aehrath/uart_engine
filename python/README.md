@@ -24,6 +24,18 @@ and `serial_ports.py` handles port discovery.
 Select the UART device and baud rate, connect, and either choose an HCI command
 preset or enter a raw H4 packet. The app adds the CRC automatically.
 
+The Python window mirrors the portable C client: both use the same 960x780
+four-panel layout, command presets, editable HCI fields, 128-byte quick-test
+button, selectable 16 KiB through 16 MiB large transfers, progress display, and
+color-coded rolling traffic log. Tk entry fields retain their platform-native
+selection and clipboard behavior.
+
+The **Per-byte IRQ** checkbox mirrors the C client and server dashboard. It
+selects either one UART RX interrupt per byte or the normal circular-DMA/IDLE
+receiver. The server replies with its authoritative state, so changing the
+toggle at either end keeps both applications synchronized; connection also
+queries the current mode automatically.
+
 ## Packet format
 
 ```text

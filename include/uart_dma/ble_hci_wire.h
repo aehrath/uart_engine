@@ -17,6 +17,17 @@
 #define BLE_HCI_H4_ISO     0x05U
 /** @} */
 
+/** Vendor command used to set or query the UART receive mode. */
+#define BLE_HCI_RX_MODE_OPCODE       0xFC01U
+/** Vendor event code carrying synchronized application state. */
+#define BLE_HCI_VENDOR_EVENT_CODE    0xFFU
+/** DMA circular receive mode value used on the control wire. */
+#define BLE_HCI_RX_MODE_DMA          0x00U
+/** Per-byte UART interrupt receive mode value used on the control wire. */
+#define BLE_HCI_RX_MODE_BYTE_IRQ     0x01U
+/** Query-only value that leaves the current receive mode unchanged. */
+#define BLE_HCI_RX_MODE_QUERY        0xFFU
+
 /** Maximum parameter bytes encoded by an HCI Command header. */
 #define BLE_HCI_MAX_COMMAND_PARAMETERS 255U
 /** Maximum H4 bytes before the project-specific CRC trailer. */
@@ -228,6 +239,28 @@ typedef struct BLE_HCI_WIRE_PACKED {
     BleHciTestCompleteParameters_t parameters;
 } BleHciTestCompleteEvent_t;
 
+/** Parameter carried by the vendor RX-mode command. */
+typedef struct BLE_HCI_WIRE_PACKED {
+    /** BLE_HCI_RX_MODE_DMA, BLE_HCI_RX_MODE_BYTE_IRQ, or BLE_HCI_RX_MODE_QUERY. */
+    uint8_t mode;
+} BleHciRxModeCommandParameters_t;
+
+/** Parameters carried by a synchronized RX-mode vendor event. */
+typedef struct BLE_HCI_WIRE_PACKED {
+    /** ASCII `RXMD` discriminator. */
+    char signature[4];
+    /** Current BLE_HCI_RX_MODE_* value. */
+    uint8_t mode;
+} BleHciRxModeEventParameters_t;
+
+/** Vendor event broadcasting the server's current UART receive mode. */
+typedef struct BLE_HCI_WIRE_PACKED {
+    /** Vendor-specific HCI Event header. */
+    BleHciEventHeader_t header;
+    /** Typed synchronized mode state. */
+    BleHciRxModeEventParameters_t parameters;
+} BleHciRxModeEvent_t;
+
 /** Project-specific big-endian CRC trailer appended after an H4 packet. */
 typedef struct BLE_HCI_WIRE_PACKED {
     /** CRC16-CCITT in big-endian wire order. */
@@ -251,12 +284,17 @@ _Static_assert(sizeof(BleHciCommandCompleteParameters_t) == 4U,
                "Command Complete parameters layout changed");
 _Static_assert(sizeof(BleHciTestCompleteParameters_t) == 11U,
                "Test Complete parameters layout changed");
+_Static_assert(sizeof(BleHciRxModeCommandParameters_t) == 1U,
+               "RX mode command parameters layout changed");
+_Static_assert(sizeof(BleHciRxModeEventParameters_t) == 5U,
+               "RX mode event parameters layout changed");
 _Static_assert(sizeof(BleHciAclHeader_t) == 5U, "H4 ACL header layout changed");
 _Static_assert(sizeof(BleHciEventHeader_t) == 3U, "H4 event header layout changed");
 _Static_assert(sizeof(BleHciScoHeader_t) == 4U, "H4 SCO header layout changed");
 _Static_assert(sizeof(BleHciIsoHeader_t) == 5U, "H4 ISO header layout changed");
 _Static_assert(sizeof(BleHciCommandCompleteEvent_t) == 7U, "Command Complete layout changed");
 _Static_assert(sizeof(BleHciTestCompleteEvent_t) == 14U, "Test Complete layout changed");
+_Static_assert(sizeof(BleHciRxModeEvent_t) == 8U, "RX mode event layout changed");
 _Static_assert(sizeof(BleHciCrcTrailer_t) == 2U, "CRC trailer layout changed");
 
 /** Return the fixed header size for an H4 packet indicator.

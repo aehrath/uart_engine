@@ -9,13 +9,19 @@ the application controller, background serial reader, and widgets.
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 
 from ble_protocol import (
     COMMAND_PRESETS,
     H4CrcStreamParser,
+    RX_MODE_BYTE_IRQ,
+    RX_MODE_DMA,
+    RX_MODE_QUERY,
+    TEST_TRANSFER_SIZES,
     add_crc,
     build_hci_command,
+    build_rx_mode_command,
     build_test_transfer_frames,
     parse_hex,
 )
@@ -33,7 +39,7 @@ def run_gui() -> None:
         raise SystemExit("pyserial is required. Run: python3 -m pip install -r python/requirements.txt") from error
 
     import tkinter as tk
-    from tkinter import messagebox, scrolledtext, ttk
+    from tkinter import ttk
 
     class BleUartApp:
         """Coordinates Tk widgets, serial I/O, parsing, and test transfers."""
@@ -44,84 +50,153 @@ def run_gui() -> None:
             @param root Tk root window owned by the caller.
             """
             self.root = root
-            self.root.title("BLE UART HCI Client")
-            self.root.geometry("880x650")
+            self.root.title("BLE UART Client")
+            self.root.geometry("960x780")
+            self.root.minsize(760, 600)
+            self.root.configure(background="#F5F7FA")
             self.serial_port: serial.Serial | None = None
             self.reader_thread: threading.Thread | None = None
             self.stop_reader = threading.Event()
             self.rx_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+            self.port_scan_running = False
             self.parser = H4CrcStreamParser()
             self.test_identifier = 0
+            self.log_line_count = 0
 
-            self.port_var = tk.StringVar()
+            default_port = "COM3" if sys.platform == "win32" else (
+                "/dev/ttys006" if sys.platform == "darwin" else "/dev/ttyUSB0")
+            self.port_var = tk.StringVar(value=default_port)
             self.baud_var = tk.StringVar(value="4000000")
             self.status_var = tk.StringVar(value="Disconnected")
             self.preset_var = tk.StringVar(value=next(iter(COMMAND_PRESETS)))
             self.opcode_var = tk.StringVar(value="0C03")
             self.parameters_var = tk.StringVar()
             self.raw_var = tk.StringVar(value="01 03 0C 00")
+            self.transfer_progress = tk.DoubleVar(value=0.0)
+            self.transfer_status_var = tk.StringVar(value="0 / 0 bytes")
+            self.bulk_size_var = tk.StringVar(value="2 MiB")
+            self.byte_irq_var = tk.BooleanVar(value=False)
 
-            self._build_ui(ttk, scrolledtext)
+            self._build_ui()
             self.refresh_ports()
             self.select_preset()
+            self.log_notice("Ready. Start ble_uart_server and enter its printed port.")
             self.root.after(40, self.drain_reader_queue)
             self.root.protocol("WM_DELETE_WINDOW", self.close)
 
-        def _build_ui(self, ttk_module: object, scrolledtext_module: object) -> None:
-            """Create and arrange all connection, command, transfer, and log widgets."""
-            del ttk_module, scrolledtext_module
-            container = ttk.Frame(self.root, padding=16)
+        def _configure_styles(self) -> None:
+            """Configure a cross-platform palette matching the native C client."""
+            style = ttk.Style(self.root)
+            if "clam" in style.theme_names():
+                style.theme_use("clam")
+            style.configure("App.TFrame", background="#F5F7FA")
+            style.configure("App.TLabel", background="#F5F7FA", foreground="#5A6478")
+            style.configure("App.TLabelframe", background="#F5F7FA", bordercolor="#A0A8B5")
+            style.configure("App.TLabelframe.Label", background="#F5F7FA",
+                            foreground="#192337")
+            style.configure("Status.TLabel", background="#FFFFFF", foreground="#192337",
+                            relief=tk.SUNKEN, padding=(8, 5))
+            style.configure("Transfer.Horizontal.TProgressbar", troughcolor="#DCE1E8",
+                            background="#4691EB", bordercolor="#969EAC")
+
+        def _build_ui(self) -> None:
+            """Create the same connection, command, transfer, and log layout as the C UI."""
+            self._configure_styles()
+            container = ttk.Frame(self.root, padding=(20, 16), style="App.TFrame")
             container.pack(fill=tk.BOTH, expand=True)
 
-            connection = ttk.LabelFrame(container, text="Serial connection", padding=10)
+            tk.Label(container, text="BLE UART HCI Client", background="#F5F7FA",
+                     foreground="#192337", font=("TkDefaultFont", 20, "bold")).pack(anchor=tk.W)
+            tk.Label(container,
+                     text="Portable Python UI • H4 framing • CRC16-CCITT • live receive parser",
+                     background="#F5F7FA", foreground="#5A6478",
+                     font=("TkDefaultFont", 11)).pack(anchor=tk.W, pady=(2, 12))
+
+            connection = ttk.LabelFrame(container, text="Serial connection", padding=(14, 10),
+                                        style="App.TLabelframe")
             connection.pack(fill=tk.X)
-            ttk.Label(connection, text="Port").grid(row=0, column=0, sticky=tk.W)
+            ttk.Label(connection, text="Port", style="App.TLabel").grid(row=0, column=0,
+                                                                          sticky=tk.W)
             self.port_combo = ttk.Combobox(connection, textvariable=self.port_var, width=42)
-            self.port_combo.grid(row=0, column=1, padx=8, sticky=tk.EW)
-            ttk.Button(connection, text="Refresh", command=self.refresh_ports).grid(row=0, column=2)
-            ttk.Label(connection, text="Baud").grid(row=0, column=3, padx=(16, 0))
+            self.port_combo.grid(row=0, column=1, padx=(8, 18), sticky=tk.EW)
+            self.port_combo.bind("<Button-1>", lambda _event: self.refresh_ports())
+            ttk.Label(connection, text="Baud", style="App.TLabel").grid(row=0, column=2)
             ttk.Combobox(connection, textvariable=self.baud_var, width=10,
                          values=("9600", "57600", "115200", "460800", "921600",
-                                 "1000000", "2000000", "3000000", "4000000")).grid(row=0, column=4, padx=8)
+                                 "1000000", "2000000", "3000000", "4000000")).grid(
+                                     row=0, column=3, padx=8)
             self.connect_button = ttk.Button(connection, text="Connect", command=self.toggle_connection)
-            self.connect_button.grid(row=0, column=5)
-            ttk.Label(connection, textvariable=self.status_var).grid(row=1, column=1, sticky=tk.W, pady=(8, 0))
+            self.connect_button.grid(row=0, column=4, ipadx=34)
+            ttk.Label(connection,
+                      text="Native copy/paste shortcuts • hardware baud rates up to 4000000",
+                      style="App.TLabel").grid(row=1, column=0, columnspan=4,
+                                                sticky=tk.W, pady=(7, 4))
+            self.rx_mode_toggle = ttk.Checkbutton(
+                connection, text="Per-byte IRQ", variable=self.byte_irq_var,
+                command=self.send_rx_mode_request, state=tk.DISABLED)
+            self.rx_mode_toggle.grid(row=1, column=4, sticky=tk.E, pady=(7, 4))
+            ttk.Label(connection, textvariable=self.status_var, style="Status.TLabel").grid(
+                row=2, column=0, columnspan=5, sticky=tk.EW)
             connection.columnconfigure(1, weight=1)
 
-            command = ttk.LabelFrame(container, text="Send HCI command", padding=10)
+            command = ttk.LabelFrame(container, text="HCI command", padding=(14, 10),
+                                     style="App.TLabelframe")
             command.pack(fill=tk.X, pady=(12, 0))
-            ttk.Label(command, text="Preset").grid(row=0, column=0, sticky=tk.W)
+            ttk.Label(command, text="Preset", style="App.TLabel").grid(row=0, column=0,
+                                                                         sticky=tk.W)
             preset = ttk.Combobox(command, textvariable=self.preset_var,
                                   values=tuple(COMMAND_PRESETS), state="readonly", width=28)
-            preset.grid(row=0, column=1, padx=8, sticky=tk.W)
+            preset.grid(row=0, column=1, padx=(8, 24), sticky=tk.EW)
             preset.bind("<<ComboboxSelected>>", lambda _event: self.select_preset())
-            ttk.Label(command, text="Opcode").grid(row=0, column=2, padx=(16, 0))
+            ttk.Label(command, text="Opcode", style="App.TLabel").grid(row=0, column=2)
             ttk.Entry(command, textvariable=self.opcode_var, width=10).grid(row=0, column=3, padx=8)
-            ttk.Label(command, text="Parameters (hex)").grid(row=1, column=0, sticky=tk.W, pady=(10, 0))
+            ttk.Label(command, text="Parameters (hex)", style="App.TLabel").grid(
+                row=1, column=0, sticky=tk.W, pady=(10, 0))
             ttk.Entry(command, textvariable=self.parameters_var).grid(row=1, column=1, columnspan=3,
                                                                        padx=8, pady=(10, 0), sticky=tk.EW)
-            ttk.Button(command, text="Send command", command=self.send_command).grid(row=0, column=4,
-                                                                                       rowspan=2, padx=(12, 0))
+            ttk.Button(command, text="Send command", command=self.send_command).grid(
+                row=1, column=4, padx=(12, 0), pady=(10, 0), ipadx=14)
+            ttk.Label(command, text="Raw H4 (hex)", style="App.TLabel").grid(
+                row=2, column=0, sticky=tk.W, pady=(10, 0))
+            ttk.Entry(command, textvariable=self.raw_var).grid(
+                row=2, column=1, columnspan=3, padx=8, pady=(10, 0), sticky=tk.EW)
+            ttk.Button(command, text="Append CRC + send", command=self.send_raw).grid(
+                row=2, column=4, padx=(12, 0), pady=(10, 0), ipadx=5)
             command.columnconfigure(1, weight=1)
 
-            raw = ttk.LabelFrame(container, text="Send raw H4 packet", padding=10)
-            raw.pack(fill=tk.X, pady=(12, 0))
-            ttk.Entry(raw, textvariable=self.raw_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
-            ttk.Button(raw, text="Append CRC + send", command=self.send_raw).pack(side=tk.LEFT, padx=(10, 0))
-
-            bulk = ttk.LabelFrame(container, text="Bulk test messages", padding=10)
+            bulk = ttk.LabelFrame(container, text="Bulk test messages", padding=(14, 10),
+                                  style="App.TLabelframe")
             bulk.pack(fill=tk.X, pady=(12, 0))
-            ttk.Button(bulk, text="Send 128 bytes",
-                       command=lambda: self.start_test_transfer(128)).pack(side=tk.LEFT)
-            ttk.Button(bulk, text="Send 2 MiB",
-                       command=lambda: self.start_test_transfer(2 * 1024 * 1024)).pack(side=tk.LEFT, padx=(10, 0))
-            self.transfer_status = ttk.Label(bulk, text="Ready")
-            self.transfer_status.pack(side=tk.LEFT, padx=(16, 0))
+            ttk.Button(bulk, text="Send 128-byte message",
+                       command=lambda: self.start_test_transfer(128)).grid(row=0, column=0,
+                                                                           ipadx=8)
+            ttk.Label(bulk, text="Large block", style="App.TLabel").grid(
+                row=0, column=1, padx=(12, 6))
+            ttk.Combobox(bulk, textvariable=self.bulk_size_var,
+                         values=tuple(label for label, _size in TEST_TRANSFER_SIZES),
+                         state="readonly", width=9).grid(row=0, column=2)
+            ttk.Button(bulk, text="Send selected block",
+                       command=self.send_selected_test_transfer).grid(
+                           row=0, column=3, padx=(12, 18), ipadx=5)
+            ttk.Progressbar(bulk, variable=self.transfer_progress, maximum=1.0,
+                            style="Transfer.Horizontal.TProgressbar").grid(
+                                row=0, column=4, sticky=tk.EW)
+            ttk.Label(bulk, textvariable=self.transfer_status_var, style="App.TLabel").grid(
+                row=1, column=4, sticky=tk.W, pady=(5, 0))
+            bulk.columnconfigure(4, weight=1)
 
-            ttk.Label(container, text="UART traffic").pack(anchor=tk.W, pady=(12, 4))
-            self.log = scrolledtext.ScrolledText(container, height=20, state=tk.DISABLED,
-                                                  font=("Menlo", 11))
+            traffic = ttk.LabelFrame(container, text="UART traffic", padding=(12, 10),
+                                     style="App.TLabelframe")
+            traffic.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
+            self.log = tk.Text(traffic, height=13, state=tk.DISABLED, wrap=tk.NONE,
+                               background="#141923", foreground="#BEC6D2",
+                               insertbackground="#BEC6D2", relief=tk.FLAT,
+                               font=("TkFixedFont", 10), padx=10, pady=8)
             self.log.pack(fill=tk.BOTH, expand=True)
+            self.log.tag_configure("TX", foreground="#64BEFF")
+            self.log.tag_configure("RX", foreground="#69E196")
+            self.log.tag_configure("ERROR", foreground="#FF7878")
+            self.log.tag_configure("TEST", foreground="#BEC6D2")
 
         def log_line(self, direction: str, data: bytes, detail: str = "") -> None:
             """Append one formatted TX or RX record to the traffic view.
@@ -131,19 +206,37 @@ def run_gui() -> None:
             @param detail Optional protocol description.
             """
             suffix = f"  {detail}" if detail else ""
+            self._append_log_text(f"{direction:<5} {data.hex(' ').upper()}{suffix}", direction)
+
+        def _append_log_text(self, message: str, kind: str) -> None:
+            """Append and color one line while retaining the C UI's 13-line window."""
             self.log.configure(state=tk.NORMAL)
-            self.log.insert(tk.END, f"{direction:<4} {data.hex(' ').upper()}{suffix}\n")
+            self.log.insert(tk.END, f"{message}\n", kind)
+            self.log_line_count += 1
+            if self.log_line_count > 13:
+                self.log.delete("1.0", "2.0")
+                self.log_line_count -= 1
             self.log.see(tk.END)
             self.log.configure(state=tk.DISABLED)
 
+        def log_notice(self, message: str, kind: str = "TEST") -> None:
+            """Append a non-packet status line to the rolling traffic view."""
+            self._append_log_text(message, kind)
+
         def refresh_ports(self) -> None:
-            """Refresh the serial-device picker while preserving a valid selection."""
-            ports = list(available_ports())
-            devices = [device for device, _description in ports]
-            self.port_combo["values"] = devices
-            if devices and self.port_var.get() not in devices:
-                self.port_var.set(devices[0])
-            self.status_var.set(f"{len(devices)} serial port(s) found" if devices else "No serial ports found")
+            """Refresh devices asynchronously so an OS serial driver cannot block Tk."""
+            if self.port_scan_running:
+                return
+            self.port_scan_running = True
+
+            def discover() -> None:
+                """Run pyserial/IOKit enumeration outside Tk's event thread."""
+                try:
+                    self.rx_queue.put(("ports", list(available_ports())))
+                except Exception as error:  # A platform backend may raise driver-specific errors.
+                    self.rx_queue.put(("ports_error", error))
+
+            threading.Thread(target=discover, daemon=True).start()
 
         def toggle_connection(self) -> None:
             """Connect the selected port or disconnect the active port.
@@ -155,9 +248,15 @@ def run_gui() -> None:
                 self.disconnect()
                 return
             port_name = self.port_var.get()
-            requested_baud = int(self.baud_var.get())
+            try:
+                requested_baud = int(self.baud_var.get())
+            except ValueError:
+                self.status_var.set("Invalid baud rate")
+                self.log_notice("ERROR  Baud rate must be a decimal number", "ERROR")
+                return
             if not 0 < requested_baud <= 4_000_000:
-                messagebox.showerror("Invalid baud rate", "Baud must be between 1 and 4,000,000.")
+                self.status_var.set("Baud must be between 1 and 4000000")
+                self.log_notice("ERROR  Baud must be between 1 and 4000000", "ERROR")
                 return
             simulated_baud = False
             try:
@@ -168,17 +267,22 @@ def run_gui() -> None:
                         self.serial_port = serial.Serial(port_name, 115200, timeout=0.1)
                         simulated_baud = True
                     except (OSError, serial.SerialException):
-                        messagebox.showerror("Connection failed", str(error))
+                        self.status_var.set(str(error))
+                        self.log_notice(f"ERROR  {error}", "ERROR")
                         return
                 else:
-                    messagebox.showerror("Connection failed", str(error))
+                    self.status_var.set(str(error))
+                    self.log_notice(f"ERROR  {error}", "ERROR")
                     return
             self.stop_reader.clear()
             self.reader_thread = threading.Thread(target=self.read_serial, daemon=True)
             self.reader_thread.start()
             self.connect_button.configure(text="Disconnect")
+            self.rx_mode_toggle.configure(state=tk.NORMAL)
             suffix = f" (simulating {requested_baud:,} baud on PTY)" if simulated_baud else ""
             self.status_var.set(f"Connected to {self.serial_port.port}{suffix}")
+            self.log_notice(f"Connected to {self.serial_port.port} at {requested_baud} baud")
+            self.write_frame(build_rx_mode_command(RX_MODE_QUERY), "RX mode query")
 
         def disconnect(self) -> None:
             """Stop the reader, close the serial device, and reset connection UI."""
@@ -186,8 +290,11 @@ def run_gui() -> None:
             port = self.serial_port
             self.serial_port = None
             if port is not None:
+                port_name = port.port
                 port.close()
+                self.log_notice(f"Disconnected from {port_name}")
             self.connect_button.configure(text="Connect")
+            self.rx_mode_toggle.configure(state=tk.DISABLED)
             self.status_var.set("Disconnected")
 
         def read_serial(self) -> None:
@@ -210,20 +317,38 @@ def run_gui() -> None:
                 while True:
                     kind, value = self.rx_queue.get_nowait()
                     if kind == "error":
-                        messagebox.showerror("Serial error", str(value))
+                        self.log_notice(f"ERROR  {value}", "ERROR")
                         self.disconnect()
+                    elif kind == "ports":
+                        self.port_scan_running = False
+                        ports = value if isinstance(value, list) else []
+                        devices = [device for device, _description in ports]
+                        self.port_combo["values"] = devices
+                        if devices and not self.port_var.get():
+                            self.port_var.set(devices[0])
+                    elif kind == "ports_error":
+                        self.port_scan_running = False
+                        self.log_notice(f"ERROR  Serial-port discovery failed: {value}", "ERROR")
                     elif kind == "data":
                         for frame in self.parser.feed(value if isinstance(value, bytes) else b""):
+                            if frame.crc_valid and frame.rx_mode is not None:
+                                self.byte_irq_var.set(frame.rx_mode == RX_MODE_BYTE_IRQ)
                             crc_status = "CRC OK" if frame.crc_valid else (
                                 f"CRC BAD (got {frame.received_crc:04X}, expected {frame.computed_crc:04X})"
                             )
-                            self.log_line("RX", frame.h4_packet + frame.received_crc.to_bytes(2, "big"),
-                                          f"{frame.summary}; {crc_status}")
+                            self.log_line(
+                                "RX", frame.h4_packet + frame.received_crc.to_bytes(2, "big"),
+                                f"[{crc_status}, {frame.summary}]")
                     elif kind == "tx_progress":
                         sent, total = value if isinstance(value, tuple) else (0, 0)
-                        self.transfer_status.configure(text=f"Sending {sent:,} / {total:,} bytes")
+                        self.transfer_progress.set(sent / total if total else 0.0)
+                        self.transfer_status_var.set(f"{sent} / {total} bytes")
+                        self.log_notice(f"TEST  Sent {sent}/{total} bytes ({sent * 100 // total}%)")
                     elif kind == "tx_done":
-                        self.transfer_status.configure(text=f"Sent {int(value):,} bytes; awaiting verification")
+                        total = int(value)
+                        self.transfer_progress.set(1.0)
+                        self.transfer_status_var.set(f"{total} / {total} bytes")
+                        self.log_notice(f"TEST  All {total} bytes sent; waiting for server verification")
             except queue.Empty:
                 pass
             self.root.after(40, self.drain_reader_queue)
@@ -235,14 +360,14 @@ def run_gui() -> None:
             @param detail Human-readable protocol description.
             """
             if self.serial_port is None:
-                messagebox.showwarning("Not connected", "Connect to a serial port first.")
+                self.log_notice("ERROR  Connect to a serial port first", "ERROR")
                 return
             try:
                 self.serial_port.write(frame)
                 self.serial_port.flush()
-                self.log_line("TX", frame, detail)
+                self.log_line("TX", frame[:-2], f"[CRC {frame[-2:].hex().upper()}] {detail}")
             except serial.SerialException as error:
-                messagebox.showerror("Send failed", str(error))
+                self.log_notice(f"ERROR  Serial write failed: {error}", "ERROR")
                 self.disconnect()
 
         def select_preset(self) -> None:
@@ -258,7 +383,7 @@ def run_gui() -> None:
                 parameters = parse_hex(self.parameters_var.get())
                 frame = build_hci_command(opcode, parameters)
             except ValueError as error:
-                messagebox.showerror("Invalid command", str(error))
+                self.log_notice(f"ERROR  {error}", "ERROR")
                 return
             self.write_frame(frame, f"HCI command 0x{opcode:04X}; CRC {frame[-2:].hex().upper()}")
 
@@ -270,7 +395,7 @@ def run_gui() -> None:
                     raise ValueError("Enter at least one H4 byte.")
                 frame = add_crc(payload)
             except ValueError as error:
-                messagebox.showerror("Invalid packet", str(error))
+                self.log_notice(f"ERROR  {error}", "ERROR")
                 return
             self.write_frame(frame, f"raw H4; CRC {frame[-2:].hex().upper()}")
 
@@ -280,10 +405,13 @@ def run_gui() -> None:
             @param total_size Logical number of generated payload bytes.
             """
             if self.serial_port is None:
-                messagebox.showwarning("Not connected", "Connect to a serial port first.")
+                self.log_notice("ERROR  Connect before sending test data", "ERROR")
                 return
             self.test_identifier = (self.test_identifier + 1) & 0xFFFF or 1
             identifier = self.test_identifier
+            self.transfer_progress.set(0.0)
+            self.transfer_status_var.set(f"0 / {total_size} bytes")
+            self.log_notice(f"TEST  Sending {total_size} bytes (id={identifier})")
 
             def send_worker() -> None:
                 """Write generated test frames and post progress to the UI queue."""
@@ -307,8 +435,20 @@ def run_gui() -> None:
                 except serial.SerialException as error:
                     self.rx_queue.put(("error", error))
 
-            self.transfer_status.configure(text=f"Starting {total_size:,}-byte transfer")
             threading.Thread(target=send_worker, daemon=True).start()
+
+        def send_selected_test_transfer(self) -> None:
+            """Start the large transfer selected by the shared-size dropdown."""
+            selected = self.bulk_size_var.get()
+            sizes = dict(TEST_TRANSFER_SIZES)
+            self.start_test_transfer(sizes[selected])
+
+        def send_rx_mode_request(self) -> None:
+            """Send the toggle state and wait for the server's authoritative event."""
+            if self.serial_port is None:
+                return
+            mode = RX_MODE_BYTE_IRQ if self.byte_irq_var.get() else RX_MODE_DMA
+            self.write_frame(build_rx_mode_command(mode), "RX mode request")
 
         def close(self) -> None:
             """Release the serial resource and destroy the Tk root window."""

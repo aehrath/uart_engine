@@ -58,3 +58,9 @@ cross-compilation builds may explicitly omit documentation with
 
 See [`apps/README.md`](apps/README.md) for the C server and clients, and
 [`python/README.md`](python/README.md) for the Python client.
+
+All graphical apps expose the same synchronized **Per-byte IRQ** toggle. The
+default receive path uses circular DMA plus UART IDLE notification; the optional
+path stores each byte from RXNE in the same ring buffer. A typed HCI vendor
+command/event exchange keeps the server dashboard and connected client state in
+sync.

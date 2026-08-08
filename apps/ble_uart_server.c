@@ -8,6 +8,7 @@
 #include "task.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -17,6 +18,7 @@
 #include <unistd.h>
 
 #define UART_IDLE_FLAG       (1UL << 4)
+#define UART_RXNE_FLAG       (1UL << 5)
 #define SERIAL_POLL_TICKS    pdMS_TO_TICKS(5U)
 #define MAX_WIRE_FRAME       UART_DMA_MAX_PACKET_SIZE
 
@@ -61,15 +63,54 @@ static void injectDmaFrame(const uint8_t *frame, uint16_t length) {
     uint8_t *const dmaBuffer = UartDma_GetRxBuffer();
     const uint32_t dmaBufferSize = UartDma_GetRxBufferSize();
 
-    for (uint16_t index = 0U; index < length; index++) {
-        dmaBuffer[dmaWriteIndex] = frame[index];
-        dmaWriteIndex = (dmaWriteIndex + 1U) % dmaBufferSize;
+    if (UartDma_GetRxMode() == UART_DMA_RX_MODE_BYTE_IRQ) {
+        for (uint16_t index = 0U; index < length; index++) {
+            USART_HW->RDR = frame[index];
+            USART_HW->ISR = UART_RXNE_FLAG;
+            USART_IRQHandler();
+            dmaWriteIndex = (dmaWriteIndex + 1U) % dmaBufferSize;
+        }
+    } else {
+        for (uint16_t index = 0U; index < length; index++) {
+            dmaBuffer[dmaWriteIndex] = frame[index];
+            dmaWriteIndex = (dmaWriteIndex + 1U) % dmaBufferSize;
+        }
     }
 
     DMA_RX_STREAM->NDTR = dmaBufferSize - dmaWriteIndex;
     USART_HW->ISR = UART_IDLE_FLAG;
     USART_IRQHandler();
     USART_HW->ISR = 0U;
+}
+
+/** Broadcast the authoritative receive mode as a typed vendor event. */
+static void sendRxModeState(void) {
+    const BleHciRxModeEvent_t event = {
+        .header = {
+            .indicator = {.value = BLE_HCI_H4_EVENT},
+            .fields = {
+                .event_code = BLE_HCI_VENDOR_EVENT_CODE,
+                .parameter_length = sizeof(BleHciRxModeEventParameters_t),
+            },
+        },
+        .parameters = {
+            .signature = {'R', 'X', 'M', 'D'},
+            .mode = UartDma_GetRxMode() == UART_DMA_RX_MODE_BYTE_IRQ
+                ? BLE_HCI_RX_MODE_BYTE_IRQ : BLE_HCI_RX_MODE_DMA,
+        },
+    };
+    PacketMessage_t response = UartDma_MessageFrom(&event, sizeof(event));
+    (void)UartDma_SendPacket(&response, pdMS_TO_TICKS(100U));
+}
+
+/** Change the receiver at a frame boundary, log it, and notify the client. */
+static void setRxMode(UartDmaRxMode_t mode, bool notifyClient) {
+    UartDma_SetRxMode(mode);
+    printf("RX MODE -> %s\n", mode == UART_DMA_RX_MODE_BYTE_IRQ ? "BYTE IRQ" : "DMA");
+    fflush(stdout);
+    if (notifyClient) {
+        sendRxModeState();
+    }
 }
 
 /** Adapter from serial-ingress callbacks to simulated DMA injection. */
@@ -102,6 +143,19 @@ void UartDma_PlatformTransmitDma(uint8_t *data, uint16_t size) {
 /** Log an HCI command and enqueue its typed Command Complete response. */
 static void onHciCommand(uint16_t opcode, uint8_t parameterLength,
                          const uint8_t *parameters) {
+    if (opcode == BLE_HCI_RX_MODE_OPCODE &&
+        parameterLength == sizeof(BleHciRxModeCommandParameters_t)) {
+        BleHciRxModeCommandParameters_t request;
+        memcpy(&request, parameters, sizeof(request));
+        if (request.mode == BLE_HCI_RX_MODE_DMA) {
+            setRxMode(UART_DMA_RX_MODE_DMA_IDLE, true);
+        } else if (request.mode == BLE_HCI_RX_MODE_BYTE_IRQ) {
+            setRxMode(UART_DMA_RX_MODE_BYTE_IRQ, true);
+        } else {
+            sendRxModeState();
+        }
+        return;
+    }
     const BleHciCommandCompleteEvent_t event = {
         .header = {
             .indicator = {.value = BLE_HCI_H4_EVENT},
@@ -130,6 +184,36 @@ static void onHciCommand(uint16_t opcode, uint8_t parameterLength,
     printf("TX DMA <- Command Complete 0x%04X\n", opcode);
     fflush(stdout);
     (void)UartDma_SendPacket(&response, pdMS_TO_TICKS(100U));
+}
+
+/** Read dashboard/terminal control lines without blocking the scheduler. */
+static void controlReaderTask(void *parameters) {
+    (void)parameters;
+    char command[16];
+    size_t length = 0U;
+    (void)fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK);
+    while (!stopRequested) {
+        char byte;
+        const ssize_t count = read(STDIN_FILENO, &byte, sizeof(byte));
+        if (count == 1) {
+            if (byte == '\n') {
+                command[length] = '\0';
+                if (strcmp(command, "irq") == 0) {
+                    setRxMode(UART_DMA_RX_MODE_BYTE_IRQ, true);
+                } else if (strcmp(command, "dma") == 0) {
+                    setRxMode(UART_DMA_RX_MODE_DMA_IDLE, true);
+                } else if (strcmp(command, "mode") == 0) {
+                    sendRxModeState();
+                }
+                length = 0U;
+            } else if (byte != '\r' && length + 1U < sizeof(command)) {
+                command[length++] = byte;
+            }
+        } else {
+            vTaskDelay(SERIAL_POLL_TICKS);
+        }
+    }
+    vTaskDelete(NULL);
 }
 
 /** Enqueue the vendor event reporting test-transfer verification status. */
@@ -281,8 +365,14 @@ int main(void) {
     BleHci_SetCommandHandler(onHciCommand);
     BleHci_SetAclHandler(onHciAcl);
     UartDmaSystem_Init();
+    setRxMode(UART_DMA_RX_MODE_DMA_IDLE, false);
 
     if (xTaskCreate(serialReaderTask, "Serial_RX", configMINIMAL_STACK_SIZE + 256U,
+                    NULL, tskIDLE_PRIORITY + 1U, NULL) != pdPASS) {
+        PseudoUart_Close(ptyMaster);
+        return 1;
+    }
+    if (xTaskCreate(controlReaderTask, "Mode_Control", configMINIMAL_STACK_SIZE + 128U,
                     NULL, tskIDLE_PRIORITY + 1U, NULL) != pdPASS) {
         PseudoUart_Close(ptyMaster);
         return 1;

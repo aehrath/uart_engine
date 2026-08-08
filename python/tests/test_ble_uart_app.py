@@ -7,9 +7,14 @@ import unittest
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
 from ble_protocol import (  # noqa: E402
+    COMMAND_PRESETS,
     H4CrcStreamParser,
+    TEST_TRANSFER_SIZES,
+    RX_MODE_BYTE_IRQ,
+    RX_MODE_QUERY,
     add_crc,
     build_hci_command,
+    build_rx_mode_command,
     build_test_transfer_frames,
     crc16_ccitt,
     parse_hex,
@@ -28,6 +33,41 @@ class ProtocolTests(unittest.TestCase):
         packet = build_hci_command(0x0C03)
         self.assertEqual(packet[:4], bytes.fromhex("01 03 0C 00"))
         self.assertEqual(packet[-2:], crc16_ccitt(packet[:-2]).to_bytes(2, "big"))
+
+    def test_command_presets_match_native_client(self):
+        """Keep the Python preset picker aligned with the portable C UI."""
+        self.assertEqual(tuple(COMMAND_PRESETS), (
+            "HCI Reset",
+            "Read Local Version",
+            "Read BD_ADDR",
+            "LE Read Buffer Size",
+            "LE Enable Scan",
+            "LE Disable Scan",
+        ))
+
+    def test_transfer_sizes_match_native_client(self):
+        """Keep every large-block dropdown label and size aligned with the C UI."""
+        self.assertEqual(TEST_TRANSFER_SIZES, (
+            ("16 KiB", 16 * 1024),
+            ("64 KiB", 64 * 1024),
+            ("128 KiB", 128 * 1024),
+            ("512 KiB", 512 * 1024),
+            ("1 MiB", 1 * 1024 * 1024),
+            ("2 MiB", 2 * 1024 * 1024),
+            ("4 MiB", 4 * 1024 * 1024),
+            ("8 MiB", 8 * 1024 * 1024),
+            ("16 MiB", 16 * 1024 * 1024),
+        ))
+
+    def test_rx_mode_command_and_event(self):
+        """Verify typed mode requests and synchronized RXMD event decoding."""
+        command = build_rx_mode_command(RX_MODE_QUERY)
+        self.assertEqual(command[:5], bytes.fromhex("01 01 FC 01 FF"))
+        parser = H4CrcStreamParser()
+        event = add_crc(bytes.fromhex("04 FF 05 52 58 4D 44 01"))
+        frame = parser.feed(event)[0]
+        self.assertEqual(frame.rx_mode, RX_MODE_BYTE_IRQ)
+        self.assertEqual(frame.summary, "RX mode: per-byte IRQ")
 
     def test_hex_input_formats(self):
         """Verify all separators accepted by the user-facing hex parser."""

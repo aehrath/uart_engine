@@ -8,6 +8,8 @@
 
 /** UART register subset accessed by the portable stack. */
 typedef struct {
+    /** Control register containing the receive-interrupt enable bit. */
+    volatile uint32_t CR1;
     /** Interrupt/status register. */
     volatile uint32_t ISR;
     /** Interrupt-clear register. */

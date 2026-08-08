@@ -164,6 +164,33 @@ static void testUartApiAndInterrupts(void) {
     rxDmaRegisters.NDTR = 1024U;
     UartDmaSystem_Init();
 
+    assert(UartDma_GetRxMode() == UART_DMA_RX_MODE_DMA_IDLE);
+    assert((rxDmaRegisters.CR & 1UL) != 0U);
+    assert((uartRegisters.CR1 & (1UL << 5)) == 0U);
+    UartDma_SetRxMode(UART_DMA_RX_MODE_BYTE_IRQ);
+    assert(UartDma_GetRxMode() == UART_DMA_RX_MODE_BYTE_IRQ);
+    assert((rxDmaRegisters.CR & 1UL) == 0U);
+    assert((uartRegisters.CR1 & (1UL << 5)) != 0U);
+
+    static const uint8_t interruptBytes[] = {0xA5U, 0x5AU, 0x11U, 0xFEU};
+    for (size_t index = 0U; index < sizeof(interruptBytes); index++) {
+        uartRegisters.RDR = interruptBytes[index];
+        uartRegisters.ISR = 1UL << 5;
+        USART_IRQHandler();
+    }
+    uint8_t receivedBytes[sizeof(interruptBytes)] = {0U};
+    uint32_t receivedLength = 0U;
+    assert(UartDmaRingBuffer_ReadTo(UartDmaRingBuffer_GetWriteIndex(),
+                                    receivedBytes, sizeof(receivedBytes),
+                                    &receivedLength));
+    assert(receivedLength == sizeof(interruptBytes));
+    assert(memcmp(receivedBytes, interruptBytes, sizeof(interruptBytes)) == 0);
+
+    UartDma_SetRxMode(UART_DMA_RX_MODE_DMA_IDLE);
+    assert(UartDma_GetRxMode() == UART_DMA_RX_MODE_DMA_IDLE);
+    assert((rxDmaRegisters.CR & 1UL) != 0U);
+    assert((uartRegisters.CR1 & (1UL << 5)) == 0U);
+
     assert(UartDma_SendPacket(NULL, 0U) == pdFALSE);
     message.length = UART_DMA_MAX_PACKET_SIZE - 1U;
     assert(UartDma_SendPacket(&message, 0U) == pdFALSE);

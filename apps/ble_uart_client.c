@@ -75,6 +75,13 @@ static bool sendCommand(AppSerialPort_t *port, uint16_t opcode,
     return sendFramed(port, &command, commandLength);
 }
 
+/** Transmit a typed request to set or query the server receive mode. */
+static bool sendRxModeRequest(AppSerialPort_t *port, uint8_t mode) {
+    BleHciCommandPacket_t command;
+    const size_t commandLength = AppH4RxModeCommand_Init(&command, mode);
+    return commandLength != 0U && sendFramed(port, &command, commandLength);
+}
+
 /** Print and decode a frame delivered by the incremental receive parser. */
 static void describeFrame(const uint8_t *frame, size_t frameLength,
                           bool crcValid, void *context) {
@@ -83,6 +90,11 @@ static void describeFrame(const uint8_t *frame, size_t frameLength,
     printf("RX   ");
     printHex(frame, frameLength);
     printf("  %s", crcValid ? "CRC OK" : "CRC BAD");
+
+    bool byteIrq = false;
+    if (crcValid && AppH4RxModeEvent_Decode(frame, frameLength, &byteIrq)) {
+        printf("; RX mode=%s", byteIrq ? "PER-BYTE IRQ" : "DMA/IDLE");
+    }
 
     BleHciPacketIndicator_t indicator;
     memcpy(&indicator, frame, sizeof(indicator));
@@ -137,6 +149,7 @@ static void printHelp(void) {
     puts("  reset | version | address | buffers | scan-on | scan-off");
     puts("  send OPCODE [PARAM ...]   custom HCI command in hexadecimal");
     puts("  raw BYTE [BYTE ...]       raw H4 packet; CRC is appended");
+    puts("  mode dma | irq | query     set or query the synchronized RX mode");
     puts("  help                       show this help");
     puts("  quit                       disconnect and exit");
 }
@@ -154,6 +167,23 @@ static bool executeLine(AppSerialPort_t *port, char *line) {
     }
     if (strcmp(word, "help") == 0) {
         printHelp();
+        return true;
+    }
+
+    if (strcmp(word, "mode") == 0) {
+        const char *mode = strtok_r(NULL, " \t\r\n", &save);
+        uint8_t encodedMode = BLE_HCI_RX_MODE_QUERY;
+        if (mode == NULL || strcmp(mode, "query") == 0) {
+            encodedMode = BLE_HCI_RX_MODE_QUERY;
+        } else if (strcmp(mode, "dma") == 0) {
+            encodedMode = BLE_HCI_RX_MODE_DMA;
+        } else if (strcmp(mode, "irq") == 0) {
+            encodedMode = BLE_HCI_RX_MODE_BYTE_IRQ;
+        } else {
+            fputs("Usage: mode dma | irq | query\n", stderr);
+            return true;
+        }
+        (void)sendRxModeRequest(port, encodedMode);
         return true;
     }
 
@@ -242,6 +272,7 @@ static int runInteractive(AppSerialPort_t *port) {
     AppH4StreamParser_t parser;
     AppH4StreamParser_Init(&parser);
     char line[2048];
+    (void)sendRxModeRequest(port, BLE_HCI_RX_MODE_QUERY);
     printHelp();
     fputs("ble-uart> ", stdout);
     fflush(stdout);

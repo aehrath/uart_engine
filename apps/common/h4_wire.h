@@ -49,6 +49,18 @@ void AppH4_FormatHex(char *destination, size_t capacity,
  * @return Serialized H4 length, or zero for invalid arguments. */
 size_t AppH4Command_Init(BleHciCommandPacket_t *packet, uint16_t opcode,
                          const uint8_t *parameters, size_t parameter_length);
+/** Initialize the typed vendor command that sets or queries RX mode.
+ * @param packet Destination command packet.
+ * @param mode BLE_HCI_RX_MODE_DMA, BLE_HCI_RX_MODE_BYTE_IRQ, or query.
+ * @return Serialized H4 command length. */
+size_t AppH4RxModeCommand_Init(BleHciCommandPacket_t *packet, uint8_t mode);
+/** Decode a synchronized RX-mode vendor event.
+ * @param frame Complete H4 frame, optionally followed by its CRC trailer.
+ * @param frame_length Available bytes in @p frame.
+ * @param byte_irq Receives whether per-byte IRQ mode is authoritative.
+ * @return `true` only for an `RXMD` state event. */
+bool AppH4RxModeEvent_Decode(const uint8_t *frame, size_t frame_length,
+                             bool *byte_irq);
 /** Reset an incremental host stream parser. */
 void AppH4StreamParser_Init(AppH4StreamParser_t *parser);
 /** Consume serial bytes and dispatch every completed frame.

@@ -36,6 +36,8 @@ typedef struct {
     char lines[MAX_LOG_LINES][MAX_LOG_LENGTH];
     /** Number of populated lines. */
     size_t count;
+    /** Authoritative receive mode reported by the connected server. */
+    bool byteIrqMode;
 } TrafficLog_t;
 
 /** Incremental state for a nonblocking deterministic test transfer. */
@@ -52,6 +54,14 @@ typedef struct {
     bool active;
 } TestSender_t;
 
+/** One selectable large deterministic-transfer size. */
+typedef struct {
+    /** Label shared with the Python client. */
+    const char *label;
+    /** Logical payload size in bytes. */
+    uint32_t size;
+} BulkSizePreset_t;
+
 static const Preset_t presets[] = {
     {"HCI Reset",          0x0C03U, {0U},            0U},
     {"Read Local Version", 0x1001U, {0U},            0U},
@@ -60,6 +70,77 @@ static const Preset_t presets[] = {
     {"LE Enable Scan",     0x200CU, {0x01U, 0x00U}, 2U},
     {"LE Disable Scan",    0x200CU, {0x00U, 0x00U}, 2U},
 };
+
+/** Large-transfer choices mirrored by the Python UI. */
+static const BulkSizePreset_t bulkSizePresets[] = {
+    {"16 KiB",  16U * 1024U},
+    {"64 KiB",  64U * 1024U},
+    {"128 KiB", 128U * 1024U},
+    {"512 KiB", 512U * 1024U},
+    {"1 MiB",   1U * 1024U * 1024U},
+    {"2 MiB",   2U * 1024U * 1024U},
+    {"4 MiB",   4U * 1024U * 1024U},
+    {"8 MiB",   8U * 1024U * 1024U},
+    {"16 MiB", 16U * 1024U * 1024U},
+};
+
+/** Semicolon-separated labels consumed by raygui's dropdown control. */
+static const char bulkSizeOptions[] =
+    "16 KiB;64 KiB;128 KiB;512 KiB;1 MiB;2 MiB;4 MiB;8 MiB;16 MiB";
+
+/** Return whether the platform's standard clipboard modifier is held. */
+static bool clipboardModifierDown(void) {
+#if defined(__APPLE__)
+    return IsKeyDown(KEY_LEFT_SUPER) || IsKeyDown(KEY_RIGHT_SUPER);
+#else
+    return IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+#endif
+}
+
+/** Replace a single-line field with printable clipboard text. */
+static void pasteClipboardText(char *text, size_t capacity) {
+    const char *const clipboard = GetClipboardText();
+    if (clipboard == NULL || capacity == 0U) {
+        return;
+    }
+    size_t output = 0U;
+    for (size_t input = 0U; clipboard[input] != '\0' && output + 1U < capacity;
+         input++) {
+        const unsigned char value = (unsigned char)clipboard[input];
+        if (value >= 0x20U && value != 0x7FU) {
+            text[output++] = (char)value;
+        }
+    }
+    text[output] = '\0';
+}
+
+/** Draw a raygui text box with portable whole-field clipboard shortcuts.
+ *
+ * Cmd is used on macOS and Ctrl on Windows and Linux. C copies the complete
+ * active field, X copies and clears it, and V replaces it with clipboard text.
+ */
+static void drawClipboardTextBox(Rectangle bounds, char *text, size_t capacity,
+                                 bool *editing) {
+    const bool modifier = *editing && clipboardModifierDown();
+    const bool copy = modifier && IsKeyPressed(KEY_C);
+    const bool cut = modifier && IsKeyPressed(KEY_X);
+    const bool paste = modifier && IsKeyPressed(KEY_V);
+    const bool shortcut = copy || cut || paste;
+
+    if (copy || cut) {
+        SetClipboardText(text);
+    }
+    if (cut) {
+        text[0] = '\0';
+    } else if (paste) {
+        pasteClipboardText(text, capacity);
+    }
+
+    /* Suppress normal character insertion on the shortcut frame. */
+    if (GuiTextBox(bounds, text, (int)capacity, shortcut ? false : *editing)) {
+        *editing = !*editing;
+    }
+}
 
 /** Append a formatted line, evicting the oldest line when full. */
 static void appendLog(TrafficLog_t *log, const char *format, ...) {
@@ -122,6 +203,14 @@ static bool sendCommand(AppSerialPort_t *port, TrafficLog_t *log,
     return sendFramed(port, log, &command, commandLength);
 }
 
+/** Send a typed RX-mode set or query command. */
+static bool sendRxModeRequest(AppSerialPort_t *port, TrafficLog_t *log,
+                              uint8_t mode) {
+    BleHciCommandPacket_t command;
+    const size_t length = AppH4RxModeCommand_Init(&command, mode);
+    return sendFramed(port, log, &command, length);
+}
+
 /** Convert a received frame callback into a traffic-log entry. */
 static void logFrame(const uint8_t *frame, size_t length, bool crcValid,
                      void *context) {
@@ -131,7 +220,13 @@ static void logFrame(const uint8_t *frame, size_t length, bool crcValid,
     AppH4_FormatHex(hex, sizeof(hex), frame, length);
     BleHciPacketIndicator_t indicator;
     memcpy(&indicator, frame, sizeof(indicator));
-    if (indicator.value == APP_H4_EVENT && h4Length >= sizeof(BleHciEventHeader_t)) {
+    bool byteIrqMode = false;
+    if (crcValid && AppH4RxModeEvent_Decode(frame, length, &byteIrqMode)) {
+        log->byteIrqMode = byteIrqMode;
+        appendLog(log, "RX  Mode synchronized: %s",
+                  byteIrqMode ? "per-byte IRQ" : "DMA + IDLE");
+    } else if (indicator.value == APP_H4_EVENT &&
+               h4Length >= sizeof(BleHciEventHeader_t)) {
         BleHciEventHeader_t header;
         memcpy(&header, frame, sizeof(header));
         appendLog(log, "RX  %s  [%s, Event %02X]", hex,
@@ -234,7 +329,7 @@ int main(void) {
     AppSerialPort_Init(&serial);
     AppH4StreamParser_t parser;
     AppH4StreamParser_Init(&parser);
-    TrafficLog_t log = {{{0}}, 0U};
+    TrafficLog_t log = {{{0}}, 0U, false};
     TestSender_t testSender = {0U, 0U, 0U, 0U, false};
 #ifdef _WIN32
     char portText[128] = "COM3";
@@ -254,8 +349,10 @@ int main(void) {
     bool parametersEdit = false;
     bool rawEdit = false;
     bool presetDropdown = false;
+    bool bulkSizeDropdown = false;
     int presetIndex = 0;
     int previousPreset = 0;
+    int bulkSizeIndex = 5;
     presetToFields(0, opcodeText, sizeof(opcodeText), parametersText, sizeof(parametersText));
     appendLog(&log, "Ready. Start ble_uart_server and enter its printed port.");
 
@@ -274,6 +371,15 @@ int main(void) {
         }
         pumpTestTransfer(&testSender, &serial, &log);
 
+        /* Raygui text boxes have caller-owned focus; keep exactly one active. */
+        if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
+            portEdit = false;
+            baudEdit = false;
+            opcodeEdit = false;
+            parametersEdit = false;
+            rawEdit = false;
+        }
+
         BeginDrawing();
         ClearBackground((Color){245, 247, 250, 255});
         DrawText("BLE UART HCI Client", 24, 20, 26, (Color){25, 35, 55, 255});
@@ -282,13 +388,11 @@ int main(void) {
 
         GuiGroupBox((Rectangle){20, 84, 920, 106}, "Serial connection");
         GuiLabel((Rectangle){36, 103, 60, 24}, "Port");
-        if (GuiTextBox((Rectangle){86, 101, 410, 30}, portText, sizeof(portText), portEdit)) {
-            portEdit = !portEdit;
-        }
+        drawClipboardTextBox((Rectangle){86, 101, 410, 30}, portText,
+                             sizeof(portText), &portEdit);
         GuiLabel((Rectangle){516, 103, 50, 24}, "Baud");
-        if (GuiTextBox((Rectangle){563, 101, 125, 30}, baudText, sizeof(baudText), baudEdit)) {
-            baudEdit = !baudEdit;
-        }
+        drawClipboardTextBox((Rectangle){563, 101, 125, 30}, baudText,
+                             sizeof(baudText), &baudEdit);
         if (GuiButton((Rectangle){706, 101, 210, 30}, serial.connected ? "Disconnect" : "Connect")) {
             if (serial.connected) {
                 AppSerialPort_Close(&serial);
@@ -303,6 +407,7 @@ int main(void) {
                 } else if (AppSerialPort_Open(&serial, portText, baud, error, sizeof(error))) {
                     (void)snprintf(statusText, sizeof(statusText), "Connected to %s", portText);
                     appendLog(&log, "Connected to %s at %lu baud", portText, baud);
+                    (void)sendRxModeRequest(&serial, &log, BLE_HCI_RX_MODE_QUERY);
                 } else {
                     (void)snprintf(statusText, sizeof(statusText), "%s", error);
                     appendLog(&log, "ERROR  %s", error);
@@ -310,8 +415,22 @@ int main(void) {
             }
         }
         GuiStatusBar((Rectangle){36, 145, 880, 26}, statusText);
-        DrawText("Hardware baud rates supported up to 4000000",
-                 563, 134, 11, (Color){100, 110, 128, 255});
+        DrawText("Cmd/Ctrl+C copy • X cut • V paste • baud up to 4000000",
+                 36, 134, 11, (Color){100, 110, 128, 255});
+        const bool previousRxMode = log.byteIrqMode;
+        if (!serial.connected) {
+            GuiDisable();
+        }
+        const bool rxModeChanged = GuiCheckBox((Rectangle){744, 132, 20, 20},
+                                               "Per-byte IRQ", &log.byteIrqMode) != 0;
+        if (!serial.connected) {
+            GuiEnable();
+        }
+        if (rxModeChanged && !sendRxModeRequest(
+                &serial, &log, log.byteIrqMode
+                    ? BLE_HCI_RX_MODE_BYTE_IRQ : BLE_HCI_RX_MODE_DMA)) {
+            log.byteIrqMode = previousRxMode;
+        }
 
         GuiGroupBox((Rectangle){20, 205, 920, 176}, "HCI command");
         GuiLabel((Rectangle){36, 225, 65, 24}, "Preset");
@@ -326,14 +445,11 @@ int main(void) {
             previousPreset = presetIndex;
         }
         GuiLabel((Rectangle){408, 225, 60, 24}, "Opcode");
-        if (GuiTextBox((Rectangle){470, 222, 120, 30}, opcodeText, sizeof(opcodeText), opcodeEdit)) {
-            opcodeEdit = !opcodeEdit;
-        }
+        drawClipboardTextBox((Rectangle){470, 222, 120, 30}, opcodeText,
+                             sizeof(opcodeText), &opcodeEdit);
         GuiLabel((Rectangle){36, 270, 110, 24}, "Parameters (hex)");
-        if (GuiTextBox((Rectangle){148, 267, 598, 30}, parametersText,
-                       sizeof(parametersText), parametersEdit)) {
-            parametersEdit = !parametersEdit;
-        }
+        drawClipboardTextBox((Rectangle){148, 267, 598, 30}, parametersText,
+                             sizeof(parametersText), &parametersEdit);
         if (GuiButton((Rectangle){764, 267, 152, 30}, "Send command")) {
             char *end = NULL;
             const unsigned long opcode = strtoul(opcodeText, &end, 16);
@@ -349,9 +465,8 @@ int main(void) {
             }
         }
         GuiLabel((Rectangle){36, 320, 110, 24}, "Raw H4 (hex)");
-        if (GuiTextBox((Rectangle){148, 317, 598, 30}, rawText, sizeof(rawText), rawEdit)) {
-            rawEdit = !rawEdit;
-        }
+        drawClipboardTextBox((Rectangle){148, 317, 598, 30}, rawText,
+                             sizeof(rawText), &rawEdit);
         if (GuiButton((Rectangle){764, 317, 152, 30}, "Append CRC + send")) {
             uint8_t raw[APP_H4_MAX_FRAME_SIZE - 2U];
             const size_t rawLength = AppH4_ParseHex(rawText, raw, sizeof(raw));
@@ -363,23 +478,25 @@ int main(void) {
         }
 
         GuiGroupBox((Rectangle){20, 398, 920, 100}, "Bulk test messages");
-        if (GuiButton((Rectangle){36, 422, 210, 34}, "Send 128-byte message")) {
+        if (GuiButton((Rectangle){36, 422, 184, 34}, "Send 128-byte message")) {
             startTestTransfer(&testSender, &serial, &log, 128U);
         }
-        if (GuiButton((Rectangle){262, 422, 210, 34}, "Send 2 MiB chunk")) {
-            startTestTransfer(&testSender, &serial, &log, 2U * 1024U * 1024U);
+        GuiLabel((Rectangle){234, 427, 76, 24}, "Large block");
+        if (GuiButton((Rectangle){458, 422, 166, 34}, "Send selected block")) {
+            startTestTransfer(&testSender, &serial, &log,
+                              bulkSizePresets[bulkSizeIndex].size);
         }
         const float progress = testSender.totalSize == 0U ? 0.0f
             : (float)testSender.offset / (float)testSender.totalSize;
-        DrawRectangle(494, 428, 420, 20, (Color){220, 225, 232, 255});
-        DrawRectangle(494, 428, (int)(420.0f * progress), 20,
+        DrawRectangle(642, 428, 272, 20, (Color){220, 225, 232, 255});
+        DrawRectangle(642, 428, (int)(272.0f * progress), 20,
                       (Color){70, 145, 235, 255});
-        DrawRectangleLines(494, 428, 420, 20, (Color){150, 158, 172, 255});
+        DrawRectangleLines(642, 428, 272, 20, (Color){150, 158, 172, 255});
         char progressText[96];
         (void)snprintf(progressText, sizeof(progressText), "%u / %u bytes",
                        (unsigned int)testSender.offset,
                        (unsigned int)testSender.totalSize);
-        DrawText(progressText, 494, 460, 14, (Color){80, 90, 108, 255});
+        DrawText(progressText, 642, 460, 14, (Color){80, 90, 108, 255});
 
         GuiGroupBox((Rectangle){20, 514, 920, 246}, "UART traffic");
         DrawRectangle(34, 537, 892, 208, (Color){20, 25, 35, 255});
@@ -392,6 +509,12 @@ int main(void) {
                         ? (Color){105, 225, 150, 255}
                         : (Color){190, 198, 210, 255};
             DrawText(log.lines[index], 46, 547 + (int)index * 15, 13, color);
+        }
+
+        /* Draw last so the expanded selector overlays the traffic panel. */
+        if (GuiDropdownBox((Rectangle){310, 422, 132, 34}, bulkSizeOptions,
+                           &bulkSizeIndex, bulkSizeDropdown)) {
+            bulkSizeDropdown = !bulkSizeDropdown;
         }
         EndDrawing();
     }

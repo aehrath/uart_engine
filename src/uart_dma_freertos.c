@@ -13,7 +13,10 @@
 #include "uart_dma/uart_dma.h"
 
 #define UART_ISR_IDLE_Msk    (1UL << 4)
+#define UART_ISR_RXNE_Msk    (1UL << 5)
 #define UART_ICR_IDLECF_Msk  (1UL << 4)
+#define UART_CR1_RXNEIE_Msk  (1UL << 5)
+#define DMA_CR_EN_Msk        (1UL << 0)
 
 /* Static CMSIS-Core Cache Stubs (Normally resolved via core_cm7.h) */
 #ifndef SCB_D_CACHE_LINE_SIZE
@@ -56,6 +59,7 @@ static TaskHandle_t       xTxEngineTaskHandle = NULL;
 static QueueHandle_t      xRxPacketQueueHandle = NULL;
 static QueueHandle_t      xTxPacketQueueHandle = NULL;
 static SemaphoreHandle_t  xTxDmaSemaphore      = NULL;
+static volatile UartDmaRxMode_t rxMode = UART_DMA_RX_MODE_DMA_IDLE;
 
 /* --- Priority Scheduling Matrix --- */
 #define PRIORITY_PRODUCER_TASK  (configMAX_PRIORITIES - 1) /* Critical Hardware Layer */
@@ -72,6 +76,7 @@ void vTxEngineTask(void *pvParameters);
 
 void UartDmaSystem_Init(void) {
     UartDmaRingBuffer_Reset();
+    UartDma_SetRxMode(UART_DMA_RX_MODE_DMA_IDLE);
     /* 1. Allocate Inter-Process Communication Pipelines */
     xRxPacketQueueHandle = xQueueCreate(QUEUE_STORAGE_SIZE, sizeof(PacketMessage_t));
     xTxPacketQueueHandle = xQueueCreate(QUEUE_STORAGE_SIZE, sizeof(PacketMessage_t));
@@ -92,8 +97,35 @@ void UartDmaSystem_Init(void) {
     xTaskCreate(vConsumerTask, "Cons_App_Task", configMINIMAL_STACK_SIZE + 512, NULL, PRIORITY_CONSUMER_TASK, &xConsumerTaskHandle);
 }
 
+void UartDma_SetRxMode(UartDmaRxMode_t mode) {
+    if (mode != UART_DMA_RX_MODE_DMA_IDLE && mode != UART_DMA_RX_MODE_BYTE_IRQ) {
+        return;
+    }
+    if (mode == UART_DMA_RX_MODE_BYTE_IRQ) {
+        const uint32_t dmaWriteIndex = UartDma_GetRxBufferSize() - DMA_RX_STREAM->NDTR;
+        DMA_RX_STREAM->CR &= ~DMA_CR_EN_Msk;
+        UartDmaRingBuffer_SetWriteIndex(dmaWriteIndex % UartDma_GetRxBufferSize());
+        USART_HW->CR1 |= UART_CR1_RXNEIE_Msk;
+    } else {
+        USART_HW->CR1 &= ~UART_CR1_RXNEIE_Msk;
+        DMA_RX_STREAM->NDTR = UartDma_GetRxBufferSize()
+                            - UartDmaRingBuffer_GetWriteIndex();
+        DMA_RX_STREAM->CR |= DMA_CR_EN_Msk;
+    }
+    rxMode = mode;
+}
+
+UartDmaRxMode_t UartDma_GetRxMode(void) {
+    return rxMode;
+}
+
 void USART_IRQHandler(void) {
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+
+    if (rxMode == UART_DMA_RX_MODE_BYTE_IRQ &&
+        (USART_HW->ISR & UART_ISR_RXNE_Msk) != 0U) {
+        UartDmaRingBuffer_WriteByte((uint8_t)USART_HW->RDR);
+    }
 
     /* Detect IDLE Line State Trigger (Quiet Line after Packet Segment) */
     if ((USART_HW->ISR & UART_ISR_IDLE_Msk) != 0) {
@@ -131,8 +163,9 @@ void vProducerTask(void *pvParameters) {
         SCB_InvalidateDCache_by_Addr((uint32_t *)UartDma_GetRxBuffer(),
                                     (int32_t)UartDma_GetRxBufferSize());
 
-        uint32_t currentNDTR = DMA_RX_STREAM->NDTR;
-        uint32_t currentWriteIndex = UartDma_GetRxBufferSize() - currentNDTR;
+        const uint32_t currentWriteIndex = rxMode == UART_DMA_RX_MODE_BYTE_IRQ
+            ? UartDmaRingBuffer_GetWriteIndex()
+            : UartDma_GetRxBufferSize() - DMA_RX_STREAM->NDTR;
 
         PacketMessage_t newPacket;
         uint32_t dataLength = 0;

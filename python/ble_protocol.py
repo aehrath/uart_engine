@@ -15,9 +15,26 @@ H4_ACL = 0x02
 H4_SCO = 0x03
 H4_EVENT = 0x04
 H4_ISO = 0x05
+RX_MODE_OPCODE = 0xFC01
+RX_MODE_DMA = 0x00
+RX_MODE_BYTE_IRQ = 0x01
+RX_MODE_QUERY = 0xFF
 MAX_HCI_PAYLOAD = 4096
 TEST_TRANSFER_HANDLE = 0x0FFE
 TEST_TRANSFER_CHUNK_SIZE = 230
+
+#: Ordered large-transfer choices shared with the portable C UI.
+TEST_TRANSFER_SIZES: tuple[tuple[str, int], ...] = (
+    ("16 KiB", 16 * 1024),
+    ("64 KiB", 64 * 1024),
+    ("128 KiB", 128 * 1024),
+    ("512 KiB", 512 * 1024),
+    ("1 MiB", 1 * 1024 * 1024),
+    ("2 MiB", 2 * 1024 * 1024),
+    ("4 MiB", 4 * 1024 * 1024),
+    ("8 MiB", 8 * 1024 * 1024),
+    ("16 MiB", 16 * 1024 * 1024),
+)
 
 
 def crc16_ccitt(data: bytes) -> int:
@@ -72,6 +89,13 @@ def build_hci_command(opcode: int, parameters: bytes = b"") -> bytes:
         raise ValueError("An HCI command can contain at most 255 parameter bytes.")
     h4_packet = bytes((H4_COMMAND, opcode & 0xFF, opcode >> 8, len(parameters))) + parameters
     return add_crc(h4_packet)
+
+
+def build_rx_mode_command(mode: int) -> bytes:
+    """Build the typed vendor command that sets or queries UART RX mode."""
+    if mode not in (RX_MODE_DMA, RX_MODE_BYTE_IRQ, RX_MODE_QUERY):
+        raise ValueError("Unsupported UART receive mode.")
+    return build_hci_command(RX_MODE_OPCODE, bytes((mode,)))
 
 
 def test_pattern_byte(offset: int) -> int:
@@ -147,6 +171,8 @@ class ParsedFrame:
     def summary(self) -> str:
         """Return a concise protocol-aware description for the traffic log."""
         if self.packet_type == H4_EVENT and len(self.h4_packet) >= 3:
+            if self.rx_mode is not None:
+                return "RX mode: per-byte IRQ" if self.rx_mode else "RX mode: DMA + IDLE"
             if (self.h4_packet[1] == 0xFF and len(self.h4_packet) >= 14
                     and self.h4_packet[3:7] == b"TEST"):
                 identifier = int.from_bytes(self.h4_packet[7:9], "little")
@@ -161,6 +187,16 @@ class ParsedFrame:
             handle = self.h4_packet[1] | self.h4_packet[2] << 8
             return f"ACL handle/flags 0x{handle:04X}"
         return self.name
+
+    @property
+    def rx_mode(self) -> int | None:
+        """Decode an `RXMD` vendor event, or return `None` for other frames."""
+        if (self.packet_type == H4_EVENT and len(self.h4_packet) >= 8
+                and self.h4_packet[1] == 0xFF and self.h4_packet[2] == 5
+                and self.h4_packet[3:7] == b"RXMD"
+                and self.h4_packet[7] in (RX_MODE_DMA, RX_MODE_BYTE_IRQ)):
+            return self.h4_packet[7]
+        return None
 
 
 class H4CrcStreamParser:
@@ -248,6 +284,6 @@ COMMAND_PRESETS: dict[str, tuple[int, bytes]] = {
     "Read Local Version": (0x1001, b""),
     "Read BD_ADDR": (0x1009, b""),
     "LE Read Buffer Size": (0x2002, b""),
-    "LE Set Scan Enable": (0x200C, bytes((0x01, 0x00))),
+    "LE Enable Scan": (0x200C, bytes((0x01, 0x00))),
     "LE Disable Scan": (0x200C, bytes((0x00, 0x00))),
 }

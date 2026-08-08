@@ -17,6 +17,14 @@
 
 #include "FreeRTOS.h"
 
+/** Selectable UART receive implementation. */
+typedef enum {
+    /** Circular DMA receives bytes and UART IDLE wakes the producer. */
+    UART_DMA_RX_MODE_DMA_IDLE = 0,
+    /** Every RX byte enters through the UART RXNE interrupt. */
+    UART_DMA_RX_MODE_BYTE_IRQ = 1
+} UartDmaRxMode_t;
+
 /** Allocate synchronization objects and create the producer, consumer, and TX tasks. */
 void UartDmaSystem_Init(void);
 /** Queue a typed H4 message for CRC framing and DMA transmission.
@@ -24,7 +32,13 @@ void UartDmaSystem_Init(void);
  * @param ticks_to_wait Maximum FreeRTOS queue wait duration.
  * @return `pdTRUE` when queued, otherwise `pdFALSE`. */
 BaseType_t UartDma_SendPacket(const PacketMessage_t *message, TickType_t ticks_to_wait);
-/** Handle UART IDLE detection and wake the RX producer task. */
+/** Switch the receive implementation between circular DMA and per-byte IRQ.
+ * Switching is intended at a complete frame boundary.
+ * @param mode New receive implementation. */
+void UartDma_SetRxMode(UartDmaRxMode_t mode);
+/** Return the currently selected receive implementation. */
+UartDmaRxMode_t UartDma_GetRxMode(void);
+/** Store RXNE bytes in IRQ mode and wake the producer on UART IDLE. */
 void USART_IRQHandler(void);
 /** Handle TX DMA completion and release the transmitter semaphore. */
 void DMA_TX_Complete_IRQHandler(void);

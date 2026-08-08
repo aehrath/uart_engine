@@ -82,6 +82,31 @@ size_t AppH4Command_Init(BleHciCommandPacket_t *packet, uint16_t opcode,
     return sizeof(packet->header) + parameterLength;
 }
 
+size_t AppH4RxModeCommand_Init(BleHciCommandPacket_t *packet, uint8_t mode) {
+    const BleHciRxModeCommandParameters_t parameters = {.mode = mode};
+    return AppH4Command_Init(packet, BLE_HCI_RX_MODE_OPCODE,
+                             (const uint8_t *)&parameters, sizeof(parameters));
+}
+
+bool AppH4RxModeEvent_Decode(const uint8_t *frame, size_t frame_length,
+                             bool *byte_irq) {
+    if (frame == NULL || byte_irq == NULL || frame_length < sizeof(BleHciRxModeEvent_t)) {
+        return false;
+    }
+    BleHciRxModeEvent_t event;
+    memcpy(&event, frame, sizeof(event));
+    if (event.header.indicator.value != BLE_HCI_H4_EVENT ||
+        event.header.fields.event_code != BLE_HCI_VENDOR_EVENT_CODE ||
+        event.header.fields.parameter_length != sizeof(event.parameters) ||
+        memcmp(event.parameters.signature, "RXMD", sizeof(event.parameters.signature)) != 0 ||
+        (event.parameters.mode != BLE_HCI_RX_MODE_DMA &&
+         event.parameters.mode != BLE_HCI_RX_MODE_BYTE_IRQ)) {
+        return false;
+    }
+    *byte_irq = event.parameters.mode == BLE_HCI_RX_MODE_BYTE_IRQ;
+    return true;
+}
+
 void AppH4StreamParser_Init(AppH4StreamParser_t *parser) {
     memset(parser, 0, sizeof(*parser));
 }
