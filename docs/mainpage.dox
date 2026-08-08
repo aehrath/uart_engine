@@ -1,0 +1,34 @@
+/**
+ * @mainpage UART DMA and BLE HCI Toolkit
+ *
+ * @section overview Overview
+ *
+ * This project provides a FreeRTOS-backed UART DMA transport, an incremental
+ * Bluetooth HCI H4 parser, portable C and Python clients, a continuous BLE-side
+ * server, and desktop user interfaces.
+ *
+ * @section architecture Architecture
+ *
+ * - @ref uart_dma_core owns the FreeRTOS queues, DMA interrupt integration,
+ *   circular receive buffer, CRC validation, and transmit engine.
+ * - @ref ble_hci_protocol defines the packed H4 wire layouts and parser API.
+ * - @ref app_transport provides portable host serial-port and framed-H4 helpers.
+ * - @ref test_transfer defines the deterministic large-transfer test protocol.
+ * - The `apps`, `demo`, and `python` directories contain executable front ends.
+ *
+ * @section framing Wire framing
+ *
+ * Each transmitted unit consists of an HCI H4 packet followed by a big-endian
+ * CRC16-CCITT trailer. Multi-byte Bluetooth fields use little-endian wire order.
+ * Packed C structures in ble_hci_wire.h describe each fixed wire header; byte
+ * arrays are retained only for variable payloads and incremental byte streams.
+ *
+ * @section building Building
+ *
+ * @code{.sh}
+ * cmake -S . -B build
+ * cmake --build build --parallel
+ * ctest --test-dir build --output-on-failure
+ * cmake --build build --target docs
+ * @endcode
+ */

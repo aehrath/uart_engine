@@ -1,0 +1,253 @@
+"""@file
+@brief BLE HCI-over-UART framing, CRC, parsing, and test-transfer helpers.
+
+The module mirrors the packed C wire protocol for the optional Python client.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Iterable
+
+
+H4_COMMAND = 0x01
+H4_ACL = 0x02
+H4_SCO = 0x03
+H4_EVENT = 0x04
+H4_ISO = 0x05
+MAX_HCI_PAYLOAD = 4096
+TEST_TRANSFER_HANDLE = 0x0FFE
+TEST_TRANSFER_CHUNK_SIZE = 230
+
+
+def crc16_ccitt(data: bytes) -> int:
+    """Compute CRC16-CCITT.
+
+    @param data Bytes protected by the checksum.
+    @return CRC using polynomial `0x1021` and initial value `0xffff`.
+    """
+    crc = 0xFFFF
+    for value in data:
+        crc ^= value << 8
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
+    return crc
+
+
+def add_crc(payload: bytes) -> bytes:
+    """Append the transport's big-endian CRC trailer.
+
+    @param payload Complete H4 packet without a trailer.
+    @return New immutable frame containing the packet and two-byte CRC.
+    """
+    crc = crc16_ccitt(payload)
+    return payload + crc.to_bytes(2, "big")
+
+
+def parse_hex(text: str) -> bytes:
+    """Parse user-entered hexadecimal bytes.
+
+    @param text Whitespace, comma, or colon-separated hexadecimal text.
+    @return Parsed bytes.
+    @throws ValueError If a token is incomplete or non-hexadecimal.
+    """
+    compact = text.replace("0x", "").replace(",", " ").replace(":", " ")
+    try:
+        return bytes.fromhex(compact)
+    except ValueError as error:
+        raise ValueError("Enter complete hexadecimal bytes, such as '01 03 0C 00'.") from error
+
+
+def build_hci_command(opcode: int, parameters: bytes = b"") -> bytes:
+    """Build one CRC-protected H4 Command frame.
+
+    @param opcode Bluetooth command opcode in host byte order.
+    @param parameters Zero through 255 command parameter bytes.
+    @return Serialized H4 packet followed by its CRC.
+    @throws ValueError If the opcode or parameter count is out of range.
+    """
+    if not 0 <= opcode <= 0xFFFF:
+        raise ValueError("Opcode must be between 0x0000 and 0xffff.")
+    if len(parameters) > 0xFF:
+        raise ValueError("An HCI command can contain at most 255 parameter bytes.")
+    h4_packet = bytes((H4_COMMAND, opcode & 0xFF, opcode >> 8, len(parameters))) + parameters
+    return add_crc(h4_packet)
+
+
+def test_pattern_byte(offset: int) -> int:
+    """Return the deterministic test byte for a logical transfer offset."""
+    return (offset * 31 + 7) & 0xFF
+
+
+def build_test_transfer_frames(total_size: int, identifier: int = 1) -> Iterable[bytes]:
+    """Generate CRC-protected ACL frames for one deterministic test transfer.
+
+    @param total_size Logical data size from one byte through four GiB.
+    @param identifier Transfer identifier encoded in every chunk.
+    @return Iterator of complete CRC-protected H4 ACL frames.
+    @throws ValueError If @p total_size is outside the wire format's range.
+    """
+    if not 0 < total_size <= 0xFFFFFFFF:
+        raise ValueError("Test transfer size must be between 1 and 4 GiB.")
+    offset = 0
+    while offset < total_size:
+        chunk_size = min(TEST_TRANSFER_CHUNK_SIZE, total_size - offset)
+        flags = (0x01 if offset == 0 else 0) | (0x02 if offset + chunk_size == total_size else 0)
+        header = (
+            b"TEST"
+            + bytes((1, flags))
+            + identifier.to_bytes(2, "little")
+            + total_size.to_bytes(4, "little")
+            + offset.to_bytes(4, "little")
+            + chunk_size.to_bytes(2, "little")
+        )
+        payload = bytes(test_pattern_byte(offset + index) for index in range(chunk_size))
+        acl_data = header + payload
+        h4_packet = (
+            bytes((H4_ACL,))
+            + TEST_TRANSFER_HANDLE.to_bytes(2, "little")
+            + len(acl_data).to_bytes(2, "little")
+            + acl_data
+        )
+        yield add_crc(h4_packet)
+        offset += chunk_size
+
+
+@dataclass(frozen=True)
+class ParsedFrame:
+    """A complete H4 packet and the result of its CRC validation.
+
+    @var packet_type H4 packet indicator.
+    @var h4_packet Packet bytes excluding the CRC trailer.
+    @var received_crc Big-endian CRC decoded from the wire.
+    @var computed_crc CRC calculated from `h4_packet`.
+    """
+    packet_type: int
+    h4_packet: bytes
+    received_crc: int
+    computed_crc: int
+
+    @property
+    def crc_valid(self) -> bool:
+        """Return whether the received and computed CRC values match."""
+        return self.received_crc == self.computed_crc
+
+    @property
+    def name(self) -> str:
+        """Return the human-readable H4 packet-type name."""
+        return {
+            H4_COMMAND: "Command",
+            H4_ACL: "ACL",
+            H4_SCO: "SCO",
+            H4_EVENT: "Event",
+            H4_ISO: "ISO",
+        }.get(self.packet_type, "Unknown")
+
+    @property
+    def summary(self) -> str:
+        """Return a concise protocol-aware description for the traffic log."""
+        if self.packet_type == H4_EVENT and len(self.h4_packet) >= 3:
+            if (self.h4_packet[1] == 0xFF and len(self.h4_packet) >= 14
+                    and self.h4_packet[3:7] == b"TEST"):
+                identifier = int.from_bytes(self.h4_packet[7:9], "little")
+                status = "passed" if self.h4_packet[9] == 0 else "failed"
+                size = int.from_bytes(self.h4_packet[10:14], "little")
+                return f"Test transfer {identifier} {status}, {size} bytes"
+            return f"Event 0x{self.h4_packet[1]:02X}, {self.h4_packet[2]} parameter byte(s)"
+        if self.packet_type == H4_COMMAND and len(self.h4_packet) >= 4:
+            opcode = self.h4_packet[1] | self.h4_packet[2] << 8
+            return f"Command opcode 0x{opcode:04X}"
+        if self.packet_type == H4_ACL and len(self.h4_packet) >= 5:
+            handle = self.h4_packet[1] | self.h4_packet[2] << 8
+            return f"ACL handle/flags 0x{handle:04X}"
+        return self.name
+
+
+class H4CrcStreamParser:
+    """Incrementally decode H4 packets followed by the stack's two-byte CRC.
+
+    Serial reads may contain partial frames, multiple frames, or leading corrupt
+    bytes. Parser state is retained between calls to `feed()`.
+    """
+
+    _HEADER_LENGTHS = {
+        H4_COMMAND: 3,
+        H4_ACL: 4,
+        H4_SCO: 3,
+        H4_EVENT: 2,
+        H4_ISO: 4,
+    }
+
+    def __init__(self) -> None:
+        """Create an empty stream parser with no discarded input bytes."""
+        self._buffer = bytearray()
+        self.discarded_bytes = 0
+
+    @staticmethod
+    def _payload_length(packet_type: int, header: bytes) -> int:
+        """Decode the payload length from a packet-type-specific HCI header.
+
+        @throws ValueError If @p packet_type is unsupported.
+        """
+        if packet_type == H4_COMMAND:
+            return header[2]
+        if packet_type == H4_ACL:
+            return header[2] | header[3] << 8
+        if packet_type == H4_SCO:
+            return header[2]
+        if packet_type == H4_EVENT:
+            return header[1]
+        if packet_type == H4_ISO:
+            return (header[2] | header[3] << 8) & 0x3FFF
+        raise ValueError("Unsupported H4 packet type")
+
+    def feed(self, data: bytes) -> list[ParsedFrame]:
+        """Consume arbitrary serial bytes and return every complete frame.
+
+        @param data Newly received stream bytes.
+        @return Complete frames decoded during this call.
+        """
+        self._buffer.extend(data)
+        frames: list[ParsedFrame] = []
+
+        while self._buffer:
+            packet_type = self._buffer[0]
+            header_length = self._HEADER_LENGTHS.get(packet_type)
+            if header_length is None:
+                del self._buffer[0]
+                self.discarded_bytes += 1
+                continue
+
+            h4_header_end = 1 + header_length
+            if len(self._buffer) < h4_header_end:
+                break
+            header = bytes(self._buffer[1:h4_header_end])
+            payload_length = self._payload_length(packet_type, header)
+            if payload_length > MAX_HCI_PAYLOAD:
+                del self._buffer[0]
+                self.discarded_bytes += 1
+                continue
+
+            h4_length = h4_header_end + payload_length
+            framed_length = h4_length + 2
+            if len(self._buffer) < framed_length:
+                break
+
+            h4_packet = bytes(self._buffer[:h4_length])
+            received_crc = int.from_bytes(self._buffer[h4_length:framed_length], "big")
+            frames.append(
+                ParsedFrame(packet_type, h4_packet, received_crc, crc16_ccitt(h4_packet))
+            )
+            del self._buffer[:framed_length]
+
+        return frames
+
+
+COMMAND_PRESETS: dict[str, tuple[int, bytes]] = {
+    "HCI Reset": (0x0C03, b""),
+    "Read Local Version": (0x1001, b""),
+    "Read BD_ADDR": (0x1009, b""),
+    "LE Read Buffer Size": (0x2002, b""),
+    "LE Set Scan Enable": (0x200C, bytes((0x01, 0x00))),
+    "LE Disable Scan": (0x200C, bytes((0x00, 0x00))),
+}
