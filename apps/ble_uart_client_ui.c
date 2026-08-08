@@ -1,6 +1,7 @@
 /** @file
  * @brief Portable raylib/raygui BLE HCI UART client application. */
 #include "raylib.h"
+#include "dashboard_dropdown.h"
 #include "h4_wire.h"
 #include "serial_port.h"
 #include "test_transfer_protocol.h"
@@ -16,29 +17,122 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_LOG_LINES       13U
+#define MAX_LOG_LINES       9U
 #define MAX_LOG_LENGTH      220U
+#define CONNECTION_PROBE_SIZE 128U
+#define CONNECTION_PROBE_TIMEOUT_SECONDS 2.5
 
 static Font uiFont;
+static Font displayFont;
 static bool customUiFont;
+static bool customDisplayFont;
+
+static const Color COLOR_CANVAS = {10, 15, 28, 255};
+static const Color COLOR_PANEL = {20, 28, 46, 255};
+static const Color COLOR_PANEL_RAISED = {27, 37, 59, 255};
+static const Color COLOR_BORDER = {49, 65, 92, 255};
+static const Color COLOR_TEXT = {232, 239, 249, 255};
+static const Color COLOR_MUTED = {143, 158, 181, 255};
+static const Color COLOR_CYAN = {45, 212, 191, 255};
+static const Color COLOR_BLUE = {76, 148, 255, 255};
+static const Color COLOR_PURPLE = {167, 139, 250, 255};
 
 /** Load the bundled sans-serif UI font and configure raygui to use it. */
 static void loadUiFont(void) {
     const char *path = TextFormat("%s%s", GetApplicationDirectory(),
                                   UART_DMA_UI_FONT_FILE);
-    uiFont = LoadFontEx(path, 28, NULL, 0);
+    uiFont = LoadFontEx(path, 36, NULL, 0);
     customUiFont = uiFont.texture.id != 0U;
     if (!customUiFont) {
         uiFont = GetFontDefault();
     }
     SetTextureFilter(uiFont.texture, TEXTURE_FILTER_BILINEAR);
     GuiSetFont(uiFont);
-    GuiSetStyle(DEFAULT, TEXT_SIZE, 15);
+    GuiSetStyle(DEFAULT, TEXT_SIZE, 17);
+    GuiSetStyle(DEFAULT, BORDER_WIDTH, 1);
+    GuiSetStyle(DEFAULT, TEXT_PADDING, 10);
+    GuiSetStyle(DEFAULT, BORDER_COLOR_NORMAL, ColorToInt(COLOR_BORDER));
+    GuiSetStyle(DEFAULT, BASE_COLOR_NORMAL, ColorToInt(COLOR_PANEL_RAISED));
+    GuiSetStyle(DEFAULT, TEXT_COLOR_NORMAL, ColorToInt(COLOR_TEXT));
+    GuiSetStyle(DEFAULT, BORDER_COLOR_FOCUSED, ColorToInt(COLOR_CYAN));
+    GuiSetStyle(DEFAULT, BASE_COLOR_FOCUSED, ColorToInt((Color){35, 50, 76, 255}));
+    GuiSetStyle(DEFAULT, TEXT_COLOR_FOCUSED, ColorToInt(WHITE));
+    GuiSetStyle(DEFAULT, BORDER_COLOR_PRESSED, ColorToInt(COLOR_BLUE));
+    GuiSetStyle(DEFAULT, BASE_COLOR_PRESSED, ColorToInt((Color){42, 63, 96, 255}));
+    GuiSetStyle(DEFAULT, TEXT_COLOR_PRESSED, ColorToInt(WHITE));
+    GuiSetStyle(DEFAULT, BORDER_COLOR_DISABLED, ColorToInt((Color){43, 52, 70, 255}));
+    GuiSetStyle(DEFAULT, BASE_COLOR_DISABLED, ColorToInt((Color){24, 30, 43, 255}));
+    GuiSetStyle(DEFAULT, TEXT_COLOR_DISABLED, ColorToInt((Color){91, 104, 124, 255}));
+    GuiSetStyle(DROPDOWNBOX, BASE_COLOR_NORMAL, ColorToInt((Color){14, 22, 38, 255}));
+    GuiSetStyle(DROPDOWNBOX, TEXT_COLOR_NORMAL, ColorToInt((Color){241, 246, 255, 255}));
+    GuiSetStyle(DROPDOWNBOX, BASE_COLOR_FOCUSED, ColorToInt((Color){103, 232, 249, 255}));
+    GuiSetStyle(DROPDOWNBOX, TEXT_COLOR_FOCUSED, ColorToInt((Color){7, 22, 28, 255}));
+    GuiSetStyle(DROPDOWNBOX, BASE_COLOR_PRESSED, ColorToInt(COLOR_BLUE));
+    GuiSetStyle(DROPDOWNBOX, TEXT_COLOR_PRESSED, ColorToInt(WHITE));
+
+    const char *displayPath = TextFormat("%s%s", GetApplicationDirectory(),
+                                         UART_DMA_UI_DISPLAY_FONT_FILE);
+    displayFont = LoadFontEx(displayPath, 42, NULL, 0);
+    customDisplayFont = displayFont.texture.id != 0U;
+    if (!customDisplayFont) {
+        displayFont = uiFont;
+    }
+    SetTextureFilter(displayFont.texture, TEXTURE_FILTER_BILINEAR);
 }
 
 /** Draw antialiased text using the shared UI typeface. */
 static void drawUiText(const char *text, int x, int y, int size, Color color) {
     DrawTextEx(uiFont, text, (Vector2){(float)x, (float)y}, (float)size, 0.0f, color);
+}
+
+/** Draw title and metric text using the technical display face. */
+static void drawDisplayText(const char *text, int x, int y, int size, Color color) {
+    DrawTextEx(displayFont, text, (Vector2){(float)x, (float)y},
+               (float)size, 0.5f, color);
+}
+
+/** Draw one rounded dashboard panel with an optional section title. */
+static void drawPanel(Rectangle bounds, const char *title) {
+    DrawRectangleRounded(bounds, 0.08f, 10, COLOR_PANEL);
+    DrawRectangleRoundedLinesEx(bounds, 0.08f, 10, 1.0f, COLOR_BORDER);
+    if (title != NULL) {
+        drawDisplayText(title, (int)bounds.x + 20, (int)bounds.y + 15,
+                        16, COLOR_MUTED);
+    }
+}
+
+/** Draw one client telemetry card. */
+static void drawMetricCard(Rectangle bounds, const char *label,
+                           const char *value, Color accent) {
+    DrawRectangleRounded(bounds, 0.12f, 10, COLOR_PANEL_RAISED);
+    DrawRectangleRounded((Rectangle){bounds.x, bounds.y, 5.0f, bounds.height},
+                         0.5f, 6, accent);
+    drawUiText(label, (int)bounds.x + 18, (int)bounds.y + 14, 14, COLOR_MUTED);
+    drawDisplayText(value, (int)bounds.x + 18, (int)bounds.y + 42, 25, COLOR_TEXT);
+}
+
+/** Draw a rounded high-contrast action button and report a completed click. */
+static bool brightButton(Rectangle bounds, const char *label, bool enabled) {
+    const bool hovered = enabled && CheckCollisionPointRec(GetMousePosition(), bounds);
+    const bool pressed = hovered && IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+    const Color fill = !enabled ? (Color){39, 49, 67, 255}
+        : pressed ? (Color){34, 197, 181, 255}
+        : hovered ? (Color){103, 232, 249, 255}
+        : (Color){45, 212, 191, 255};
+    DrawRectangleRounded(bounds, 0.34f, 12, fill);
+    if (enabled) {
+        DrawRectangleRoundedLinesEx(bounds, 0.34f, 12, 1.0f,
+                                    hovered ? (Color){207, 250, 254, 255}
+                                            : (Color){94, 234, 212, 255});
+    }
+    const int fontSize = 16;
+    const Vector2 measured = MeasureTextEx(uiFont, label, (float)fontSize, 0.0f);
+    DrawTextEx(uiFont, label,
+               (Vector2){bounds.x + (bounds.width - measured.x) * 0.5f,
+                         bounds.y + (bounds.height - measured.y) * 0.5f - 1.0f},
+               (float)fontSize, 0.0f,
+               enabled ? (Color){7, 22, 28, 255} : (Color){94, 107, 127, 255});
+    return enabled && hovered && IsMouseButtonReleased(MOUSE_BUTTON_LEFT);
 }
 
 /** HCI command preset displayed in the graphical command picker. */
@@ -59,6 +153,10 @@ typedef struct {
     char lines[MAX_LOG_LINES][MAX_LOG_LENGTH];
     /** Number of populated lines. */
     size_t count;
+    /** Complete H4 packets transmitted by this client. */
+    uint32_t transmittedPackets;
+    /** Complete H4 packets received by this client. */
+    uint32_t receivedPackets;
     /** Authoritative receive mode reported by the connected server. */
     bool byteIrqMode;
     /** Receive mode currently active while a toggle request is in flight. */
@@ -88,6 +186,30 @@ typedef struct {
     /** Whether the render loop should continue producing chunks. */
     bool active;
 } TestSender_t;
+
+/** State of the connection-time server identity check. */
+typedef struct {
+    /** Identifier assigned to the current or most recent probe. */
+    uint16_t identifier;
+    /** Monotonic time at which the current probe expires. */
+    double deadline;
+    /** Whether a matching acknowledgement is still expected. */
+    bool pending;
+    /** Whether the selected UART has been verified as this app's server. */
+    bool verified;
+    /** Whether an invalid acknowledgement requires an immediate disconnect. */
+    bool failed;
+    /** Whether post-verification RX-mode synchronization has been requested. */
+    bool modeQuerySent;
+} ConnectionHandshake_t;
+
+/** Objects used by the frame callback to update UI and handshake state. */
+typedef struct {
+    /** Rolling UI traffic log. */
+    TrafficLog_t *log;
+    /** Active connection verification state. */
+    ConnectionHandshake_t *handshake;
+} ClientFrameContext_t;
 
 /** One selectable large deterministic-transfer size. */
 typedef struct {
@@ -120,8 +242,10 @@ static const BulkSizePreset_t bulkSizePresets[] = {
 };
 
 /** Semicolon-separated labels consumed by raygui's dropdown control. */
-static const char bulkSizeOptions[] =
-    "16 KiB;64 KiB;128 KiB;512 KiB;1 MiB;2 MiB;4 MiB;8 MiB;16 MiB";
+static const char *const bulkSizeOptions[] = {
+    "16 KiB", "64 KiB", "128 KiB", "512 KiB", "1 MiB",
+    "2 MiB", "4 MiB", "8 MiB", "16 MiB",
+};
 
 /** Return whether the platform's standard clipboard modifier is held. */
 static bool clipboardModifierDown(void) {
@@ -214,6 +338,7 @@ static bool sendFramedEx(AppSerialPort_t *port, TrafficLog_t *log,
         appendLog(log, "ERROR  Serial write failed");
         return false;
     }
+    log->transmittedPackets++;
     if (logPacket) {
         appendLog(log, "TX  %s  [CRC %04X]", hex, crc);
     }
@@ -248,14 +373,76 @@ static bool sendRxModeRequest(AppSerialPort_t *port, TrafficLog_t *log,
     return sendFramed(port, log, &command, length);
 }
 
+/** Send the single deterministic transfer used to identify the server UART. */
+static bool sendConnectionProbe(AppSerialPort_t *port, TrafficLog_t *log,
+                                ConnectionHandshake_t *handshake) {
+    handshake->identifier++;
+    if (handshake->identifier == 0U) {
+        handshake->identifier = 1U;
+    }
+    TestTransferPacket_t probe = {
+        .h4 = {
+            .indicator = {.value = BLE_HCI_H4_ACL},
+            .fields = {
+                .handle_flags_le = BleHciWire_ToLe16(TEST_TRANSFER_HANDLE),
+                .data_length_le = BleHciWire_ToLe16(
+                    TEST_TRANSFER_HEADER_SIZE + CONNECTION_PROBE_SIZE),
+            },
+        },
+        .transfer = {
+            .signature = {'T', 'E', 'S', 'T'},
+            .version = 1U,
+            .flags = TEST_TRANSFER_FLAG_START | TEST_TRANSFER_FLAG_END,
+            .identifier_le = BleHciWire_ToLe16(handshake->identifier),
+            .total_size_le = BleHciWire_ToLe32(CONNECTION_PROBE_SIZE),
+            .offset_le = BleHciWire_ToLe32(0U),
+            .chunk_size_le = BleHciWire_ToLe16(CONNECTION_PROBE_SIZE),
+        },
+    };
+    for (uint32_t index = 0U; index < CONNECTION_PROBE_SIZE; index++) {
+        probe.data[index] = TestTransfer_PatternByte(index);
+    }
+    const size_t packetLength = sizeof(probe.h4) +
+        TEST_TRANSFER_HEADER_SIZE + CONNECTION_PROBE_SIZE;
+    if (!sendFramedEx(port, log, &probe, packetLength, false)) {
+        return false;
+    }
+    handshake->pending = true;
+    handshake->verified = false;
+    handshake->failed = false;
+    handshake->modeQuerySent = false;
+    handshake->deadline = GetTime() + CONNECTION_PROBE_TIMEOUT_SECONDS;
+    appendLog(log, "VERIFY  Sent 128-byte server probe (id=%u)",
+              handshake->identifier);
+    return true;
+}
+
 /** Convert a received frame callback into a traffic-log entry. */
 static void logFrame(const uint8_t *frame, size_t length, bool crcValid,
                      void *context) {
-    TrafficLog_t *const log = context;
+    ClientFrameContext_t *const frameContext = context;
+    TrafficLog_t *const log = frameContext->log;
+    ConnectionHandshake_t *const handshake = frameContext->handshake;
+    log->receivedPackets++;
     const size_t h4Length = length - 2U;
     BleHciPacketIndicator_t indicator;
     memcpy(&indicator, frame, sizeof(indicator));
     bool byteIrqMode = false;
+    uint16_t completionIdentifier = 0U;
+    uint8_t completionStatus = 0U;
+    uint32_t completionSize = 0U;
+    const bool testCompletion = crcValid && AppH4TestCompleteEvent_Decode(
+        frame, length, &completionIdentifier, &completionStatus, &completionSize);
+    if (handshake->pending && testCompletion &&
+        completionIdentifier == handshake->identifier) {
+        handshake->pending = false;
+        if (completionStatus == 0U && completionSize == CONNECTION_PROBE_SIZE) {
+            handshake->verified = true;
+            appendLog(log, "VERIFY  BLE UART server acknowledged probe");
+        } else {
+            handshake->failed = true;
+        }
+    }
     bool testFrame = false;
     uint8_t testFlags = 0U;
     uint32_t testTotal = 0U;
@@ -418,13 +605,13 @@ static void pumpTestTransfer(TestSender_t *sender, AppSerialPort_t *port,
 
 /** Run the portable graphical client event loop. */
 int main(void) {
-    const int windowWidth = 960;
-    const int windowHeight = 780;
+    const int windowWidth = 1120;
+    const int windowHeight = 960;
     char windowTitle[96];
     (void)snprintf(windowTitle, sizeof(windowTitle), "BLE UART Client v%s",
                    UART_DMA_APP_VERSION);
     InitWindow(windowWidth, windowHeight, windowTitle);
-    SetWindowMinSize(760, 600);
+    SetWindowMinSize(980, 820);
     SetTargetFPS(60);
     loadUiFont();
 
@@ -432,8 +619,11 @@ int main(void) {
     AppSerialPort_Init(&serial);
     AppH4StreamParser_t parser;
     AppH4StreamParser_Init(&parser);
-    TrafficLog_t log = {{{0}}, 0U, false, false, 0U, 0U, 0U, false, 0U};
+    TrafficLog_t log = {{{0}}, 0U, 0U, 0U, false, false,
+                        0U, 0U, 0U, false, 0U};
     TestSender_t testSender = {0U, 0U, 0U, 0U, false};
+    ConnectionHandshake_t handshake = {0};
+    ClientFrameContext_t frameContext = {&log, &handshake};
 #ifdef _WIN32
     char portText[128] = "COM3";
 #elif defined(__APPLE__)
@@ -468,12 +658,36 @@ int main(void) {
                     log.absoluteIrqCount += (uint32_t)received;
                 }
                 (void)AppH4StreamParser_Feed(
-                    &parser, incoming, (size_t)received, logFrame, &log);
+                    &parser, incoming, (size_t)received, logFrame, &frameContext);
             } else if (received < 0) {
                 appendLog(&log, "ERROR  Serial connection lost");
                 AppSerialPort_Close(&serial);
                 (void)snprintf(statusText, sizeof(statusText), "Disconnected after read error");
+                handshake.pending = false;
+                handshake.verified = false;
             }
+        }
+        if (serial.connected && handshake.failed) {
+            AppSerialPort_Close(&serial);
+            handshake.failed = false;
+            handshake.verified = false;
+            (void)snprintf(statusText, sizeof(statusText),
+                           "Wrong UART: BLE UART server acknowledgement did not match");
+            appendLog(&log, "ERROR  Selected UART is not a BLE UART server");
+        } else if (serial.connected && handshake.pending &&
+                   GetTime() >= handshake.deadline) {
+            AppSerialPort_Close(&serial);
+            handshake.pending = false;
+            handshake.verified = false;
+            (void)snprintf(statusText, sizeof(statusText),
+                           "Wrong UART: BLE UART server did not acknowledge probe");
+            appendLog(&log, "ERROR  Selected UART is not a BLE UART server (timeout)");
+        } else if (serial.connected && handshake.verified &&
+                   !handshake.modeQuerySent) {
+            handshake.modeQuerySent = true;
+            (void)snprintf(statusText, sizeof(statusText), "Connected to %s", portText);
+            appendLog(&log, "Connected to %s; server identity verified", portText);
+            (void)sendRxModeRequest(&serial, &log, BLE_HCI_RX_MODE_QUERY);
         }
         pumpTestTransfer(&testSender, &serial, &log);
 
@@ -487,24 +701,45 @@ int main(void) {
         }
 
         BeginDrawing();
-        ClearBackground((Color){245, 247, 250, 255});
+        ClearBackground(COLOR_CANVAS);
         char heading[96];
         (void)snprintf(heading, sizeof(heading), "BLE UART HCI Client  v%s",
                        UART_DMA_APP_VERSION);
-        drawUiText(heading, 24, 20, 26, (Color){25, 35, 55, 255});
-        drawUiText("Portable C UI | H4 framing | CRC16-CCITT | live receive parser",
-                   24, 52, 16, (Color){90, 100, 120, 255});
+        drawDisplayText(heading, 28, 22, 32, COLOR_TEXT);
+        drawUiText("PORTABLE H4 CONSOLE  /  CRC16-CCITT  /  LIVE PACKET TELEMETRY",
+                   30, 62, 14, COLOR_MUTED);
 
-        GuiGroupBox((Rectangle){20, 84, 920, 106}, "Serial connection");
-        GuiLabel((Rectangle){36, 103, 60, 24}, "Port");
-        drawClipboardTextBox((Rectangle){86, 101, 410, 30}, portText,
+        char txMetric[32];
+        char rxMetric[32];
+        char irqMetric[32];
+        (void)snprintf(txMetric, sizeof(txMetric), "%u",
+                       (unsigned int)log.transmittedPackets);
+        (void)snprintf(rxMetric, sizeof(rxMetric), "%u",
+                       (unsigned int)log.receivedPackets);
+        (void)snprintf(irqMetric, sizeof(irqMetric), "%u",
+                       (unsigned int)log.absoluteIrqCount);
+        drawMetricCard((Rectangle){24, 100, 259, 84}, "RX PACKETS", rxMetric, COLOR_BLUE);
+        drawMetricCard((Rectangle){295, 100, 259, 84}, "TX PACKETS", txMetric, COLOR_CYAN);
+        drawMetricCard((Rectangle){566, 100, 259, 84}, "RX IRQ CALLS", irqMetric, COLOR_PURPLE);
+        drawMetricCard((Rectangle){837, 100, 259, 84}, "TRANSPORT",
+                       handshake.pending ? "VERIFYING" : serial.connected
+                           ? (log.byteIrqMode ? "BYTE IRQ" : "DMA + IDLE")
+                           : "OFFLINE",
+                       serial.connected ? COLOR_CYAN : COLOR_MUTED);
+
+        drawPanel((Rectangle){24, 204, 1072, 136}, "CONNECTION");
+        GuiLabel((Rectangle){44, 247, 50, 38}, "Port");
+        drawClipboardTextBox((Rectangle){96, 247, 426, 38}, portText,
                              sizeof(portText), &portEdit);
-        GuiLabel((Rectangle){516, 103, 50, 24}, "Baud");
-        drawClipboardTextBox((Rectangle){563, 101, 125, 30}, baudText,
+        GuiLabel((Rectangle){542, 247, 52, 38}, "Baud");
+        drawClipboardTextBox((Rectangle){598, 247, 138, 38}, baudText,
                              sizeof(baudText), &baudEdit);
-        if (GuiButton((Rectangle){706, 101, 210, 30}, serial.connected ? "Disconnect" : "Connect")) {
+        if (brightButton((Rectangle){756, 247, 170, 38},
+                         serial.connected ? "Disconnect" : "Connect", true)) {
             if (serial.connected) {
                 AppSerialPort_Close(&serial);
+                handshake.pending = false;
+                handshake.verified = false;
                 (void)snprintf(statusText, sizeof(statusText), "Disconnected");
                 appendLog(&log, "Disconnected from %s", portText);
             } else {
@@ -514,29 +749,31 @@ int main(void) {
                 if (end == baudText || *end != '\0') {
                     (void)snprintf(statusText, sizeof(statusText), "Invalid baud rate");
                 } else if (AppSerialPort_Open(&serial, portText, baud, error, sizeof(error))) {
-                    (void)snprintf(statusText, sizeof(statusText), "Connected to %s", portText);
-                    appendLog(&log, "Connected to %s at %lu baud", portText, baud);
-                    (void)sendRxModeRequest(&serial, &log, BLE_HCI_RX_MODE_QUERY);
+                    AppH4StreamParser_Init(&parser);
+                    (void)snprintf(statusText, sizeof(statusText),
+                                   "Verifying BLE UART server on %s...", portText);
+                    appendLog(&log, "Opened %s at %lu baud; verifying server", portText, baud);
+                    if (!sendConnectionProbe(&serial, &log, &handshake)) {
+                        AppSerialPort_Close(&serial);
+                        (void)snprintf(statusText, sizeof(statusText),
+                                       "Could not send BLE UART verification probe");
+                    }
                 } else {
                     (void)snprintf(statusText, sizeof(statusText), "%s", error);
                     appendLog(&log, "ERROR  %s", error);
                 }
             }
         }
-        GuiStatusBar((Rectangle){36, 145, 880, 26}, statusText);
-        drawUiText("Cmd/Ctrl+C copy | X cut | V paste",
-                   36, 134, 11, (Color){100, 110, 128, 255});
-        char irqCountText[64];
-        (void)snprintf(irqCountText, sizeof(irqCountText), "IRQ calls: %u",
-                       (unsigned int)log.absoluteIrqCount);
-        drawUiText(irqCountText, 585, 134, 11, (Color){100, 110, 128, 255});
+        GuiStatusBar((Rectangle){44, 298, 882, 28}, statusText);
+        drawUiText("Native clipboard shortcuts enabled", 46, 329, 11, COLOR_MUTED);
         const bool previousRxMode = log.byteIrqMode;
-        if (!serial.connected) {
+        const bool connectionReady = serial.connected && handshake.verified;
+        if (!connectionReady) {
             GuiDisable();
         }
-        const bool rxModeChanged = GuiCheckBox((Rectangle){744, 132, 20, 20},
+        const bool rxModeChanged = GuiCheckBox((Rectangle){958, 254, 24, 24},
                                                "Per-byte IRQ", &log.byteIrqMode) != 0;
-        if (!serial.connected) {
+        if (!connectionReady) {
             GuiEnable();
         }
         if (rxModeChanged && !sendRxModeRequest(
@@ -545,9 +782,9 @@ int main(void) {
             log.byteIrqMode = previousRxMode;
         }
 
-        GuiGroupBox((Rectangle){20, 205, 920, 176}, "HCI command");
-        GuiLabel((Rectangle){36, 225, 65, 24}, "Preset");
-        if (GuiDropdownBox((Rectangle){103, 222, 280, 30},
+        drawPanel((Rectangle){24, 360, 1072, 216}, "HCI COMMAND BUILDER");
+        GuiLabel((Rectangle){44, 397, 64, 38}, "Preset");
+        if (GuiDropdownBox((Rectangle){112, 397, 360, 38},
                            "HCI Reset;Read Local Version;Read BD_ADDR;LE Read Buffer Size;LE Enable Scan;LE Disable Scan",
                            &presetIndex, presetDropdown)) {
             presetDropdown = !presetDropdown;
@@ -557,13 +794,14 @@ int main(void) {
                            parametersText, sizeof(parametersText));
             previousPreset = presetIndex;
         }
-        GuiLabel((Rectangle){408, 225, 60, 24}, "Opcode");
-        drawClipboardTextBox((Rectangle){470, 222, 120, 30}, opcodeText,
+        GuiLabel((Rectangle){496, 397, 66, 38}, "Opcode");
+        drawClipboardTextBox((Rectangle){566, 397, 164, 38}, opcodeText,
                              sizeof(opcodeText), &opcodeEdit);
-        GuiLabel((Rectangle){36, 270, 110, 24}, "Parameters (hex)");
-        drawClipboardTextBox((Rectangle){148, 267, 598, 30}, parametersText,
+        GuiLabel((Rectangle){44, 452, 132, 38}, "Parameters");
+        drawClipboardTextBox((Rectangle){180, 452, 646, 38}, parametersText,
                              sizeof(parametersText), &parametersEdit);
-        if (GuiButton((Rectangle){764, 267, 152, 30}, "Send command")) {
+        if (brightButton((Rectangle){850, 452, 226, 38}, "Send command",
+                         connectionReady)) {
             char *end = NULL;
             const unsigned long opcode = strtoul(opcodeText, &end, 16);
             uint8_t parameters[255];
@@ -577,10 +815,11 @@ int main(void) {
                                   parameters, parameterLength);
             }
         }
-        GuiLabel((Rectangle){36, 320, 110, 24}, "Raw H4 (hex)");
-        drawClipboardTextBox((Rectangle){148, 317, 598, 30}, rawText,
+        GuiLabel((Rectangle){44, 512, 132, 38}, "Raw H4 bytes");
+        drawClipboardTextBox((Rectangle){180, 512, 646, 38}, rawText,
                              sizeof(rawText), &rawEdit);
-        if (GuiButton((Rectangle){764, 317, 152, 30}, "Append CRC + send")) {
+        if (brightButton((Rectangle){850, 512, 226, 38}, "Append CRC + send",
+                         connectionReady)) {
             uint8_t raw[APP_H4_MAX_FRAME_SIZE - 2U];
             const size_t rawLength = AppH4_ParseHex(rawText, raw, sizeof(raw));
             if (rawLength == SIZE_MAX || rawLength == 0U) {
@@ -590,29 +829,32 @@ int main(void) {
             }
         }
 
-        GuiGroupBox((Rectangle){20, 398, 920, 100}, "Bulk test messages");
-        if (GuiButton((Rectangle){36, 422, 184, 34}, "Send 128-byte message")) {
+        drawPanel((Rectangle){24, 596, 1072, 124}, "TEST TRANSMISSIONS");
+        if (brightButton((Rectangle){44, 638, 220, 42}, "Send 128-byte packet",
+                         connectionReady)) {
             startTestTransfer(&testSender, &serial, &log, 128U);
         }
-        GuiLabel((Rectangle){234, 427, 76, 24}, "Large block");
-        if (GuiButton((Rectangle){458, 422, 166, 34}, "Send selected block")) {
+        GuiLabel((Rectangle){292, 640, 92, 38}, "Block size");
+        if (brightButton((Rectangle){548, 638, 218, 42}, "Send selected block",
+                         connectionReady && !testSender.active)) {
             startTestTransfer(&testSender, &serial, &log,
                               bulkSizePresets[bulkSizeIndex].size);
         }
         const float progress = testSender.totalSize == 0U ? 0.0f
             : (float)testSender.offset / (float)testSender.totalSize;
-        DrawRectangle(642, 428, 272, 20, (Color){220, 225, 232, 255});
-        DrawRectangle(642, 428, (int)(272.0f * progress), 20,
-                      (Color){70, 145, 235, 255});
-        DrawRectangleLines(642, 428, 272, 20, (Color){150, 158, 172, 255});
+        DrawRectangleRounded((Rectangle){792, 638, 284, 16}, 0.5f, 6,
+                             (Color){35, 45, 65, 255});
+        DrawRectangleRounded((Rectangle){792, 638, 284.0f * progress, 16},
+                             0.5f, 6, COLOR_BLUE);
         char progressText[96];
         (void)snprintf(progressText, sizeof(progressText), "%u / %u bytes",
                        (unsigned int)testSender.offset,
                        (unsigned int)testSender.totalSize);
-        drawUiText(progressText, 642, 460, 14, (Color){80, 90, 108, 255});
+        drawUiText(progressText, 792, 665, 14, COLOR_MUTED);
 
-        GuiGroupBox((Rectangle){20, 514, 920, 246}, "UART traffic");
-        DrawRectangle(34, 537, 892, 208, (Color){20, 25, 35, 255});
+        drawPanel((Rectangle){24, 740, 1072, 196}, "LIVE UART TRAFFIC");
+        DrawRectangleRounded((Rectangle){44, 777, 1032, 142}, 0.04f, 6,
+                             (Color){7, 11, 20, 255});
         for (size_t index = 0U; index < log.count; index++) {
             const Color color = strncmp(log.lines[index], "ERROR", 5U) == 0
                 ? (Color){255, 120, 120, 255}
@@ -621,20 +863,23 @@ int main(void) {
                     : strncmp(log.lines[index], "RX", 2U) == 0
                         ? (Color){105, 225, 150, 255}
                         : (Color){190, 198, 210, 255};
-            drawUiText(log.lines[index], 46, 547 + (int)index * 15, 13, color);
+            drawUiText(log.lines[index], 58, 786 + (int)index * 15, 13, color);
         }
 
         /* Draw last so the expanded selector overlays the traffic panel. */
-        if (GuiDropdownBox((Rectangle){310, 422, 132, 34}, bulkSizeOptions,
-                           &bulkSizeIndex, bulkSizeDropdown)) {
-            bulkSizeDropdown = !bulkSizeDropdown;
-        }
+        (void)AppDashboard_UpwardDropdown(
+            (Rectangle){392, 638, 132, 42}, uiFont, bulkSizeOptions,
+            sizeof(bulkSizeOptions) / sizeof(bulkSizeOptions[0]),
+            &bulkSizeIndex, &bulkSizeDropdown);
         EndDrawing();
     }
 
     AppSerialPort_Close(&serial);
     if (customUiFont) {
         UnloadFont(uiFont);
+    }
+    if (customDisplayFont) {
+        UnloadFont(displayFont);
     }
     CloseWindow();
     return 0;

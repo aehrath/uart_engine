@@ -69,6 +69,16 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(frame.rx_mode, RX_MODE_BYTE_IRQ)
         self.assertEqual(frame.summary, "RX mode: per-byte IRQ")
 
+    def test_test_completion_event(self):
+        """Decode the server acknowledgement used during connection verification."""
+        parser = H4CrcStreamParser()
+        event = add_crc(
+            bytes.fromhex("04 FF 0B 54 45 53 54 34 12 00 80 00 00 00"))
+        frame = parser.feed(event)[0]
+        self.assertTrue(frame.crc_valid)
+        self.assertEqual(frame.test_completion, (0x1234, 0, 128))
+        self.assertEqual(frame.summary, "Test transfer 4660 passed, 128 bytes")
+
     def test_hex_input_formats(self):
         """Verify all separators accepted by the user-facing hex parser."""
         self.assertEqual(parse_hex("0x01, 03:0C 00"), bytes.fromhex("01 03 0C 00"))

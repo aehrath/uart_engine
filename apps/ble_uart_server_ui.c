@@ -1,6 +1,7 @@
 /** @file
  * @brief Portable graphical supervisor for the continuous BLE UART server. */
 #include "raylib.h"
+#include "dashboard_dropdown.h"
 #include "h4_wire.h"
 #include "test_transfer_protocol.h"
 #include "uart_dma/app_version.h"
@@ -26,25 +27,82 @@
 #define PROCESS_BUFFER_SIZE 2048U
 
 static Font uiFont;
+static Font displayFont;
 static bool customUiFont;
+static bool customDisplayFont;
+
+static const Color COLOR_CANVAS = {10, 15, 28, 255};
+static const Color COLOR_PANEL = {20, 28, 46, 255};
+static const Color COLOR_PANEL_RAISED = {27, 37, 59, 255};
+static const Color COLOR_BORDER = {49, 65, 92, 255};
+static const Color COLOR_TEXT = {232, 239, 249, 255};
+static const Color COLOR_MUTED = {143, 158, 181, 255};
+static const Color COLOR_CYAN = {45, 212, 191, 255};
+static const Color COLOR_BLUE = {76, 148, 255, 255};
+static const Color COLOR_PURPLE = {167, 139, 250, 255};
 
 /** Load the bundled sans-serif UI font and configure raygui to use it. */
 static void loadUiFont(void) {
     const char *path = TextFormat("%s%s", GetApplicationDirectory(),
                                   UART_DMA_UI_FONT_FILE);
-    uiFont = LoadFontEx(path, 28, NULL, 0);
+    uiFont = LoadFontEx(path, 36, NULL, 0);
     customUiFont = uiFont.texture.id != 0U;
     if (!customUiFont) {
         uiFont = GetFontDefault();
     }
     SetTextureFilter(uiFont.texture, TEXTURE_FILTER_BILINEAR);
     GuiSetFont(uiFont);
-    GuiSetStyle(DEFAULT, TEXT_SIZE, 15);
+    GuiSetStyle(DEFAULT, TEXT_SIZE, 17);
+    GuiSetStyle(DEFAULT, BORDER_WIDTH, 1);
+    GuiSetStyle(DEFAULT, TEXT_PADDING, 10);
+    GuiSetStyle(DEFAULT, BORDER_COLOR_NORMAL, ColorToInt(COLOR_BORDER));
+    GuiSetStyle(DEFAULT, BASE_COLOR_NORMAL, ColorToInt(COLOR_PANEL_RAISED));
+    GuiSetStyle(DEFAULT, TEXT_COLOR_NORMAL, ColorToInt(COLOR_TEXT));
+    GuiSetStyle(DEFAULT, BORDER_COLOR_FOCUSED, ColorToInt(COLOR_CYAN));
+    GuiSetStyle(DEFAULT, BASE_COLOR_FOCUSED, ColorToInt((Color){35, 50, 76, 255}));
+    GuiSetStyle(DEFAULT, TEXT_COLOR_FOCUSED, ColorToInt(WHITE));
+    GuiSetStyle(DEFAULT, BORDER_COLOR_PRESSED, ColorToInt(COLOR_BLUE));
+    GuiSetStyle(DEFAULT, BASE_COLOR_PRESSED, ColorToInt((Color){42, 63, 96, 255}));
+    GuiSetStyle(DEFAULT, TEXT_COLOR_PRESSED, ColorToInt(WHITE));
+    GuiSetStyle(DEFAULT, BORDER_COLOR_DISABLED, ColorToInt((Color){43, 52, 70, 255}));
+    GuiSetStyle(DEFAULT, BASE_COLOR_DISABLED, ColorToInt((Color){24, 30, 43, 255}));
+    GuiSetStyle(DEFAULT, TEXT_COLOR_DISABLED, ColorToInt((Color){91, 104, 124, 255}));
+    GuiSetStyle(DROPDOWNBOX, BASE_COLOR_NORMAL, ColorToInt((Color){14, 22, 38, 255}));
+    GuiSetStyle(DROPDOWNBOX, TEXT_COLOR_NORMAL, ColorToInt((Color){241, 246, 255, 255}));
+    GuiSetStyle(DROPDOWNBOX, BASE_COLOR_FOCUSED, ColorToInt((Color){103, 232, 249, 255}));
+    GuiSetStyle(DROPDOWNBOX, TEXT_COLOR_FOCUSED, ColorToInt((Color){7, 22, 28, 255}));
+    GuiSetStyle(DROPDOWNBOX, BASE_COLOR_PRESSED, ColorToInt(COLOR_BLUE));
+    GuiSetStyle(DROPDOWNBOX, TEXT_COLOR_PRESSED, ColorToInt(WHITE));
+
+    const char *displayPath = TextFormat("%s%s", GetApplicationDirectory(),
+                                         UART_DMA_UI_DISPLAY_FONT_FILE);
+    displayFont = LoadFontEx(displayPath, 42, NULL, 0);
+    customDisplayFont = displayFont.texture.id != 0U;
+    if (!customDisplayFont) {
+        displayFont = uiFont;
+    }
+    SetTextureFilter(displayFont.texture, TEXTURE_FILTER_BILINEAR);
 }
 
 /** Draw antialiased text using the shared UI typeface. */
 static void drawUiText(const char *text, int x, int y, int size, Color color) {
     DrawTextEx(uiFont, text, (Vector2){(float)x, (float)y}, (float)size, 0.0f, color);
+}
+
+/** Draw title and metric text using the technical display face. */
+static void drawDisplayText(const char *text, int x, int y, int size, Color color) {
+    DrawTextEx(displayFont, text, (Vector2){(float)x, (float)y},
+               (float)size, 0.5f, color);
+}
+
+/** Draw one rounded dashboard panel with an optional section title. */
+static void drawPanel(Rectangle bounds, const char *title) {
+    DrawRectangleRounded(bounds, 0.08f, 10, COLOR_PANEL);
+    DrawRectangleRoundedLinesEx(bounds, 0.08f, 10, 1.0f, COLOR_BORDER);
+    if (title != NULL) {
+        drawDisplayText(title, (int)bounds.x + 20, (int)bounds.y + 15,
+                        16, COLOR_MUTED);
+    }
 }
 
 /** HCI command preset mirrored from the client applications. */
@@ -88,8 +146,10 @@ static const BulkSizePreset_t bulkSizePresets[] = {
     {"16 MiB", 16U * 1024U * 1024U},
 };
 
-static const char bulkSizeOptions[] =
-    "16 KiB;64 KiB;128 KiB;512 KiB;1 MiB;2 MiB;4 MiB;8 MiB;16 MiB";
+static const char *const bulkSizeOptions[] = {
+    "16 KiB", "64 KiB", "128 KiB", "512 KiB", "1 MiB",
+    "2 MiB", "4 MiB", "8 MiB", "16 MiB",
+};
 static const char presetOptions[] =
     "HCI Reset;Read Local Version;Read BD_ADDR;LE Read Buffer Size;LE Enable Scan;LE Disable Scan";
 
@@ -461,13 +521,35 @@ static bool startServerTest(ServerProcess_t *process, ServerLog_t *log,
 /** Render one dashboard metric card. */
 static void drawMetricCard(Rectangle bounds, const char *label,
                            const char *value, Color accent) {
-    DrawRectangleRounded(bounds, 0.10f, 8, WHITE);
+    DrawRectangleRounded(bounds, 0.12f, 10, COLOR_PANEL_RAISED);
     DrawRectangleRounded((Rectangle){bounds.x, bounds.y, 5.0f, bounds.height},
                          0.5f, 4, accent);
-    drawUiText(label, (int)bounds.x + 18, (int)bounds.y + 14, 14,
-               (Color){100, 110, 128, 255});
-    drawUiText(value, (int)bounds.x + 18, (int)bounds.y + 40, 24,
-               (Color){25, 35, 55, 255});
+    drawUiText(label, (int)bounds.x + 18, (int)bounds.y + 14, 14, COLOR_MUTED);
+    drawDisplayText(value, (int)bounds.x + 18, (int)bounds.y + 42, 25, COLOR_TEXT);
+}
+
+/** Draw a rounded high-contrast action button and report a completed click. */
+static bool brightButton(Rectangle bounds, const char *label, bool enabled) {
+    const bool hovered = enabled && CheckCollisionPointRec(GetMousePosition(), bounds);
+    const bool pressed = hovered && IsMouseButtonDown(MOUSE_BUTTON_LEFT);
+    const Color fill = !enabled ? (Color){39, 49, 67, 255}
+        : pressed ? (Color){34, 197, 181, 255}
+        : hovered ? (Color){103, 232, 249, 255}
+        : (Color){45, 212, 191, 255};
+    DrawRectangleRounded(bounds, 0.34f, 12, fill);
+    if (enabled) {
+        DrawRectangleRoundedLinesEx(bounds, 0.34f, 12, 1.0f,
+                                    hovered ? (Color){207, 250, 254, 255}
+                                            : (Color){94, 234, 212, 255});
+    }
+    const int fontSize = 16;
+    const Vector2 measured = MeasureTextEx(uiFont, label, (float)fontSize, 0.0f);
+    DrawTextEx(uiFont, label,
+               (Vector2){bounds.x + (bounds.width - measured.x) * 0.5f,
+                         bounds.y + (bounds.height - measured.y) * 0.5f - 1.0f},
+               (float)fontSize, 0.0f,
+               enabled ? (Color){7, 22, 28, 255} : (Color){94, 107, 127, 255});
+    return enabled && hovered && IsMouseButtonReleased(MOUSE_BUTTON_LEFT);
 }
 
 /** Run the graphical server dashboard and child-process supervisor. */
@@ -475,8 +557,8 @@ int main(void) {
     char windowTitle[96];
     (void)snprintf(windowTitle, sizeof(windowTitle), "BLE UART Server v%s",
                    UART_DMA_APP_VERSION);
-    InitWindow(960, 940, windowTitle);
-    SetWindowMinSize(760, 700);
+    InitWindow(1120, 960, windowTitle);
+    SetWindowMinSize(980, 820);
     SetTargetFPS(60);
     loadUiFont();
 
@@ -513,31 +595,17 @@ int main(void) {
         }
 
         BeginDrawing();
-        ClearBackground((Color){245, 247, 250, 255});
+        ClearBackground(COLOR_CANVAS);
         char heading[96];
         (void)snprintf(heading, sizeof(heading), "BLE UART DMA Server  v%s",
                        UART_DMA_APP_VERSION);
-        drawUiText(heading, 24, 20, 26, (Color){25, 35, 55, 255});
-        drawUiText("FreeRTOS | circular RX DMA | HCI command responder",
-                   24, 52, 16, (Color){90, 100, 120, 255});
+        drawDisplayText(heading, 28, 22, 32, COLOR_TEXT);
+        drawUiText("FREERTOS ENGINE  /  CIRCULAR RX DMA  /  LIVE HCI TELEMETRY",
+                   30, 62, 14, COLOR_MUTED);
 
         const Color serverColor = process.running
             ? (process.stopping ? (Color){240, 170, 60, 255} : (Color){45, 185, 105, 255})
             : (Color){145, 152, 166, 255};
-        DrawCircle(35, 110, 7.0f, serverColor);
-        drawUiText(process.running ? (process.stopping ? "Stopping" : "Server running")
-                                   : "Server stopped",
-                   51, 100, 20, (Color){40, 48, 62, 255});
-
-        if (GuiButton((Rectangle){724, 91, 212, 38},
-                      process.running ? "Stop server" : "Start server")) {
-            if (process.running) {
-                requestServerStop(&process, &log);
-            } else {
-                (void)startServer(&process, &log, &state);
-            }
-        }
-
         char rxValue[32];
         char txValue[32];
         char irqValue[32];
@@ -545,35 +613,43 @@ int main(void) {
         (void)snprintf(txValue, sizeof(txValue), "%u", state.transmittedEvents);
         (void)snprintf(irqValue, sizeof(irqValue), "%u",
                        (unsigned int)state.rxInterruptCount);
-        drawMetricCard((Rectangle){24, 151, 218, 82}, "RX messages", rxValue,
-                       (Color){70, 145, 235, 255});
-        drawMetricCard((Rectangle){258, 151, 218, 82}, "TX activity", txValue,
-                       (Color){45, 185, 105, 255});
-        drawMetricCard((Rectangle){492, 151, 218, 82}, "RX IRQ calls", irqValue,
-                       (Color){170, 105, 225, 255});
-        drawMetricCard((Rectangle){726, 151, 210, 82}, "Transport",
+        drawMetricCard((Rectangle){24, 100, 259, 84}, "RX PACKETS", rxValue, COLOR_BLUE);
+        drawMetricCard((Rectangle){295, 100, 259, 84}, "TX ACTIVITY", txValue, COLOR_CYAN);
+        drawMetricCard((Rectangle){566, 100, 259, 84}, "RX IRQ CALLS", irqValue, COLOR_PURPLE);
+        drawMetricCard((Rectangle){837, 100, 259, 84}, "TRANSPORT",
                        process.running
-                           ? (state.byteIrqMode ? "Byte IRQ active" : "DMA active")
-                           : "Idle",
+                           ? (state.byteIrqMode ? "BYTE IRQ" : "DMA + IDLE")
+                           : "OFFLINE",
                        serverColor);
 
-        GuiGroupBox((Rectangle){20, 250, 920, 96}, "Client connection");
-        GuiLabel((Rectangle){36, 271, 125, 24}, "Pseudo-UART port");
-        GuiStatusBar((Rectangle){163, 268, 568, 30},
+        drawPanel((Rectangle){24, 204, 1072, 136}, "SERVER CONTROL");
+        DrawCircle(50, 255, 7.0f, serverColor);
+        drawUiText(process.running ? (process.stopping ? "Stopping engine" : "Server running")
+                                   : "Server stopped",
+                   68, 244, 18, COLOR_TEXT);
+        if (brightButton((Rectangle){876, 232, 200, 40},
+                         process.running ? "Stop server" : "Start server", true)) {
+            if (process.running) {
+                requestServerStop(&process, &log);
+            } else {
+                (void)startServer(&process, &log, &state);
+            }
+        }
+        GuiLabel((Rectangle){44, 289, 122, 38}, "Pseudo-UART");
+        GuiStatusBar((Rectangle){170, 289, 570, 38},
                      state.port[0] != '\0' ? state.port : "Start the server to create a port");
-        if (GuiButton((Rectangle){748, 268, 168, 30}, "Copy port")) {
+        if (brightButton((Rectangle){758, 289, 152, 38}, "Copy port",
+                         state.port[0] != '\0')) {
             if (state.port[0] != '\0') {
                 SetClipboardText(state.port);
                 appendLog(&log, "Copied pseudo-UART port to clipboard");
             }
         }
-        GuiLabel((Rectangle){36, 307, 650, 24},
-                 "Paste this port into the Python app, C terminal client, or C client UI.");
         const bool previousMode = state.byteIrqMode;
         if (!process.running) {
             GuiDisable();
         }
-        const bool modeChanged = GuiCheckBox((Rectangle){748, 307, 20, 20},
+        const bool modeChanged = GuiCheckBox((Rectangle){942, 296, 24, 24},
                                              "Per-byte IRQ", &state.byteIrqMode) != 0;
         if (!process.running) {
             GuiEnable();
@@ -583,9 +659,9 @@ int main(void) {
             appendLog(&log, "ERROR  Unable to send receive-mode request");
         }
 
-        GuiGroupBox((Rectangle){20, 363, 920, 176}, "Send HCI packet to client");
-        GuiLabel((Rectangle){36, 383, 65, 24}, "Preset");
-        if (GuiDropdownBox((Rectangle){103, 380, 280, 30}, presetOptions,
+        drawPanel((Rectangle){24, 360, 1072, 216}, "HCI COMMAND BUILDER");
+        GuiLabel((Rectangle){44, 397, 64, 38}, "Preset");
+        if (GuiDropdownBox((Rectangle){112, 397, 360, 38}, presetOptions,
                            &presetIndex, presetDropdown)) {
             presetDropdown = !presetDropdown;
         }
@@ -594,17 +670,17 @@ int main(void) {
                            parametersText, sizeof(parametersText));
             previousPreset = presetIndex;
         }
-        GuiLabel((Rectangle){408, 383, 60, 24}, "Opcode");
-        drawClipboardTextBox((Rectangle){470, 380, 120, 30}, opcodeText,
+        GuiLabel((Rectangle){496, 397, 66, 38}, "Opcode");
+        drawClipboardTextBox((Rectangle){566, 397, 164, 38}, opcodeText,
                              sizeof(opcodeText), &opcodeEdit);
-        GuiLabel((Rectangle){36, 428, 110, 24}, "Parameters (hex)");
-        drawClipboardTextBox((Rectangle){148, 425, 598, 30}, parametersText,
+        GuiLabel((Rectangle){44, 452, 132, 38}, "Parameters");
+        drawClipboardTextBox((Rectangle){180, 452, 646, 38}, parametersText,
                              sizeof(parametersText), &parametersEdit);
         if (!process.running) {
             GuiDisable();
         }
-        const bool sendCommandPressed = GuiButton(
-            (Rectangle){764, 425, 152, 30}, "Send command");
+        const bool sendCommandPressed = brightButton(
+            (Rectangle){850, 452, 226, 38}, "Send command", process.running);
         if (!process.running) {
             GuiEnable();
         }
@@ -623,14 +699,14 @@ int main(void) {
                                            parameters, parameterLength);
             }
         }
-        GuiLabel((Rectangle){36, 478, 110, 24}, "Raw H4 (hex)");
-        drawClipboardTextBox((Rectangle){148, 475, 598, 30}, rawText,
+        GuiLabel((Rectangle){44, 512, 132, 38}, "Raw H4 bytes");
+        drawClipboardTextBox((Rectangle){180, 512, 646, 38}, rawText,
                              sizeof(rawText), &rawEdit);
         if (!process.running) {
             GuiDisable();
         }
-        const bool sendRawPressed = GuiButton(
-            (Rectangle){764, 475, 152, 30}, "Append CRC + send");
+        const bool sendRawPressed = brightButton(
+            (Rectangle){850, 512, 226, 38}, "Append CRC + send", process.running);
         if (!process.running) {
             GuiEnable();
         }
@@ -644,15 +720,17 @@ int main(void) {
             }
         }
 
-        GuiGroupBox((Rectangle){20, 556, 920, 100}, "Send test messages to client");
+        drawPanel((Rectangle){24, 596, 1072, 124}, "TEST TRANSMISSIONS");
         if (!process.running || state.testActive) {
             GuiDisable();
         }
-        const bool sendSmallTest = GuiButton(
-            (Rectangle){36, 580, 184, 34}, "Send 128-byte message");
-        GuiLabel((Rectangle){234, 585, 76, 24}, "Large block");
-        const bool sendLargeTest = GuiButton(
-            (Rectangle){458, 580, 166, 34}, "Send selected block");
+        const bool sendSmallTest = brightButton(
+            (Rectangle){44, 638, 220, 42}, "Send 128-byte packet",
+            process.running && !state.testActive);
+        GuiLabel((Rectangle){292, 640, 92, 38}, "Block size");
+        const bool sendLargeTest = brightButton(
+            (Rectangle){548, 638, 218, 42}, "Send selected block",
+            process.running && !state.testActive);
         if (!process.running || state.testActive) {
             GuiEnable();
         }
@@ -665,18 +743,19 @@ int main(void) {
         }
         const float progress = state.testTotal == 0U ? 0.0f
             : (float)state.testSent / (float)state.testTotal;
-        DrawRectangle(642, 586, 272, 20, (Color){220, 225, 232, 255});
-        DrawRectangle(642, 586, (int)(272.0f * progress), 20,
-                      (Color){70, 145, 235, 255});
-        DrawRectangleLines(642, 586, 272, 20, (Color){150, 158, 172, 255});
+        DrawRectangleRounded((Rectangle){792, 638, 284, 16}, 0.5f, 6,
+                             (Color){35, 45, 65, 255});
+        DrawRectangleRounded((Rectangle){792, 638, 284.0f * progress, 16},
+                             0.5f, 6, COLOR_BLUE);
         char progressText[96];
         (void)snprintf(progressText, sizeof(progressText), "%u / %u bytes",
                        (unsigned int)state.testSent,
                        (unsigned int)state.testTotal);
-        drawUiText(progressText, 642, 618, 14, (Color){80, 90, 108, 255});
+        drawUiText(progressText, 792, 665, 14, COLOR_MUTED);
 
-        GuiGroupBox((Rectangle){20, 673, 920, 247}, "Live DMA / HCI traffic");
-        DrawRectangle(34, 697, 892, 207, (Color){20, 25, 35, 255});
+        drawPanel((Rectangle){24, 740, 1072, 196}, "LIVE DMA / HCI TRAFFIC");
+        DrawRectangleRounded((Rectangle){44, 777, 1032, 142}, 0.04f, 6,
+                             (Color){7, 11, 20, 255});
         for (size_t index = 0U; index < log.count; index++) {
             const Color color = strncmp(log.lines[index], "ERROR", 5U) == 0
                 ? (Color){255, 120, 120, 255}
@@ -685,14 +764,14 @@ int main(void) {
                     : strncmp(log.lines[index], "TX DMA", 6U) == 0
                         ? (Color){105, 225, 150, 255}
                         : (Color){190, 198, 210, 255};
-            drawUiText(log.lines[index], 46, 709 + (int)index * 17, 13, color);
+            drawUiText(log.lines[index], 58, 786 + (int)index * 15, 13, color);
         }
 
         /* Draw dropdowns last so their expanded lists overlay lower panels. */
-        if (GuiDropdownBox((Rectangle){310, 580, 132, 34}, bulkSizeOptions,
-                           &bulkSizeIndex, bulkSizeDropdown)) {
-            bulkSizeDropdown = !bulkSizeDropdown;
-        }
+        (void)AppDashboard_UpwardDropdown(
+            (Rectangle){392, 638, 132, 42}, uiFont, bulkSizeOptions,
+            sizeof(bulkSizeOptions) / sizeof(bulkSizeOptions[0]),
+            &bulkSizeIndex, &bulkSizeDropdown);
         EndDrawing();
     }
 
@@ -704,6 +783,9 @@ int main(void) {
     }
     if (customUiFont) {
         UnloadFont(uiFont);
+    }
+    if (customDisplayFont) {
+        UnloadFont(displayFont);
     }
     CloseWindow();
     return 0;

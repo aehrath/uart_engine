@@ -71,8 +71,10 @@ actual number of receive-byte IRQ handler invocations.
 
 Application releases are numbered from the repository [`VERSION`](VERSION)
 file. Every dashboard displays that version in its window title and heading.
-The native dashboards bundle Noto Sans for consistent antialiased text, while
-the Python dashboard selects the corresponding native sans-serif UI family.
+The native dashboards bundle Space Grotesk for a geometric, antialiased visual
+system, while the Python dashboard selects the closest native sans-serif UI
+family. All dashboards use bright rounded action controls against a layered
+dark instrument-panel layout.
 
 IRQ counters are deliberately application-local rather than synchronized over
 HCI. Dashboards show a cumulative process-lifetime value, while logs show a

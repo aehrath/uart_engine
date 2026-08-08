@@ -107,6 +107,28 @@ bool AppH4RxModeEvent_Decode(const uint8_t *frame, size_t frame_length,
     return true;
 }
 
+bool AppH4TestCompleteEvent_Decode(const uint8_t *frame, size_t frame_length,
+                                   uint16_t *identifier, uint8_t *status,
+                                   uint32_t *total_size) {
+    if (frame == NULL || identifier == NULL || status == NULL ||
+        total_size == NULL || frame_length < sizeof(BleHciTestCompleteEvent_t)) {
+        return false;
+    }
+    BleHciTestCompleteEvent_t event;
+    memcpy(&event, frame, sizeof(event));
+    if (event.header.indicator.value != BLE_HCI_H4_EVENT ||
+        event.header.fields.event_code != BLE_HCI_VENDOR_EVENT_CODE ||
+        event.header.fields.parameter_length != sizeof(event.parameters) ||
+        memcmp(event.parameters.signature, "TEST",
+               sizeof(event.parameters.signature)) != 0) {
+        return false;
+    }
+    *identifier = BleHciWire_FromLe16(event.parameters.identifier_le);
+    *status = event.parameters.status;
+    *total_size = BleHciWire_FromLe32(event.parameters.total_size_le);
+    return true;
+}
+
 void AppH4StreamParser_Init(AppH4StreamParser_t *parser) {
     memset(parser, 0, sizeof(*parser));
 }

@@ -52,6 +52,67 @@ def run_gui() -> None:
     import tkinter.font as tkfont
     from tkinter import ttk
 
+    class RoundedActionButton(tk.Canvas):
+        """Bright keyboard-accessible rounded action button for the dark dashboard."""
+
+        def __init__(self, parent: tk.Misc, text: str, command: object,
+                     width: int = 190, height: int = 42) -> None:
+            super().__init__(parent, width=width, height=height,
+                             background="#141C2E", highlightthickness=0,
+                             borderwidth=0, takefocus=True)
+            self._text = text
+            self._command = command
+            self._state = tk.NORMAL
+            self._hovered = False
+            self._width = width
+            self._height = height
+            self.bind("<Enter>", lambda _event: self._set_hover(True))
+            self.bind("<Leave>", lambda _event: self._set_hover(False))
+            self.bind("<ButtonRelease-1>", self._activate)
+            self.bind("<Return>", self._activate)
+            self.bind("<space>", self._activate)
+            self._draw()
+
+        def _set_hover(self, hovered: bool) -> None:
+            self._hovered = hovered
+            self._draw()
+
+        def _draw(self) -> None:
+            self.delete("all")
+            enabled = self._state != tk.DISABLED
+            fill = "#67E8F9" if enabled and self._hovered else (
+                "#2DD4BF" if enabled else "#273143")
+            radius = 13
+            self.create_rectangle(radius, 0, self._width - radius, self._height,
+                                  fill=fill, outline=fill)
+            self.create_rectangle(0, radius, self._width, self._height - radius,
+                                  fill=fill, outline=fill)
+            self.create_oval(0, 0, radius * 2, radius * 2, fill=fill, outline=fill)
+            self.create_oval(self._width - radius * 2, 0, self._width, radius * 2,
+                             fill=fill, outline=fill)
+            self.create_oval(0, self._height - radius * 2, radius * 2, self._height,
+                             fill=fill, outline=fill)
+            self.create_oval(self._width - radius * 2, self._height - radius * 2,
+                             self._width, self._height, fill=fill, outline=fill)
+            self.create_text(self._width / 2, self._height / 2,
+                             text=self._text,
+                             fill="#07161C" if enabled else "#5E6B7F",
+                             font=(preferred_family, 11, "bold"))
+
+        def _activate(self, _event: object = None) -> None:
+            if self._state != tk.DISABLED and callable(self._command):
+                self._command()
+
+        def configure(self, cnf: object = None, **kwargs: object) -> object:
+            if "text" in kwargs:
+                self._text = str(kwargs.pop("text"))
+            if "state" in kwargs:
+                self._state = str(kwargs.pop("state"))
+            self._draw()
+            return super().configure(cnf, **kwargs)
+
+        config = configure
+
     class BleUartApp:
         """Coordinates Tk widgets, serial I/O, parsing, and test transfers."""
 
@@ -62,9 +123,9 @@ def run_gui() -> None:
             """
             self.root = root
             self.root.title(f"BLE UART Client v{application_version()}")
-            self.root.geometry("960x780")
-            self.root.minsize(760, 600)
-            self.root.configure(background="#F5F7FA")
+            self.root.geometry("1120x960")
+            self.root.minsize(980, 820)
+            self.root.configure(background="#0A0F1C")
             self.serial_port: serial.Serial | None = None
             self.reader_thread: threading.Thread | None = None
             self.stop_reader = threading.Event()
@@ -72,6 +133,9 @@ def run_gui() -> None:
             self.port_scan_running = False
             self.parser = H4CrcStreamParser()
             self.test_identifier = 0
+            self.handshake_identifier = 0
+            self.handshake_pending = False
+            self.handshake_status_text = ""
             self.log_line_count = 0
 
             default_port = "COM3" if sys.platform == "win32" else (
@@ -88,6 +152,12 @@ def run_gui() -> None:
             self.bulk_size_var = tk.StringVar(value="2 MiB")
             self.byte_irq_var = tk.BooleanVar(value=False)
             self.irq_count_var = tk.StringVar(value="IRQ calls: 0")
+            self.tx_packets = 0
+            self.rx_packets = 0
+            self.tx_packets_var = tk.StringVar(value="0")
+            self.rx_packets_var = tk.StringVar(value="0")
+            self.irq_metric_var = tk.StringVar(value="0")
+            self.transport_var = tk.StringVar(value="OFFLINE")
             self.irq_absolute_count = 0
             self.receive_byte_irq_active = False
             self.test_irq_active = False
@@ -102,118 +172,183 @@ def run_gui() -> None:
             self.root.protocol("WM_DELETE_WINDOW", self.close)
 
         def _configure_styles(self) -> None:
-            """Configure a cross-platform palette matching the native C client."""
+            """Configure the shared dark instrument-panel visual system."""
             style = ttk.Style(self.root)
             if "clam" in style.theme_names():
                 style.theme_use("clam")
-            style.configure("App.TFrame", background="#F5F7FA")
-            style.configure("App.TLabel", background="#F5F7FA", foreground="#5A6478")
-            style.configure("App.TLabelframe", background="#F5F7FA", bordercolor="#A0A8B5")
-            style.configure("App.TLabelframe.Label", background="#F5F7FA",
-                            foreground="#192337")
-            style.configure("Status.TLabel", background="#FFFFFF", foreground="#192337",
-                            relief=tk.SUNKEN, padding=(8, 5))
-            style.configure("Transfer.Horizontal.TProgressbar", troughcolor="#DCE1E8",
-                            background="#4691EB", bordercolor="#969EAC")
+            body = ("Segoe UI" if sys.platform == "win32" else
+                    "Avenir Next" if sys.platform == "darwin" else "DejaVu Sans")
+            style.configure("App.TFrame", background="#0A0F1C")
+            style.configure("Panel.TFrame", background="#141C2E", borderwidth=1,
+                            relief=tk.SOLID)
+            style.configure("Card.TFrame", background="#1B253B")
+            style.configure("App.TLabel", background="#141C2E", foreground="#E8EFF9",
+                            font=(body, 11))
+            style.configure("Muted.TLabel", background="#141C2E", foreground="#8F9EB5",
+                            font=(body, 10))
+            style.configure("Section.TLabel", background="#141C2E", foreground="#8F9EB5",
+                            font=(body, 11, "bold"))
+            style.configure("CardLabel.TLabel", background="#1B253B", foreground="#8F9EB5",
+                            font=(body, 9, "bold"))
+            style.configure("CardValue.TLabel", background="#1B253B", foreground="#E8EFF9",
+                            font=(body, 20, "bold"))
+            style.configure("Status.TLabel", background="#1B253B", foreground="#E8EFF9",
+                            borderwidth=1, relief=tk.SOLID, padding=(10, 8), font=(body, 10))
+            style.configure("TButton", background="#253451", foreground="#F4F8FF",
+                            bordercolor="#405574", padding=(12, 9), font=(body, 11, "bold"))
+            style.map("TButton", background=[("active", "#32486F"), ("pressed", "#3B5B8E")])
+            style.configure("Accent.TButton", background="#356FD6", foreground="#FFFFFF",
+                            bordercolor="#4C94FF")
+            style.map("Accent.TButton", background=[("active", "#4385ED"),
+                                                     ("pressed", "#2F62BE")])
+            style.configure("TEntry", fieldbackground="#1B253B", foreground="#E8EFF9",
+                            insertcolor="#E8EFF9", bordercolor="#405574", padding=8,
+                            font=(body, 11))
+            style.configure("TCombobox", fieldbackground="#1B253B", foreground="#E8EFF9",
+                            background="#253451", arrowcolor="#8F9EB5",
+                            bordercolor="#405574", padding=7, font=(body, 11))
+            style.map("TCombobox", fieldbackground=[("readonly", "#1B253B")],
+                      foreground=[("readonly", "#E8EFF9")])
+            self.root.option_add("*TCombobox*Listbox.background", "#0E1626")
+            self.root.option_add("*TCombobox*Listbox.foreground", "#F1F6FF")
+            self.root.option_add("*TCombobox*Listbox.selectBackground", "#67E8F9")
+            self.root.option_add("*TCombobox*Listbox.selectForeground", "#07161C")
+            style.configure("TCheckbutton", background="#141C2E", foreground="#E8EFF9",
+                            font=(body, 11, "bold"), indicatorcolor="#1B253B",
+                            indicatorrelief=tk.FLAT)
+            style.map("TCheckbutton", background=[("active", "#141C2E")],
+                      indicatorcolor=[("selected", "#2DD4BF")])
+            style.configure("Transfer.Horizontal.TProgressbar", troughcolor="#232D41",
+                            background="#4C94FF", bordercolor="#232D41", thickness=14)
 
         def _build_ui(self) -> None:
-            """Create the same connection, command, transfer, and log layout as the C UI."""
+            """Create the shared telemetry-first client dashboard layout."""
             self._configure_styles()
-            container = ttk.Frame(self.root, padding=(20, 16), style="App.TFrame")
+            container = ttk.Frame(self.root, padding=24, style="App.TFrame")
             container.pack(fill=tk.BOTH, expand=True)
 
             tk.Label(container,
                      text=f"BLE UART HCI Client  v{application_version()}",
-                     background="#F5F7FA", foreground="#192337",
-                     font=("Helvetica", 20, "bold")).pack(anchor=tk.W)
+                     background="#0A0F1C", foreground="#E8EFF9",
+                     font=(preferred_family, 25, "bold")).pack(anchor=tk.W)
             tk.Label(container,
-                     text="Portable Python UI • H4 framing • CRC16-CCITT • live receive parser",
-                     background="#F5F7FA", foreground="#5A6478",
-                     font=("Helvetica", 11)).pack(anchor=tk.W, pady=(2, 12))
+                     text="PORTABLE H4 CONSOLE  /  CRC16-CCITT  /  LIVE PACKET TELEMETRY",
+                     background="#0A0F1C", foreground="#8F9EB5",
+                     font=(preferred_family, 10, "bold")).pack(anchor=tk.W, pady=(3, 16))
 
-            connection = ttk.LabelFrame(container, text="Serial connection", padding=(14, 10),
-                                        style="App.TLabelframe")
-            connection.pack(fill=tk.X)
-            ttk.Label(connection, text="Port", style="App.TLabel").grid(row=0, column=0,
-                                                                          sticky=tk.W)
-            self.port_combo = ttk.Combobox(connection, textvariable=self.port_var, width=42)
+            metrics = ttk.Frame(container, style="App.TFrame")
+            metrics.pack(fill=tk.X, pady=(0, 16))
+            for column in range(4):
+                metrics.columnconfigure(column, weight=1, uniform="metric")
+
+            def metric_card(column: int, label: str, value: tk.StringVar,
+                            accent: str) -> None:
+                card = ttk.Frame(metrics, padding=(16, 12), style="Card.TFrame")
+                card.grid(row=0, column=column, sticky=tk.EW,
+                          padx=(0 if column == 0 else 6, 0 if column == 3 else 6))
+                tk.Frame(card, width=4, height=55, background=accent).pack(side=tk.LEFT,
+                                                                           padx=(0, 12))
+                content = ttk.Frame(card, style="Card.TFrame")
+                content.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+                ttk.Label(content, text=label, style="CardLabel.TLabel").pack(anchor=tk.W)
+                ttk.Label(content, textvariable=value, style="CardValue.TLabel").pack(anchor=tk.W,
+                                                                                       pady=(5, 0))
+
+            metric_card(0, "RX PACKETS", self.rx_packets_var, "#4C94FF")
+            metric_card(1, "TX PACKETS", self.tx_packets_var, "#2DD4BF")
+            metric_card(2, "RX IRQ CALLS", self.irq_metric_var, "#A78BFA")
+            metric_card(3, "TRANSPORT", self.transport_var, "#2DD4BF")
+
+            def panel(title: str) -> ttk.Frame:
+                outer = ttk.Frame(container, padding=(18, 13), style="Panel.TFrame")
+                outer.pack(fill=tk.X, pady=(0, 14))
+                ttk.Label(outer, text=title, style="Section.TLabel").pack(anchor=tk.W,
+                                                                          pady=(0, 10))
+                body = ttk.Frame(outer, style="Panel.TFrame")
+                body.pack(fill=tk.BOTH, expand=True)
+                return body
+
+            connection = panel("CONNECTION")
+            connection_grid = ttk.Frame(connection, style="Panel.TFrame")
+            connection_grid.pack(fill=tk.X)
+            ttk.Label(connection_grid, text="Port", style="App.TLabel").grid(
+                row=0, column=0, sticky=tk.W)
+            self.port_combo = ttk.Combobox(connection_grid, textvariable=self.port_var, width=42)
             self.port_combo.grid(row=0, column=1, padx=(8, 18), sticky=tk.EW)
             self.port_combo.bind("<Button-1>", lambda _event: self.refresh_ports())
-            ttk.Label(connection, text="Baud", style="App.TLabel").grid(row=0, column=2)
-            ttk.Combobox(connection, textvariable=self.baud_var, width=10,
+            ttk.Label(connection_grid, text="Baud", style="App.TLabel").grid(row=0, column=2)
+            ttk.Combobox(connection_grid, textvariable=self.baud_var, width=11,
                          values=("9600", "57600", "115200", "460800", "921600",
                                  "1000000", "2000000", "3000000", "4000000")).grid(
                                      row=0, column=3, padx=8)
-            self.connect_button = ttk.Button(connection, text="Connect", command=self.toggle_connection)
-            self.connect_button.grid(row=0, column=4, ipadx=34)
-            ttk.Label(connection,
-                      text="Native copy/paste shortcuts • hardware baud rates up to 4000000",
-                      style="App.TLabel").grid(row=1, column=0, columnspan=3,
-                                                sticky=tk.W, pady=(7, 4))
-            ttk.Label(connection, textvariable=self.irq_count_var,
-                      style="App.TLabel").grid(row=1, column=3, sticky=tk.E,
-                                                pady=(7, 4), padx=(0, 12))
+            self.connect_button = RoundedActionButton(
+                connection_grid, "Connect", self.toggle_connection, width=170, height=42)
+            self.connect_button.grid(row=0, column=4)
             self.rx_mode_toggle = ttk.Checkbutton(
-                connection, text="Per-byte IRQ", variable=self.byte_irq_var,
+                connection_grid, text="Per-byte IRQ", variable=self.byte_irq_var,
                 command=self.send_rx_mode_request, state=tk.DISABLED)
-            self.rx_mode_toggle.grid(row=1, column=4, sticky=tk.E, pady=(7, 4))
-            ttk.Label(connection, textvariable=self.status_var, style="Status.TLabel").grid(
-                row=2, column=0, columnspan=5, sticky=tk.EW)
-            connection.columnconfigure(1, weight=1)
+            self.rx_mode_toggle.grid(row=0, column=5, sticky=tk.E, padx=(20, 0))
+            ttk.Label(connection_grid, textvariable=self.status_var, style="Status.TLabel").grid(
+                row=1, column=0, columnspan=6, sticky=tk.EW, pady=(10, 0))
+            connection_grid.columnconfigure(1, weight=1)
 
-            command = ttk.LabelFrame(container, text="HCI command", padding=(14, 10),
-                                     style="App.TLabelframe")
-            command.pack(fill=tk.X, pady=(12, 0))
+            command = panel("HCI COMMAND BUILDER")
             ttk.Label(command, text="Preset", style="App.TLabel").grid(row=0, column=0,
                                                                          sticky=tk.W)
             preset = ttk.Combobox(command, textvariable=self.preset_var,
-                                  values=tuple(COMMAND_PRESETS), state="readonly", width=28)
-            preset.grid(row=0, column=1, padx=(8, 24), sticky=tk.EW)
+                                  values=tuple(COMMAND_PRESETS), state="readonly", width=32)
+            preset.grid(row=0, column=1, padx=(8, 24), sticky=tk.EW, ipady=2)
             preset.bind("<<ComboboxSelected>>", lambda _event: self.select_preset())
             ttk.Label(command, text="Opcode", style="App.TLabel").grid(row=0, column=2)
-            ttk.Entry(command, textvariable=self.opcode_var, width=10).grid(row=0, column=3, padx=8)
-            ttk.Label(command, text="Parameters (hex)", style="App.TLabel").grid(
-                row=1, column=0, sticky=tk.W, pady=(10, 0))
+            ttk.Entry(command, textvariable=self.opcode_var, width=12).grid(row=0, column=3, padx=8)
+            ttk.Label(command, text="Parameters", style="App.TLabel").grid(
+                row=1, column=0, sticky=tk.W, pady=(12, 0))
             ttk.Entry(command, textvariable=self.parameters_var).grid(row=1, column=1, columnspan=3,
-                                                                       padx=8, pady=(10, 0), sticky=tk.EW)
-            ttk.Button(command, text="Send command", command=self.send_command).grid(
-                row=1, column=4, padx=(12, 0), pady=(10, 0), ipadx=14)
-            ttk.Label(command, text="Raw H4 (hex)", style="App.TLabel").grid(
-                row=2, column=0, sticky=tk.W, pady=(10, 0))
+                                                                       padx=8, pady=(12, 0), sticky=tk.EW)
+            self.send_command_button = RoundedActionButton(
+                command, "Send command", self.send_command, width=210, height=42)
+            self.send_command_button.configure(state=tk.DISABLED)
+            self.send_command_button.grid(row=1, column=4, padx=(12, 0), pady=(12, 0))
+            ttk.Label(command, text="Raw H4 bytes", style="App.TLabel").grid(
+                row=2, column=0, sticky=tk.W, pady=(12, 0))
             ttk.Entry(command, textvariable=self.raw_var).grid(
-                row=2, column=1, columnspan=3, padx=8, pady=(10, 0), sticky=tk.EW)
-            ttk.Button(command, text="Append CRC + send", command=self.send_raw).grid(
-                row=2, column=4, padx=(12, 0), pady=(10, 0), ipadx=5)
+                row=2, column=1, columnspan=3, padx=8, pady=(12, 0), sticky=tk.EW)
+            self.send_raw_button = RoundedActionButton(
+                command, "Append CRC + send", self.send_raw, width=210, height=42)
+            self.send_raw_button.configure(state=tk.DISABLED)
+            self.send_raw_button.grid(row=2, column=4, padx=(12, 0), pady=(12, 0))
             command.columnconfigure(1, weight=1)
 
-            bulk = ttk.LabelFrame(container, text="Bulk test messages", padding=(14, 10),
-                                  style="App.TLabelframe")
-            bulk.pack(fill=tk.X, pady=(12, 0))
-            ttk.Button(bulk, text="Send 128-byte message",
-                       command=lambda: self.start_test_transfer(128)).grid(row=0, column=0,
-                                                                           ipadx=8)
-            ttk.Label(bulk, text="Large block", style="App.TLabel").grid(
-                row=0, column=1, padx=(12, 6))
+            bulk = panel("TEST TRANSMISSIONS")
+            self.send_small_button = RoundedActionButton(
+                bulk, "Send 128-byte packet", lambda: self.start_test_transfer(128),
+                width=210, height=42)
+            self.send_small_button.configure(state=tk.DISABLED)
+            self.send_small_button.grid(row=0, column=0)
+            ttk.Label(bulk, text="Block size", style="App.TLabel").grid(
+                row=0, column=1, padx=(20, 8))
             ttk.Combobox(bulk, textvariable=self.bulk_size_var,
                          values=tuple(label for label, _size in TEST_TRANSFER_SIZES),
-                         state="readonly", width=9).grid(row=0, column=2)
-            ttk.Button(bulk, text="Send selected block",
-                       command=self.send_selected_test_transfer).grid(
-                           row=0, column=3, padx=(12, 18), ipadx=5)
+                         state="readonly", width=9,
+                         height=len(TEST_TRANSFER_SIZES)).grid(row=0, column=2)
+            self.send_large_button = RoundedActionButton(
+                bulk, "Send selected block", self.send_selected_test_transfer,
+                width=210, height=42)
+            self.send_large_button.configure(state=tk.DISABLED)
+            self.send_large_button.grid(row=0, column=3, padx=(16, 24))
             ttk.Progressbar(bulk, variable=self.transfer_progress, maximum=1.0,
                             style="Transfer.Horizontal.TProgressbar").grid(
                                 row=0, column=4, sticky=tk.EW)
             ttk.Label(bulk, textvariable=self.transfer_status_var, style="App.TLabel").grid(
-                row=1, column=4, sticky=tk.W, pady=(5, 0))
+                row=1, column=4, sticky=tk.W, pady=(6, 0))
             bulk.columnconfigure(4, weight=1)
 
-            traffic = ttk.LabelFrame(container, text="UART traffic", padding=(12, 10),
-                                     style="App.TLabelframe")
-            traffic.pack(fill=tk.BOTH, expand=True, pady=(12, 0))
-            self.log = tk.Text(traffic, height=13, state=tk.DISABLED, wrap=tk.NONE,
-                               background="#141923", foreground="#BEC6D2",
+            traffic = panel("LIVE UART TRAFFIC")
+            traffic.master.pack_configure(fill=tk.BOTH, expand=True)
+            self.log = tk.Text(traffic, height=9, state=tk.DISABLED, wrap=tk.NONE,
+                               background="#070B14", foreground="#BEC6D2",
                                insertbackground="#BEC6D2", relief=tk.FLAT,
-                               font=("TkFixedFont", 10), padx=10, pady=8)
+                               highlightthickness=0, font=("Menlo", 10), padx=12, pady=10)
             self.log.pack(fill=tk.BOTH, expand=True)
             self.log.tag_configure("TX", foreground="#64BEFF")
             self.log.tag_configure("RX", foreground="#69E196")
@@ -297,27 +432,71 @@ def run_gui() -> None:
                     self.log_notice(f"ERROR  {error}", "ERROR")
                     return
             self.stop_reader.clear()
+            self.parser = H4CrcStreamParser()
             self.reader_thread = threading.Thread(target=self.read_serial, daemon=True)
             self.reader_thread.start()
             self.connect_button.configure(text="Disconnect")
-            self.rx_mode_toggle.configure(state=tk.NORMAL)
+            self.rx_mode_toggle.configure(state=tk.DISABLED)
+            self.send_command_button.configure(state=tk.DISABLED)
+            self.send_raw_button.configure(state=tk.DISABLED)
+            self.send_small_button.configure(state=tk.DISABLED)
+            self.send_large_button.configure(state=tk.DISABLED)
             suffix = f" (simulating {requested_baud:,} baud on PTY)" if simulated_baud else ""
-            self.status_var.set(f"Connected to {self.serial_port.port}{suffix}")
-            self.log_notice(f"Connected to {self.serial_port.port} at {requested_baud} baud")
-            self.write_frame(build_rx_mode_command(RX_MODE_QUERY), "RX mode query")
+            self.handshake_status_text = f"Connected to {self.serial_port.port}{suffix}"
+            self.status_var.set(f"Verifying BLE UART server on {self.serial_port.port}...")
+            self.transport_var.set("VERIFYING")
+            self.log_notice(
+                f"Opened {self.serial_port.port} at {requested_baud} baud; verifying server")
+            self.handshake_identifier = (self.handshake_identifier + 1) & 0xFFFF or 1
+            identifier = self.handshake_identifier
+            self.handshake_pending = True
+            probe = next(build_test_transfer_frames(128, identifier))
+            self.write_frame(probe, f"128-byte server verification probe (id={identifier})")
+            self.root.after(2500, lambda expected=identifier: self._handshake_timeout(expected))
 
-        def disconnect(self) -> None:
-            """Stop the reader, close the serial device, and reset connection UI."""
+        def disconnect(self, error_message: str | None = None) -> None:
+            """Close the serial device and optionally preserve a visible error."""
             self.stop_reader.set()
+            self.handshake_pending = False
             port = self.serial_port
             self.serial_port = None
             if port is not None:
                 port_name = port.port
                 port.close()
-                self.log_notice(f"Disconnected from {port_name}")
+                if error_message is None:
+                    self.log_notice(f"Disconnected from {port_name}")
             self.connect_button.configure(text="Connect")
             self.rx_mode_toggle.configure(state=tk.DISABLED)
-            self.status_var.set("Disconnected")
+            self.send_command_button.configure(state=tk.DISABLED)
+            self.send_raw_button.configure(state=tk.DISABLED)
+            self.send_small_button.configure(state=tk.DISABLED)
+            self.send_large_button.configure(state=tk.DISABLED)
+            if error_message is None:
+                self.status_var.set("Disconnected")
+            else:
+                self.status_var.set(error_message)
+                self.log_notice(f"ERROR  {error_message}", "ERROR")
+            self.transport_var.set("OFFLINE")
+
+        def _handshake_timeout(self, expected_identifier: int) -> None:
+            """Reject an open port that did not acknowledge the current probe."""
+            if (self.serial_port is not None and self.handshake_pending
+                    and self.handshake_identifier == expected_identifier):
+                self.disconnect(
+                    "Wrong UART: selected port is not a BLE UART server (no acknowledgement)")
+
+        def _complete_handshake(self) -> None:
+            """Enable client controls after a matching server acknowledgement."""
+            self.handshake_pending = False
+            self.status_var.set(self.handshake_status_text)
+            self.transport_var.set("DMA + IDLE")
+            self.rx_mode_toggle.configure(state=tk.NORMAL)
+            self.send_command_button.configure(state=tk.NORMAL)
+            self.send_raw_button.configure(state=tk.NORMAL)
+            self.send_small_button.configure(state=tk.NORMAL)
+            self.send_large_button.configure(state=tk.NORMAL)
+            self.log_notice("VERIFY  BLE UART server acknowledged the 128-byte probe")
+            self.write_frame(build_rx_mode_command(RX_MODE_QUERY), "RX mode query")
 
         def read_serial(self) -> None:
             """Background worker that forwards serial reads to the Tk-safe queue."""
@@ -333,7 +512,8 @@ def run_gui() -> None:
                     if data:
                         self.rx_queue.put(("data", data))
                 except serial.SerialException as error:
-                    self.rx_queue.put(("error", error))
+                    if not self.stop_reader.is_set():
+                        self.rx_queue.put(("error", error))
                     return
 
         def drain_reader_queue(self) -> None:
@@ -342,8 +522,12 @@ def run_gui() -> None:
                 while True:
                     kind, value = self.rx_queue.get_nowait()
                     if kind == "error":
-                        self.log_notice(f"ERROR  {value}", "ERROR")
-                        self.disconnect()
+                        if self.handshake_pending:
+                            self.disconnect(
+                                f"Wrong UART: BLE UART verification failed ({value})")
+                        else:
+                            self.log_notice(f"ERROR  {value}", "ERROR")
+                            self.disconnect()
                     elif kind == "ports":
                         self.port_scan_running = False
                         ports = value if isinstance(value, list) else []
@@ -361,11 +545,25 @@ def run_gui() -> None:
                             self.irq_absolute_count += len(incoming)
                         completed = self.parser.feed(incoming)
                         self.irq_count_var.set(f"IRQ calls: {self.irq_absolute_count}")
+                        self.irq_metric_var.set(str(self.irq_absolute_count))
                         for frame in completed:
+                            self.rx_packets += 1
+                            completion = frame.test_completion if frame.crc_valid else None
+                            if self.handshake_pending and completion is not None:
+                                identifier, status, total_size = completion
+                                if identifier == self.handshake_identifier:
+                                    if status == 0 and total_size == 128:
+                                        self._complete_handshake()
+                                    else:
+                                        self.disconnect(
+                                            "Wrong UART: BLE UART acknowledgement did not match the probe")
+                                        break
                             if frame.crc_valid and frame.rx_mode is not None:
                                 self.receive_byte_irq_active = (
                                     frame.rx_mode == RX_MODE_BYTE_IRQ)
                                 self.byte_irq_var.set(self.receive_byte_irq_active)
+                                self.transport_var.set(
+                                    "BYTE IRQ" if self.receive_byte_irq_active else "DMA + IDLE")
                             crc_status = "CRC OK" if frame.crc_valid else (
                                 f"CRC BAD (got {frame.received_crc:04X}, expected {frame.computed_crc:04X})"
                             )
@@ -408,6 +606,10 @@ def run_gui() -> None:
                                     "RX", frame.h4_packet
                                     + frame.received_crc.to_bytes(2, "big"),
                                     f"[{crc_status}, {frame.summary}{irq_detail}]")
+                        self.rx_packets_var.set(str(self.rx_packets))
+                    elif kind == "tx_packets":
+                        self.tx_packets += int(value)
+                        self.tx_packets_var.set(str(self.tx_packets))
                     elif kind == "tx_progress":
                         sent, total = value if isinstance(value, tuple) else (0, 0)
                         self.transfer_progress.set(sent / total if total else 0.0)
@@ -418,6 +620,9 @@ def run_gui() -> None:
                         self.transfer_progress.set(1.0)
                         self.transfer_status_var.set(f"{total} / {total} bytes")
                         self.log_notice(f"TEST  All {total} bytes sent; waiting for server verification")
+                        if self.serial_port is not None:
+                            self.send_small_button.configure(state=tk.NORMAL)
+                            self.send_large_button.configure(state=tk.NORMAL)
             except queue.Empty:
                 pass
             self.root.after(40, self.drain_reader_queue)
@@ -434,10 +639,16 @@ def run_gui() -> None:
             try:
                 self.serial_port.write(frame)
                 self.serial_port.flush()
+                self.tx_packets += 1
+                self.tx_packets_var.set(str(self.tx_packets))
                 self.log_line("TX", frame[:-2], f"[CRC {frame[-2:].hex().upper()}] {detail}")
             except serial.SerialException as error:
                 self.log_notice(f"ERROR  Serial write failed: {error}", "ERROR")
-                self.disconnect()
+                if self.handshake_pending:
+                    self.disconnect(
+                        "Wrong UART: BLE UART verification probe could not be sent")
+                else:
+                    self.disconnect()
 
         def select_preset(self) -> None:
             """Copy the selected command preset into editable opcode and parameter fields."""
@@ -480,6 +691,8 @@ def run_gui() -> None:
             identifier = self.test_identifier
             self.transfer_progress.set(0.0)
             self.transfer_status_var.set(f"0 / {total_size} bytes")
+            self.send_small_button.configure(state=tk.DISABLED)
+            self.send_large_button.configure(state=tk.DISABLED)
             self.log_notice(f"TEST  Sending {total_size} bytes (id={identifier})")
 
             def send_worker() -> None:
@@ -487,17 +700,21 @@ def run_gui() -> None:
                 sent = 0
                 next_progress = 256 * 1024
                 batch = bytearray()
+                batch_packets = 0
                 try:
                     for frame in build_test_transfer_frames(total_size, identifier):
                         port = self.serial_port
                         if port is None:
                             return
                         batch.extend(frame)
+                        batch_packets += 1
                         chunk_size = int.from_bytes(frame[21:23], "little")
                         sent += chunk_size
                         if len(batch) >= 64 * 1024 or sent == total_size:
                             port.write(batch)
                             batch.clear()
+                            self.rx_queue.put(("tx_packets", batch_packets))
+                            batch_packets = 0
                         if sent >= next_progress:
                             self.rx_queue.put(("tx_progress", (sent, total_size)))
                             next_progress += 256 * 1024

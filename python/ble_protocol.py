@@ -173,11 +173,10 @@ class ParsedFrame:
         if self.packet_type == H4_EVENT and len(self.h4_packet) >= 3:
             if self.rx_mode is not None:
                 return "RX mode: per-byte IRQ" if self.rx_mode else "RX mode: DMA + IDLE"
-            if (self.h4_packet[1] == 0xFF and len(self.h4_packet) >= 14
-                    and self.h4_packet[3:7] == b"TEST"):
-                identifier = int.from_bytes(self.h4_packet[7:9], "little")
-                status = "passed" if self.h4_packet[9] == 0 else "failed"
-                size = int.from_bytes(self.h4_packet[10:14], "little")
+            completion = self.test_completion
+            if completion is not None:
+                identifier, status_code, size = completion
+                status = "passed" if status_code == 0 else "failed"
                 return f"Test transfer {identifier} {status}, {size} bytes"
             return f"Event 0x{self.h4_packet[1]:02X}, {self.h4_packet[2]} parameter byte(s)"
         if self.packet_type == H4_COMMAND and len(self.h4_packet) >= 4:
@@ -196,6 +195,19 @@ class ParsedFrame:
                 and self.h4_packet[3:7] == b"RXMD"
                 and self.h4_packet[7] in (RX_MODE_DMA, RX_MODE_BYTE_IRQ)):
             return self.h4_packet[7]
+        return None
+
+    @property
+    def test_completion(self) -> tuple[int, int, int] | None:
+        """Decode a `TEST` completion identifier, status, and total size."""
+        if (self.packet_type == H4_EVENT and len(self.h4_packet) >= 14
+                and self.h4_packet[1] == 0xFF and self.h4_packet[2] == 11
+                and self.h4_packet[3:7] == b"TEST"):
+            return (
+                int.from_bytes(self.h4_packet[7:9], "little"),
+                self.h4_packet[9],
+                int.from_bytes(self.h4_packet[10:14], "little"),
+            )
         return None
 
     @property

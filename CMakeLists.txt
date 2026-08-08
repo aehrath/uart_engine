@@ -163,14 +163,28 @@ if(UART_DMA_BUILD_PORTABLE_UI)
         GIT_SHALLOW TRUE
     )
     FetchContent_MakeAvailable(raylib raygui)
+    FetchContent_Declare(space_grotesk
+        URL https://github.com/floriankarsten/space-grotesk/releases/download/2.0.0/SpaceGrotesk-2.0.0.zip
+        URL_HASH SHA256=53b415577d4139248555300710bea0d268c7a5be67b93de53b716a9736cabffd
+        DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+    )
+    FetchContent_GetProperties(space_grotesk)
+    if(NOT space_grotesk_POPULATED)
+        FetchContent_Populate(space_grotesk)
+    endif()
     set(UART_DMA_UI_FONT_SOURCE
-        "${raylib_SOURCE_DIR}/examples/text/resources/NotoSansTC-Regular.ttf")
+        "${space_grotesk_SOURCE_DIR}/ttf/static/SpaceGrotesk-Regular.ttf")
+    set(UART_DMA_UI_DISPLAY_FONT_SOURCE
+        "${space_grotesk_SOURCE_DIR}/ttf/static/SpaceGrotesk-Bold.ttf")
 
-    add_executable(ble_uart_client_ui apps/ble_uart_client_ui.c)
+    add_executable(ble_uart_client_ui
+        apps/ble_uart_client_ui.c
+        apps/common/dashboard_dropdown.c)
     target_include_directories(ble_uart_client_ui PRIVATE "${raygui_SOURCE_DIR}/src")
     target_link_libraries(ble_uart_client_ui PRIVATE raylib ble_uart_app_common)
     target_compile_definitions(ble_uart_client_ui PRIVATE
-        UART_DMA_UI_FONT_FILE="NotoSansTC-Regular.ttf")
+        UART_DMA_UI_FONT_FILE="SpaceGrotesk-Regular.ttf"
+        UART_DMA_UI_DISPLAY_FONT_FILE="SpaceGrotesk-Bold.ttf")
     target_compile_features(ble_uart_client_ui PRIVATE c_std_11)
 
     if(MSVC)
@@ -195,17 +209,23 @@ if(UART_DMA_BUILD_PORTABLE_UI)
     add_custom_command(TARGET ble_uart_client_ui POST_BUILD
         COMMAND "${CMAKE_COMMAND}" -E copy_if_different
                 "${UART_DMA_UI_FONT_SOURCE}"
-                "$<TARGET_FILE_DIR:ble_uart_client_ui>/NotoSansTC-Regular.ttf"
+                "$<TARGET_FILE_DIR:ble_uart_client_ui>/SpaceGrotesk-Regular.ttf"
+        COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                "${UART_DMA_UI_DISPLAY_FONT_SOURCE}"
+                "$<TARGET_FILE_DIR:ble_uart_client_ui>/SpaceGrotesk-Bold.ttf"
         COMMENT "Bundling the shared readable UI font"
     )
 
     if(UNIX AND TARGET ble_uart_server)
-        add_executable(ble_uart_server_ui apps/ble_uart_server_ui.c)
+        add_executable(ble_uart_server_ui
+            apps/ble_uart_server_ui.c
+            apps/common/dashboard_dropdown.c)
         add_dependencies(ble_uart_server_ui ble_uart_server)
         target_include_directories(ble_uart_server_ui PRIVATE "${raygui_SOURCE_DIR}/src")
         target_link_libraries(ble_uart_server_ui PRIVATE raylib ble_uart_app_common)
         target_compile_definitions(ble_uart_server_ui PRIVATE
-            UART_DMA_UI_FONT_FILE="NotoSansTC-Regular.ttf")
+            UART_DMA_UI_FONT_FILE="SpaceGrotesk-Regular.ttf"
+            UART_DMA_UI_DISPLAY_FONT_FILE="SpaceGrotesk-Bold.ttf")
         target_compile_features(ble_uart_server_ui PRIVATE c_std_11)
         target_compile_definitions(ble_uart_server_ui PRIVATE _DEFAULT_SOURCE)
         target_compile_options(ble_uart_server_ui PRIVATE -Wall -Wextra)
@@ -229,7 +249,10 @@ if(UART_DMA_BUILD_PORTABLE_UI)
         add_custom_command(TARGET ble_uart_server_ui POST_BUILD
             COMMAND "${CMAKE_COMMAND}" -E copy_if_different
                     "${UART_DMA_UI_FONT_SOURCE}"
-                    "$<TARGET_FILE_DIR:ble_uart_server_ui>/NotoSansTC-Regular.ttf"
+                    "$<TARGET_FILE_DIR:ble_uart_server_ui>/SpaceGrotesk-Regular.ttf"
+            COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                    "${UART_DMA_UI_DISPLAY_FONT_SOURCE}"
+                    "$<TARGET_FILE_DIR:ble_uart_server_ui>/SpaceGrotesk-Bold.ttf"
             COMMENT "Bundling the shared readable UI font"
         )
     endif()

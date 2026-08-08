@@ -61,6 +61,16 @@ size_t AppH4RxModeCommand_Init(BleHciCommandPacket_t *packet, uint8_t mode);
  * @return `true` only for an `RXMD` state event. */
 bool AppH4RxModeEvent_Decode(const uint8_t *frame, size_t frame_length,
                              bool *byte_irq);
+/** Decode a deterministic test-transfer completion event.
+ * @param frame Complete H4 frame, optionally followed by its CRC trailer.
+ * @param frame_length Available bytes in @p frame.
+ * @param identifier Receives the acknowledged transfer identifier.
+ * @param status Receives zero for success or the server's failure status.
+ * @param total_size Receives the verified logical transfer size.
+ * @return `true` only for a structurally valid `TEST` completion event. */
+bool AppH4TestCompleteEvent_Decode(const uint8_t *frame, size_t frame_length,
+                                   uint16_t *identifier, uint8_t *status,
+                                   uint32_t *total_size);
 /** Reset an incremental host stream parser. */
 void AppH4StreamParser_Init(AppH4StreamParser_t *parser);
 /** Consume serial bytes and dispatch every completed frame.

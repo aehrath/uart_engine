@@ -22,6 +22,13 @@ Type the printed path into the editable **Port** field, click **Connect**, then
 send any command preset. The C server runs until Ctrl-C and responds with an HCI
 Command Complete event for every valid command.
 
+The portable C and Python graphical clients verify every newly opened port
+before enabling their sending controls. Each client sends a deterministic
+128-byte `TEST` probe and requires the server's CRC-valid completion event with
+the same identifier and size. A missing or failed acknowledgement closes the
+port after 2.5 seconds and reports that the selected UART is not a BLE UART
+server.
+
 The pseudo-UART makes local development possible without two physical serial
 adapters. On target hardware, replace the platform register and TX DMA hooks with
 the MCU UART/DMA implementation.
@@ -92,7 +99,9 @@ the fast client sender by coalescing them into 64 KiB serial batches, avoiding
 thousands of host scheduler wakeups and writes.
 
 Both native dashboards display the repository release version and use the same
-bundled antialiased Noto Sans font for legible, consistent controls and logs.
+bundled Space Grotesk family for legible, consistent controls and logs. Their
+shared telemetry row reports TX, RX, receive IRQ, and transport state above
+rounded high-contrast action controls.
 
 Each graphical app owns its IRQ dashboard counter. The value is cumulative for
 that app process. Each ordinary packet resets a separate transmission counter;
