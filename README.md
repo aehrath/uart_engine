@@ -23,6 +23,13 @@ convenience umbrella. Individual components can instead include only
 `uart_crc16.h`, `uart_dma_ring_buffer.h`, `ble_hci_parser.h`, `ble_hci_wire.h`,
 `uart_dma_messages.h`, or `uart_dma_platform.h`.
 
+## Architecture
+
+See the [runtime dataflow graph](docs/architecture.md#runtime-dataflow) and
+[repository component graph](docs/architecture.md#repository-component-graph)
+for the complete relationship between the clients, pseudo-UART server,
+FreeRTOS/DMA pipeline, libraries, demos, tests, and documentation targets.
+
 ## Build and test
 
 ```sh
