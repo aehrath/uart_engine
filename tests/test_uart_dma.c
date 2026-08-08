@@ -192,6 +192,15 @@ static void testUartApiAndInterrupts(void) {
     assert(UartDma_GetRxMode() == UART_DMA_RX_MODE_DMA_IDLE);
     assert((rxDmaRegisters.CR & 1UL) != 0U);
     assert((uartRegisters.CR1 & (1UL << 5)) == 0U);
+    DMA_RX_Complete_IRQHandler();
+    DMA_RX_Complete_IRQHandler();
+    assert(UartDma_GetRxInterruptCount() == sizeof(interruptBytes) + 2U);
+
+    assert(!UartDma_SetRxBufferSize(128U));
+    assert(UartDma_SetRxBufferSize(4096U));
+    assert(UartDma_GetRxBufferSize() == 4096U);
+    assert(rxDmaRegisters.NDTR == 4096U);
+    assert(UartDma_SetRxBufferSize(UART_DMA_RX_BUFFER_SIZE));
 
     assert(UartDma_SendPacket(NULL, 0U) == pdFALSE);
     message.length = UART_DMA_MAX_PACKET_SIZE - 1U;

@@ -9,7 +9,7 @@
 
 #include "raylib.h"
 
-/** Draw a dropdown whose expanded options open above the collapsed field.
+/** Draw a dropdown whose options open above, or below when top space is insufficient.
  *
  * This placement keeps selectors near the bottom of a fixed dashboard inside
  * the drawable window at every supported window size.

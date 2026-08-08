@@ -12,21 +12,27 @@ import queue
 import sys
 import threading
 from pathlib import Path
+from typing import Callable
 
 from ble_protocol import (
     COMMAND_PRESETS,
     H4CrcStreamParser,
-    RX_MODE_BYTE_IRQ,
-    RX_MODE_DMA,
-    RX_MODE_QUERY,
     TEST_TRANSFER_SIZES,
     add_crc,
     build_hci_command,
-    build_rx_mode_command,
     build_test_transfer_frames,
     parse_hex,
 )
 from serial_ports import available_ports
+
+RING_BUFFER_SIZES: tuple[tuple[str, int], ...] = (
+    ("256 B", 256), ("1 KiB", 1024), ("4 KiB", 4096),
+    ("16 KiB", 16 * 1024), ("64 KiB", 64 * 1024),
+)
+DMA_BUFFER_SIZES: tuple[tuple[str, int], ...] = (
+    ("32 B", 32), ("64 B", 64), ("128 B", 128), ("256 B", 256),
+    ("512 B", 512), ("1 KiB", 1024), ("4 KiB", 4096),
+)
 
 
 def application_version() -> str:
@@ -97,7 +103,7 @@ def run_gui() -> None:
             self.create_text(self._width / 2, self._height / 2,
                              text=self._text,
                              fill="#07161C" if enabled else "#5E6B7F",
-                             font=(preferred_family, 11, "bold"))
+                             font=(preferred_family, -16, "bold"))
 
         def _activate(self, _event: object = None) -> None:
             if self._state != tk.DISABLED and callable(self._command):
@@ -112,6 +118,49 @@ def run_gui() -> None:
             return super().configure(cnf, **kwargs)
 
         config = configure
+
+    class RoundedSurface(tk.Frame):
+        """Canvas-backed rounded container matching the native dashboard panels."""
+
+        def __init__(self, parent: tk.Misc, *, fill: str, border: str,
+                     style: str, radius: int,
+                     content_padding: tuple[int, int]) -> None:
+            super().__init__(parent, background="#0A0F1C", borderwidth=0,
+                             highlightthickness=0)
+            self._fill = fill
+            self._border = border
+            self._radius = radius
+            self._canvas = tk.Canvas(self, background="#0A0F1C",
+                                     borderwidth=0, highlightthickness=0)
+            self._canvas.place(x=0, y=0, relwidth=1, relheight=1)
+            self.content = ttk.Frame(self, padding=content_padding, style=style)
+            self.content.pack(fill=tk.BOTH, expand=True, padx=1,
+                              pady=max(1, radius // 2))
+            self.bind("<Configure>", self._redraw)
+
+        def _rounded_rectangle(self, inset: int, radius: int, color: str) -> None:
+            width = max(1, self.winfo_width() - 1 - inset * 2)
+            height = max(1, self.winfo_height() - 1 - inset * 2)
+            x0, y0 = inset, inset
+            x1, y1 = inset + width, inset + height
+            radius = max(1, min(radius, width // 2, height // 2))
+            self._canvas.create_rectangle(x0 + radius, y0, x1 - radius, y1,
+                                          fill=color, outline=color)
+            self._canvas.create_rectangle(x0, y0 + radius, x1, y1 - radius,
+                                          fill=color, outline=color)
+            self._canvas.create_oval(x0, y0, x0 + radius * 2, y0 + radius * 2,
+                                     fill=color, outline=color)
+            self._canvas.create_oval(x1 - radius * 2, y0, x1, y0 + radius * 2,
+                                     fill=color, outline=color)
+            self._canvas.create_oval(x0, y1 - radius * 2, x0 + radius * 2, y1,
+                                     fill=color, outline=color)
+            self._canvas.create_oval(x1 - radius * 2, y1 - radius * 2, x1, y1,
+                                     fill=color, outline=color)
+
+        def _redraw(self, _event: object = None) -> None:
+            self._canvas.delete("all")
+            self._rounded_rectangle(0, self._radius, self._border)
+            self._rounded_rectangle(1, max(1, self._radius - 1), self._fill)
 
     class BleUartApp:
         """Coordinates Tk widgets, serial I/O, parsing, and test transfers."""
@@ -130,12 +179,16 @@ def run_gui() -> None:
             self.reader_thread: threading.Thread | None = None
             self.stop_reader = threading.Event()
             self.rx_queue: queue.Queue[tuple[str, object]] = queue.Queue()
+            self.rx_queue_lock = threading.Lock()
+            self.rx_queued_bytes = 0
             self.port_scan_running = False
             self.parser = H4CrcStreamParser()
             self.test_identifier = 0
             self.handshake_identifier = 0
             self.handshake_pending = False
             self.handshake_status_text = ""
+            self.connection_attempt = 0
+            self.connecting = False
             self.log_line_count = 0
 
             default_port = "COM3" if sys.platform == "win32" else (
@@ -151,6 +204,10 @@ def run_gui() -> None:
             self.transfer_status_var = tk.StringVar(value="0 / 0 bytes")
             self.bulk_size_var = tk.StringVar(value="2 MiB")
             self.byte_irq_var = tk.BooleanVar(value=False)
+            self.ring_buffer_var = tk.StringVar(value="16 KiB")
+            self.dma_buffer_var = tk.StringVar(value="256 B")
+            self.ring_buffer_size = 16 * 1024
+            self.dma_buffer_size = 256
             self.irq_count_var = tk.StringVar(value="IRQ calls: 0")
             self.tx_packets = 0
             self.rx_packets = 0
@@ -176,50 +233,66 @@ def run_gui() -> None:
             style = ttk.Style(self.root)
             if "clam" in style.theme_names():
                 style.theme_use("clam")
-            body = ("Segoe UI" if sys.platform == "win32" else
-                    "Avenir Next" if sys.platform == "darwin" else "DejaVu Sans")
+            body = preferred_family
             style.configure("App.TFrame", background="#0A0F1C")
-            style.configure("Panel.TFrame", background="#141C2E", borderwidth=1,
-                            relief=tk.SOLID)
+            style.configure("Panel.TFrame", background="#141C2E", borderwidth=0,
+                            relief=tk.FLAT)
             style.configure("Card.TFrame", background="#1B253B")
             style.configure("App.TLabel", background="#141C2E", foreground="#E8EFF9",
-                            font=(body, 11))
+                            font=(body, -17))
             style.configure("Muted.TLabel", background="#141C2E", foreground="#8F9EB5",
-                            font=(body, 10))
+                            font=(body, -13))
             style.configure("Section.TLabel", background="#141C2E", foreground="#8F9EB5",
-                            font=(body, 11, "bold"))
+                            font=(body, -16, "bold"))
             style.configure("CardLabel.TLabel", background="#1B253B", foreground="#8F9EB5",
-                            font=(body, 9, "bold"))
+                            font=(body, -14, "bold"))
             style.configure("CardValue.TLabel", background="#1B253B", foreground="#E8EFF9",
-                            font=(body, 20, "bold"))
+                            font=(body, -25, "bold"))
             style.configure("Status.TLabel", background="#1B253B", foreground="#E8EFF9",
-                            borderwidth=1, relief=tk.SOLID, padding=(10, 8), font=(body, 10))
+                            borderwidth=0, relief=tk.FLAT, padding=(10, 8), font=(body, -16))
             style.configure("TButton", background="#253451", foreground="#F4F8FF",
-                            bordercolor="#405574", padding=(12, 9), font=(body, 11, "bold"))
+                            bordercolor="#405574", padding=(12, 9), font=(body, -16, "bold"))
             style.map("TButton", background=[("active", "#32486F"), ("pressed", "#3B5B8E")])
             style.configure("Accent.TButton", background="#356FD6", foreground="#FFFFFF",
                             bordercolor="#4C94FF")
             style.map("Accent.TButton", background=[("active", "#4385ED"),
                                                      ("pressed", "#2F62BE")])
             style.configure("TEntry", fieldbackground="#1B253B", foreground="#E8EFF9",
-                            insertcolor="#E8EFF9", bordercolor="#405574", padding=8,
-                            font=(body, 11))
+                            insertcolor="#E8EFF9", bordercolor="#405574",
+                            lightcolor="#405574", darkcolor="#405574",
+                            focuscolor="#2DD4BF", borderwidth=1, relief=tk.FLAT,
+                            padding=8, font=(body, -17))
+            style.map("TEntry",
+                      bordercolor=[("focus", "#2DD4BF"), ("active", "#405574")],
+                      lightcolor=[("focus", "#2DD4BF"), ("active", "#405574")],
+                      darkcolor=[("focus", "#2DD4BF"), ("active", "#405574")])
             style.configure("TCombobox", fieldbackground="#1B253B", foreground="#E8EFF9",
                             background="#253451", arrowcolor="#8F9EB5",
-                            bordercolor="#405574", padding=7, font=(body, 11))
+                            bordercolor="#405574", lightcolor="#405574",
+                            darkcolor="#405574", focuscolor="#2DD4BF",
+                            borderwidth=1, relief=tk.FLAT, padding=7, font=(body, -17))
             style.map("TCombobox", fieldbackground=[("readonly", "#1B253B")],
-                      foreground=[("readonly", "#E8EFF9")])
+                      foreground=[("readonly", "#E8EFF9")],
+                      bordercolor=[("focus", "#2DD4BF"), ("active", "#405574")],
+                      lightcolor=[("focus", "#2DD4BF"), ("active", "#405574")],
+                      darkcolor=[("focus", "#2DD4BF"), ("active", "#405574")])
             self.root.option_add("*TCombobox*Listbox.background", "#0E1626")
             self.root.option_add("*TCombobox*Listbox.foreground", "#F1F6FF")
             self.root.option_add("*TCombobox*Listbox.selectBackground", "#67E8F9")
             self.root.option_add("*TCombobox*Listbox.selectForeground", "#07161C")
             style.configure("TCheckbutton", background="#141C2E", foreground="#E8EFF9",
-                            font=(body, 11, "bold"), indicatorcolor="#1B253B",
+                            font=(body, -17, "bold"), indicatorcolor="#1B253B",
                             indicatorrelief=tk.FLAT)
             style.map("TCheckbutton", background=[("active", "#141C2E")],
                       indicatorcolor=[("selected", "#2DD4BF")])
             style.configure("Transfer.Horizontal.TProgressbar", troughcolor="#232D41",
-                            background="#4C94FF", bordercolor="#232D41", thickness=14)
+                            background="#4C94FF", bordercolor="#232D41",
+                            lightcolor="#232D41", darkcolor="#232D41",
+                            borderwidth=0, relief=tk.FLAT, thickness=14)
+            style.configure("Dark.Vertical.TScrollbar", background="#253451",
+                            troughcolor="#070B14", bordercolor="#070B14",
+                            lightcolor="#253451", darkcolor="#253451",
+                            arrowcolor="#8F9EB5", borderwidth=0, relief=tk.FLAT)
 
         def _build_ui(self) -> None:
             """Create the shared telemetry-first client dashboard layout."""
@@ -230,11 +303,11 @@ def run_gui() -> None:
             tk.Label(container,
                      text=f"BLE UART HCI Client  v{application_version()}",
                      background="#0A0F1C", foreground="#E8EFF9",
-                     font=(preferred_family, 25, "bold")).pack(anchor=tk.W)
+                     font=(preferred_family, -32, "bold")).pack(anchor=tk.W)
             tk.Label(container,
                      text="PORTABLE H4 CONSOLE  /  CRC16-CCITT  /  LIVE PACKET TELEMETRY",
                      background="#0A0F1C", foreground="#8F9EB5",
-                     font=(preferred_family, 10, "bold")).pack(anchor=tk.W, pady=(3, 16))
+                     font=(preferred_family, -14, "bold")).pack(anchor=tk.W, pady=(3, 16))
 
             metrics = ttk.Frame(container, style="App.TFrame")
             metrics.pack(fill=tk.X, pady=(0, 16))
@@ -242,26 +315,55 @@ def run_gui() -> None:
                 metrics.columnconfigure(column, weight=1, uniform="metric")
 
             def metric_card(column: int, label: str, value: tk.StringVar,
-                            accent: str) -> None:
-                card = ttk.Frame(metrics, padding=(16, 12), style="Card.TFrame")
-                card.grid(row=0, column=column, sticky=tk.EW,
-                          padx=(0 if column == 0 else 6, 0 if column == 3 else 6))
-                tk.Frame(card, width=4, height=55, background=accent).pack(side=tk.LEFT,
-                                                                           padx=(0, 12))
+                            accent: str, reset: Callable[[], None] | None) -> None:
+                surface = RoundedSurface(metrics, fill="#1B253B", border="#1B253B",
+                                         style="Card.TFrame", radius=13,
+                                         content_padding=(16, 5))
+                card = surface.content
+                surface.grid(row=0, column=column, sticky=tk.EW,
+                             padx=(0 if column == 0 else 6, 0 if column == 3 else 6))
+                stripe = tk.Frame(card, width=4, height=55, background=accent)
+                stripe.pack(side=tk.LEFT, padx=(0, 12))
                 content = ttk.Frame(card, style="Card.TFrame")
                 content.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-                ttk.Label(content, text=label, style="CardLabel.TLabel").pack(anchor=tk.W)
-                ttk.Label(content, textvariable=value, style="CardValue.TLabel").pack(anchor=tk.W,
-                                                                                       pady=(5, 0))
+                label_widget = ttk.Label(content, text=label, style="CardLabel.TLabel")
+                label_widget.pack(anchor=tk.W)
+                value_widget = ttk.Label(content, textvariable=value, style="CardValue.TLabel")
+                value_widget.pack(anchor=tk.W, pady=(5, 0))
+                if reset is not None:
+                    def reset_metric(_event: object = None) -> None:
+                        reset()
 
-            metric_card(0, "RX PACKETS", self.rx_packets_var, "#4C94FF")
-            metric_card(1, "TX PACKETS", self.tx_packets_var, "#2DD4BF")
-            metric_card(2, "RX IRQ CALLS", self.irq_metric_var, "#A78BFA")
-            metric_card(3, "TRANSPORT", self.transport_var, "#2DD4BF")
+                    for widget in (surface, surface._canvas, card, stripe, content,
+                                   label_widget, value_widget):
+                        widget.configure(cursor="pointinghand")
+                        widget.bind("<ButtonRelease-1>", reset_metric)
 
-            def panel(title: str) -> ttk.Frame:
-                outer = ttk.Frame(container, padding=(18, 13), style="Panel.TFrame")
-                outer.pack(fill=tk.X, pady=(0, 14))
+            def reset_rx_packets() -> None:
+                self.rx_packets = 0
+                self.rx_packets_var.set("0")
+
+            def reset_tx_packets() -> None:
+                self.tx_packets = 0
+                self.tx_packets_var.set("0")
+
+            def reset_rx_irq_calls() -> None:
+                self.irq_absolute_count = 0
+                self.irq_metric_var.set("0")
+
+            metric_card(0, "RX PACKETS", self.rx_packets_var, "#4C94FF", reset_rx_packets)
+            metric_card(1, "TX PACKETS", self.tx_packets_var, "#2DD4BF", reset_tx_packets)
+            metric_card(2, "RX IRQ CALLS", self.irq_metric_var, "#A78BFA",
+                        reset_rx_irq_calls)
+            metric_card(3, "TRANSPORT", self.transport_var, "#2DD4BF", None)
+
+            def panel(title: str, expand: bool = False) -> ttk.Frame:
+                surface = RoundedSurface(container, fill="#141C2E", border="#31415C",
+                                         style="Panel.TFrame", radius=13,
+                                         content_padding=(18, 6))
+                surface.pack(fill=tk.BOTH if expand else tk.X,
+                             expand=expand, pady=(0, 14))
+                outer = surface.content
                 ttk.Label(outer, text=title, style="Section.TLabel").pack(anchor=tk.W,
                                                                           pady=(0, 10))
                 body = ttk.Frame(outer, style="Panel.TFrame")
@@ -289,7 +391,23 @@ def run_gui() -> None:
                 command=self.send_rx_mode_request, state=tk.DISABLED)
             self.rx_mode_toggle.grid(row=0, column=5, sticky=tk.E, padx=(20, 0))
             ttk.Label(connection_grid, textvariable=self.status_var, style="Status.TLabel").grid(
-                row=1, column=0, columnspan=6, sticky=tk.EW, pady=(10, 0))
+                row=1, column=0, columnspan=2, sticky=tk.EW, pady=(10, 0))
+            ttk.Label(connection_grid, text="Ring", style="Muted.TLabel").grid(
+                row=1, column=2, sticky=tk.E, pady=(10, 0), padx=(10, 4))
+            ring_combo = ttk.Combobox(
+                connection_grid, textvariable=self.ring_buffer_var,
+                values=tuple(label for label, _size in RING_BUFFER_SIZES),
+                state="readonly", width=8)
+            ring_combo.grid(row=1, column=3, pady=(10, 0), sticky=tk.W)
+            ring_combo.bind("<<ComboboxSelected>>", self._configure_receive_buffers)
+            ttk.Label(connection_grid, text="DMA", style="Muted.TLabel").grid(
+                row=1, column=4, sticky=tk.E, pady=(10, 0), padx=(8, 4))
+            dma_combo = ttk.Combobox(
+                connection_grid, textvariable=self.dma_buffer_var,
+                values=tuple(label for label, _size in DMA_BUFFER_SIZES),
+                state="readonly", width=8)
+            dma_combo.grid(row=1, column=5, pady=(10, 0), sticky=tk.W)
+            dma_combo.bind("<<ComboboxSelected>>", self._configure_receive_buffers)
             connection_grid.columnconfigure(1, weight=1)
 
             command = panel("HCI COMMAND BUILDER")
@@ -343,13 +461,19 @@ def run_gui() -> None:
                 row=1, column=4, sticky=tk.W, pady=(6, 0))
             bulk.columnconfigure(4, weight=1)
 
-            traffic = panel("LIVE UART TRAFFIC")
-            traffic.master.pack_configure(fill=tk.BOTH, expand=True)
-            self.log = tk.Text(traffic, height=9, state=tk.DISABLED, wrap=tk.NONE,
+            traffic = panel("LIVE UART TRAFFIC", expand=True)
+            log_frame = ttk.Frame(traffic, style="Panel.TFrame")
+            log_frame.pack(fill=tk.BOTH, expand=True)
+            log_scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL,
+                                       style="Dark.Vertical.TScrollbar")
+            log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+            self.log = tk.Text(log_frame, height=9, state=tk.DISABLED, wrap=tk.NONE,
                                background="#070B14", foreground="#BEC6D2",
                                insertbackground="#BEC6D2", relief=tk.FLAT,
-                               highlightthickness=0, font=("Menlo", 10), padx=12, pady=10)
-            self.log.pack(fill=tk.BOTH, expand=True)
+                               highlightthickness=0, font=("Menlo", -13), padx=12, pady=10,
+                               yscrollcommand=log_scroll.set)
+            self.log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+            log_scroll.configure(command=self.log.yview)
             self.log.tag_configure("TX", foreground="#64BEFF")
             self.log.tag_configure("RX", foreground="#69E196")
             self.log.tag_configure("ERROR", foreground="#FF7878")
@@ -366,15 +490,25 @@ def run_gui() -> None:
             self._append_log_text(f"{direction:<5} {data.hex(' ').upper()}{suffix}", direction)
 
         def _append_log_text(self, message: str, kind: str) -> None:
-            """Append and color one line while retaining the C UI's 13-line window."""
+            """Append and color one line while preserving manual scroll position."""
+            following_tail = self.log.yview()[1] >= 0.999
             self.log.configure(state=tk.NORMAL)
             self.log.insert(tk.END, f"{message}\n", kind)
             self.log_line_count += 1
-            if self.log_line_count > 13:
+            if self.log_line_count > 256:
                 self.log.delete("1.0", "2.0")
                 self.log_line_count -= 1
-            self.log.see(tk.END)
+            if following_tail:
+                self.log.see(tk.END)
             self.log.configure(state=tk.DISABLED)
+
+        def _configure_receive_buffers(self, _event: object = None) -> None:
+            """Apply the selected local ring capacity and DMA transaction size."""
+            self.ring_buffer_size = dict(RING_BUFFER_SIZES)[self.ring_buffer_var.get()]
+            self.dma_buffer_size = dict(DMA_BUFFER_SIZES)[self.dma_buffer_var.get()]
+            self.log_notice(
+                f"RX  Buffers: ring={self.ring_buffer_size} bytes, "
+                f"DMA={self.dma_buffer_size} bytes", "RX")
 
         def log_notice(self, message: str, kind: str = "TEST") -> None:
             """Append a non-packet status line to the rolling traffic view."""
@@ -404,6 +538,13 @@ def run_gui() -> None:
             if self.serial_port is not None:
                 self.disconnect()
                 return
+            if self.connecting:
+                self.connection_attempt += 1
+                self.connecting = False
+                self.connect_button.configure(text="Connect")
+                self.status_var.set("Connection attempt cancelled")
+                self.transport_var.set("OFFLINE")
+                return
             port_name = self.port_var.get()
             try:
                 requested_baud = int(self.baud_var.get())
@@ -415,22 +556,53 @@ def run_gui() -> None:
                 self.status_var.set("Baud must be between 1 and 4000000")
                 self.log_notice("ERROR  Baud must be between 1 and 4000000", "ERROR")
                 return
-            simulated_baud = False
-            try:
-                self.serial_port = serial.Serial(port_name, requested_baud, timeout=0.1)
-            except (ValueError, OSError, serial.SerialException) as error:
-                if port_name.startswith(("/dev/ttys", "/dev/pts/")):
-                    try:
-                        self.serial_port = serial.Serial(port_name, 115200, timeout=0.1)
-                        simulated_baud = True
-                    except (OSError, serial.SerialException):
-                        self.status_var.set(str(error))
-                        self.log_notice(f"ERROR  {error}", "ERROR")
-                        return
-                else:
-                    self.status_var.set(str(error))
-                    self.log_notice(f"ERROR  {error}", "ERROR")
-                    return
+            self.connection_attempt += 1
+            attempt = self.connection_attempt
+            self.connecting = True
+            self.connect_button.configure(text="Cancel")
+            self.status_var.set(f"Opening {port_name}...")
+            self.transport_var.set("CONNECTING")
+
+            def open_port() -> None:
+                """Open a driver-backed serial device without blocking Tk."""
+                opened: serial.Serial | None = None
+                simulated_baud = False
+                error: Exception | None = None
+                try:
+                    opened = serial.Serial(port_name, requested_baud, timeout=0.1,
+                                           write_timeout=2.0)
+                except (ValueError, OSError, serial.SerialException) as first_error:
+                    error = first_error
+                    if port_name.startswith(("/dev/ttys", "/dev/pts/")):
+                        try:
+                            opened = serial.Serial(port_name, 115200, timeout=0.1,
+                                                   write_timeout=2.0)
+                            simulated_baud = True
+                            error = None
+                        except (ValueError, OSError, serial.SerialException) as fallback_error:
+                            error = fallback_error
+                self.rx_queue.put(("connect_result",
+                                   (attempt, opened, requested_baud,
+                                    simulated_baud, error)))
+
+            threading.Thread(target=open_port, daemon=True).start()
+            self.root.after(3000, lambda expected=attempt: self._connection_open_timeout(expected))
+
+        def _connection_open_timeout(self, expected_attempt: int) -> None:
+            """Return control when an operating-system serial open blocks."""
+            if self.connecting and self.connection_attempt == expected_attempt:
+                self.connection_attempt += 1
+                self.connecting = False
+                self.connect_button.configure(text="Connect")
+                self.status_var.set("Unable to open UART: driver did not respond")
+                self.transport_var.set("OFFLINE")
+                self.log_notice("ERROR  UART open timed out; check the selected port", "ERROR")
+
+        def _finish_connection_open(self, port: serial.Serial, requested_baud: int,
+                                    simulated_baud: bool) -> None:
+            """Start verification after the background serial open succeeds."""
+            self.connecting = False
+            self.serial_port = port
             self.stop_reader.clear()
             self.parser = H4CrcStreamParser()
             self.reader_thread = threading.Thread(target=self.read_serial, daemon=True)
@@ -457,9 +629,13 @@ def run_gui() -> None:
         def disconnect(self, error_message: str | None = None) -> None:
             """Close the serial device and optionally preserve a visible error."""
             self.stop_reader.set()
+            self.connection_attempt += 1
+            self.connecting = False
             self.handshake_pending = False
             port = self.serial_port
             self.serial_port = None
+            with self.rx_queue_lock:
+                self.rx_queued_bytes = 0
             if port is not None:
                 port_name = port.port
                 port.close()
@@ -489,14 +665,15 @@ def run_gui() -> None:
             """Enable client controls after a matching server acknowledgement."""
             self.handshake_pending = False
             self.status_var.set(self.handshake_status_text)
-            self.transport_var.set("DMA + IDLE")
+            self.receive_byte_irq_active = self.byte_irq_var.get()
+            self.transport_var.set(
+                "BYTE IRQ" if self.receive_byte_irq_active else "DMA + IDLE")
             self.rx_mode_toggle.configure(state=tk.NORMAL)
             self.send_command_button.configure(state=tk.NORMAL)
             self.send_raw_button.configure(state=tk.NORMAL)
             self.send_small_button.configure(state=tk.NORMAL)
             self.send_large_button.configure(state=tk.NORMAL)
             self.log_notice("VERIFY  BLE UART server acknowledged the 128-byte probe")
-            self.write_frame(build_rx_mode_command(RX_MODE_QUERY), "RX mode query")
 
         def read_serial(self) -> None:
             """Background worker that forwards serial reads to the Tk-safe queue."""
@@ -505,11 +682,19 @@ def run_gui() -> None:
                 if port is None:
                     return
                 try:
+                    with self.rx_queue_lock:
+                        available = self.ring_buffer_size - self.rx_queued_bytes
+                    if available <= 0:
+                        self.stop_reader.wait(0.002)
+                        continue
+                    capacity = min(self.dma_buffer_size, available)
                     data = port.read(1)
-                    waiting = min(port.in_waiting, 16 * 1024 - len(data))
+                    waiting = min(port.in_waiting, capacity - len(data))
                     if waiting:
                         data += port.read(waiting)
                     if data:
+                        with self.rx_queue_lock:
+                            self.rx_queued_bytes += len(data)
                         self.rx_queue.put(("data", data))
                 except serial.SerialException as error:
                     if not self.stop_reader.is_set():
@@ -528,6 +713,22 @@ def run_gui() -> None:
                         else:
                             self.log_notice(f"ERROR  {value}", "ERROR")
                             self.disconnect()
+                    elif kind == "connect_result":
+                        result = value if isinstance(value, tuple) else ()
+                        if len(result) == 5:
+                            attempt, opened, requested_baud, simulated_baud, error = result
+                            if attempt != self.connection_attempt or not self.connecting:
+                                if opened is not None:
+                                    opened.close()
+                            elif error is not None or opened is None:
+                                self.connecting = False
+                                self.connect_button.configure(text="Connect")
+                                self.status_var.set(f"Unable to open UART: {error}")
+                                self.transport_var.set("OFFLINE")
+                                self.log_notice(f"ERROR  Unable to open UART: {error}", "ERROR")
+                            else:
+                                self._finish_connection_open(
+                                    opened, int(requested_baud), bool(simulated_baud))
                     elif kind == "ports":
                         self.port_scan_running = False
                         ports = value if isinstance(value, list) else []
@@ -540,12 +741,15 @@ def run_gui() -> None:
                         self.log_notice(f"ERROR  Serial-port discovery failed: {value}", "ERROR")
                     elif kind == "data":
                         incoming = value if isinstance(value, bytes) else b""
+                        with self.rx_queue_lock:
+                            self.rx_queued_bytes = max(
+                                0, self.rx_queued_bytes - len(incoming))
                         byte_irq_active = self.receive_byte_irq_active
-                        if byte_irq_active:
-                            self.irq_absolute_count += len(incoming)
+                        self.irq_absolute_count += len(incoming) if byte_irq_active else 1
                         completed = self.parser.feed(incoming)
                         self.irq_count_var.set(f"IRQ calls: {self.irq_absolute_count}")
                         self.irq_metric_var.set(str(self.irq_absolute_count))
+                        dma_test_irq_accounted = False
                         for frame in completed:
                             self.rx_packets += 1
                             completion = frame.test_completion if frame.crc_valid else None
@@ -558,12 +762,6 @@ def run_gui() -> None:
                                         self.disconnect(
                                             "Wrong UART: BLE UART acknowledgement did not match the probe")
                                         break
-                            if frame.crc_valid and frame.rx_mode is not None:
-                                self.receive_byte_irq_active = (
-                                    frame.rx_mode == RX_MODE_BYTE_IRQ)
-                                self.byte_irq_var.set(self.receive_byte_irq_active)
-                                self.transport_var.set(
-                                    "BYTE IRQ" if self.receive_byte_irq_active else "DMA + IDLE")
                             crc_status = "CRC OK" if frame.crc_valid else (
                                 f"CRC BAD (got {frame.received_crc:04X}, expected {frame.computed_crc:04X})"
                             )
@@ -573,8 +771,12 @@ def run_gui() -> None:
                                 self.test_irq_active = True
                                 self.test_irq_calls = 0
                                 self.test_log_next_progress = 256 * 1024
-                            if flags is not None and self.test_irq_active and byte_irq_active:
-                                self.test_irq_calls += len(frame.h4_packet) + 2
+                            if flags is not None and self.test_irq_active:
+                                if byte_irq_active:
+                                    self.test_irq_calls += len(frame.h4_packet) + 2
+                                elif not dma_test_irq_accounted:
+                                    self.test_irq_calls += 1
+                                    dma_test_irq_accounted = True
                             if flags is not None and self.test_irq_active and flags & 0x02:
                                 transmission_irqs = self.test_irq_calls
                                 self.test_irq_active = False
@@ -582,7 +784,8 @@ def run_gui() -> None:
                                     f", IRQ complete: {transmission_irqs} calls; "
                                     f"app total={self.irq_absolute_count}")
                             elif flags is None:
-                                transmission_irqs = len(frame.h4_packet) + 2 if byte_irq_active else 0
+                                transmission_irqs = (len(frame.h4_packet) + 2
+                                                     if byte_irq_active else 1)
                                 irq_detail = (
                                     f", IRQ complete: {transmission_irqs} calls; "
                                     f"app total={self.irq_absolute_count}")
@@ -734,11 +937,15 @@ def run_gui() -> None:
             self.start_test_transfer(sizes[selected])
 
         def send_rx_mode_request(self) -> None:
-            """Send the toggle state and wait for the server's authoritative event."""
+            """Apply this app's local receive interrupt implementation."""
             if self.serial_port is None:
                 return
-            mode = RX_MODE_BYTE_IRQ if self.byte_irq_var.get() else RX_MODE_DMA
-            self.write_frame(build_rx_mode_command(mode), "RX mode request")
+            self.receive_byte_irq_active = self.byte_irq_var.get()
+            self.transport_var.set(
+                "BYTE IRQ" if self.receive_byte_irq_active else "DMA + IDLE")
+            self.log_notice(
+                "RX  Local receive mode: "
+                + ("per-byte IRQ" if self.receive_byte_irq_active else "DMA batches"), "RX")
 
         def close(self) -> None:
             """Release the serial resource and destroy the Tk root window."""
@@ -746,12 +953,13 @@ def run_gui() -> None:
             self.root.destroy()
 
     root = tk.Tk()
-    preferred_family = ("Segoe UI" if sys.platform == "win32" else
-                        "Helvetica Neue" if sys.platform == "darwin" else
-                        "DejaVu Sans")
+    available_families = set(tkfont.families(root))
+    preferred_family = "Space Grotesk" if "Space Grotesk" in available_families else (
+        "Segoe UI" if sys.platform == "win32" else
+        "Avenir Next" if sys.platform == "darwin" else "DejaVu Sans")
     for named_font in ("TkDefaultFont", "TkTextFont", "TkMenuFont",
                        "TkCaptionFont", "TkSmallCaptionFont"):
-        tkfont.nametofont(named_font).configure(family=preferred_family, size=11)
+        tkfont.nametofont(named_font).configure(family=preferred_family, size=-17)
     BleUartApp(root)
     root.mainloop()
 

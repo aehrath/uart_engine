@@ -24,6 +24,7 @@
 #define SERIAL_POLL_TICKS    pdMS_TO_TICKS(5U)
 #define MAX_WIRE_FRAME       UART_DMA_MAX_PACKET_SIZE
 #define TEST_TX_BATCH_SIZE   (64U * 1024U)
+#define DEFAULT_RX_DMA_SIZE  256U
 
 static UART_TypeDef uartRegisters;
 static DMA_Stream_TypeDef rxDmaRegisters;
@@ -35,10 +36,12 @@ DMA_Stream_TypeDef *DMA_TX_STREAM = &txDmaRegisters;
 
 static int ptyMaster = -1;
 static uint32_t dmaWriteIndex;
+static uint32_t rxDmaTransferSize = DEFAULT_RX_DMA_SIZE;
 static volatile sig_atomic_t stopRequested;
 static volatile uint32_t outboundTestRequest;
 static volatile bool outboundTestActive;
 static uint32_t inboundTestIrqStart;
+static uint32_t inboundTestIrqNextReport;
 static bool inboundTestIrqActive;
 static pthread_mutex_t ptyTxMutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -115,9 +118,18 @@ static void injectDmaFrame(const uint8_t *frame, uint16_t length) {
             dmaWriteIndex = (dmaWriteIndex + 1U) % dmaBufferSize;
         }
     } else {
-        for (uint16_t index = 0U; index < length; index++) {
-            dmaBuffer[dmaWriteIndex] = frame[index];
-            dmaWriteIndex = (dmaWriteIndex + 1U) % dmaBufferSize;
+        uint16_t offset = 0U;
+        while (offset < length) {
+            const uint16_t remaining = (uint16_t)(length - offset);
+            const uint16_t transfer = remaining < rxDmaTransferSize
+                ? remaining : (uint16_t)rxDmaTransferSize;
+            for (uint16_t index = 0U; index < transfer; index++) {
+                dmaBuffer[dmaWriteIndex] = frame[offset + index];
+                dmaWriteIndex = (dmaWriteIndex + 1U) % dmaBufferSize;
+            }
+            offset = (uint16_t)(offset + transfer);
+            DMA_RX_STREAM->NDTR = dmaBufferSize - dmaWriteIndex;
+            DMA_RX_Complete_IRQHandler();
         }
     }
 
@@ -165,9 +177,17 @@ static void reportRxIrqStats(uint32_t transmissionCount) {
     fflush(stdout);
 }
 
+/** Publish in-flight IRQ totals for the dashboard without completing the log. */
+static void reportRxIrqProgress(uint32_t transmissionCount) {
+    const uint32_t absoluteCount = UartDma_GetRxInterruptCount();
+    printf("RX IRQ PROGRESS -> absolute=%u transmission=%u\n",
+           (unsigned int)absoluteCount, (unsigned int)transmissionCount);
+    fflush(stdout);
+}
+
 /** Recognize one chunk of the deterministic ACL transfer protocol. */
 static bool testTransferFrameFlags(const uint8_t *frame, uint16_t length,
-                                   uint8_t *flags) {
+                                   uint8_t *flags, uint32_t *received_size) {
     if (length < sizeof(BleHciAclHeader_t) + sizeof(TestTransferHeader_t) +
                  sizeof(BleHciCrcTrailer_t)) {
         return false;
@@ -184,6 +204,7 @@ static bool testTransferFrameFlags(const uint8_t *frame, uint16_t length,
         return false;
     }
     *flags = transfer.flags;
+    *received_size = TestTransfer_Offset(&transfer) + TestTransfer_ChunkSize(&transfer);
     return true;
 }
 
@@ -210,9 +231,12 @@ static void handleSerialFrame(const uint8_t *frame, uint16_t length, void *conte
     (void)context;
     const uint32_t before = UartDma_GetRxInterruptCount();
     uint8_t testFlags = 0U;
-    const bool isTestTransfer = testTransferFrameFlags(frame, length, &testFlags);
+    uint32_t testReceivedSize = 0U;
+    const bool isTestTransfer = testTransferFrameFlags(
+        frame, length, &testFlags, &testReceivedSize);
     if (isTestTransfer && (testFlags & TEST_TRANSFER_FLAG_START) != 0U) {
         inboundTestIrqStart = before;
+        inboundTestIrqNextReport = TEST_TRANSFER_PROGRESS_STEP;
         inboundTestIrqActive = true;
     }
     injectDmaFrame(frame, length);
@@ -221,6 +245,11 @@ static void handleSerialFrame(const uint8_t *frame, uint16_t length, void *conte
         if ((testFlags & TEST_TRANSFER_FLAG_END) != 0U) {
             reportRxIrqStats(after - inboundTestIrqStart);
             inboundTestIrqActive = false;
+        } else if (testReceivedSize >= inboundTestIrqNextReport) {
+            reportRxIrqProgress(after - inboundTestIrqStart);
+            do {
+                inboundTestIrqNextReport += TEST_TRANSFER_PROGRESS_STEP;
+            } while (testReceivedSize >= inboundTestIrqNextReport);
         }
     } else {
         reportRxIrqStats(after - before);
@@ -317,14 +346,48 @@ static void controlReaderTask(void *parameters) {
             if (byte == '\n') {
                 command[length] = '\0';
                 if (strcmp(command, "irq") == 0) {
-                    setRxMode(UART_DMA_RX_MODE_BYTE_IRQ, true);
+                    setRxMode(UART_DMA_RX_MODE_BYTE_IRQ, false);
                 } else if (strcmp(command, "dma") == 0) {
-                    setRxMode(UART_DMA_RX_MODE_DMA_IDLE, true);
+                    setRxMode(UART_DMA_RX_MODE_DMA_IDLE, false);
                 } else if (strcmp(command, "mode") == 0) {
                     sendRxModeState();
                 } else if (strcmp(command, "stats") == 0) {
                     printf("RX IRQ COUNT -> %u\n",
                            (unsigned int)UartDma_GetRxInterruptCount());
+                    fflush(stdout);
+                } else if (strcmp(command, "buffers") == 0) {
+                    printf("RX BUFFERS -> ring=%u dma=%u\n",
+                           (unsigned int)UartDma_GetRxBufferSize(),
+                           (unsigned int)rxDmaTransferSize);
+                    fflush(stdout);
+                } else if (strncmp(command, "ring ", 5U) == 0) {
+                    char *end = NULL;
+                    const unsigned long requested = strtoul(&command[5], &end, 10);
+                    if (inboundTestIrqActive) {
+                        puts("ERROR  Cannot resize the ring during a receive transfer");
+                    } else if (*end != '\0' || requested > UINT32_MAX ||
+                        !UartDma_SetRxBufferSize((uint32_t)requested)) {
+                        puts("ERROR  Ring buffer must be between 256 and 65536 bytes");
+                    } else {
+                        dmaWriteIndex = 0U;
+                        printf("RX BUFFERS -> ring=%u dma=%u\n",
+                               (unsigned int)UartDma_GetRxBufferSize(),
+                               (unsigned int)rxDmaTransferSize);
+                    }
+                    fflush(stdout);
+                } else if (strncmp(command, "dma-buffer ", 11U) == 0) {
+                    char *end = NULL;
+                    const unsigned long requested = strtoul(&command[11], &end, 10);
+                    if (inboundTestIrqActive) {
+                        puts("ERROR  Cannot resize DMA during a receive transfer");
+                    } else if (*end != '\0' || requested < 32UL || requested > 4096UL) {
+                        puts("ERROR  DMA buffer must be between 32 and 4096 bytes");
+                    } else {
+                        rxDmaTransferSize = (uint32_t)requested;
+                        printf("RX BUFFERS -> ring=%u dma=%u\n",
+                               (unsigned int)UartDma_GetRxBufferSize(),
+                               (unsigned int)rxDmaTransferSize);
+                    }
                     fflush(stdout);
                 } else if (strncmp(command, "tx ", 3U) == 0) {
                     sendDashboardPacket(&command[3]);

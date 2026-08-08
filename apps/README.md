@@ -85,10 +85,10 @@ On macOS and Linux, `ble_uart_server_ui` gives the continuous FreeRTOS server a
 matching graphical dashboard. It starts and stops the actual server engine,
 displays and copies the generated pseudo-UART path, counts received commands and
 transmitted events, and shows the live DMA/HCI log. Its **Per-byte IRQ** checkbox
-controls the same server state as either client UI. The **RX IRQ calls** card is
-the server app's cumulative count of RXNE byte interrupts actually serviced by
-the UART ISR. It is local to that server process and is not synchronized to the
-client dashboards.
+controls only the server receiver. The **RX IRQ calls** card counts actual RXNE
+handler calls in byte mode and completed simulated DMA transactions in DMA
+mode. It is local to that server process and is not synchronized to the client
+dashboards.
 
 The dashboard also mirrors the client sending controls. It can transmit preset
 or custom typed HCI commands, arbitrary raw H4 packets, the 128-byte quick-test
@@ -103,22 +103,30 @@ bundled Space Grotesk family for legible, consistent controls and logs. Their
 shared telemetry row reports TX, RX, receive IRQ, and transport state above
 rounded high-contrast action controls.
 
+The **Ring** selector changes the active circular receive capacity from 256 B
+through 64 KiB. The independent **DMA** selector changes a receive transaction
+from 32 B through 4 KiB. Native logs retain 256 lines; use the mouse wheel over
+the log or click its scrollbar to inspect earlier traffic.
+
 Each graphical app owns its IRQ dashboard counter. The value is cumulative for
 that app process. Each ordinary packet resets a separate transmission counter;
 the packet's final log entry includes that count once. A chunked test message is
 treated as one full transmission, so its counter spans all chunks and appears
 only in the completion log entry.
 
+During a client-to-server test in per-byte IRQ mode, the server also publishes
+its cumulative and current-transfer interrupt counts at each 256 KiB progress
+boundary. The dashboard therefore updates while a large upload is still in
+flight, with the final packet count still logged once at completion.
+
 Large test transfers never hex-dump individual ACL chunks. The apps retain
 compact start, periodic progress, and completion records; the intentionally
 small 128-byte diagnostic message may still be displayed byte-for-byte.
 
-Receive-mode changes are synchronized in both directions. A client sends the
-typed vendor command `0xFC01`; the server applies it and returns an `RXMD`
-vendor event containing the authoritative state. Changes made in the server
-dashboard therefore update the connected C or Python client checkbox, and
-changes made in either client update the server dashboard. New connections
-query the current state automatically.
+Receive mode and buffer sizes are application-local. Changing a client affects
+how that client receives server traffic; changing the server affects how the
+server receives client traffic. This keeps every dashboard counter tied to IRQ
+calls made by its own process.
 
 On macOS:
 

@@ -29,26 +29,27 @@ client sends a 128-byte deterministic probe and waits up to 2.5 seconds for the
 server's matching, CRC-valid acknowledgement. Until that succeeds the dashboard
 shows **VERIFYING** and all transmit controls remain disabled. A wrong or silent
 UART is closed automatically and an error remains visible in the status bar.
+Serial-device opening also runs outside Tk's event thread, so an invalid or
+unresponsive driver can be cancelled and cannot freeze the window.
 
 The Python window mirrors the portable C client: both use the same 1120x960
 four-panel layout, command presets, editable HCI fields, 128-byte quick-test
 button, selectable 16 KiB through 16 MiB large transfers, progress display, and
-color-coded rolling traffic log. Tk entry fields retain their platform-native
-selection and clipboard behavior.
+a color-coded 256-line scrollable traffic log. Tk entry fields retain their
+platform-native selection and clipboard behavior.
 
 The title and heading display the shared repository release version. The UI
 uses Segoe UI, Avenir Next, or DejaVu Sans according to the host platform, with
 the same dark telemetry cards and rounded high-contrast action controls as the
 native dashboards.
 
-The **Per-byte IRQ** checkbox mirrors the C client and server dashboard. It
-selects either one UART RX interrupt per byte or the normal circular-DMA/IDLE
-receiver. The server replies with its authoritative state, so changing the
-toggle at either end keeps both applications synchronized; connection also
-queries the current mode automatically.
+The **Per-byte IRQ** checkbox controls this Python process only. Byte mode counts
+one receiver IRQ per received wire byte. DMA mode counts one IRQ per completed
+serial read batch. The adjacent **Ring** and **DMA** selectors set the queued
+receive capacity and maximum read transaction size, respectively.
 
 The IRQ dashboard count is local to this Python process and accumulates while
-incoming serial bytes are consumed through the selected per-byte receive path.
+incoming serial bytes are consumed through the selected receive path.
 Each received packet resets its transmission count. Multi-chunk test data is
 treated as one full transmission, with one aggregate IRQ count written to the
 log only after the final chunk.
@@ -56,6 +57,10 @@ log only after the final chunk.
 Transfers larger than 128 bytes use compact start/progress/completion log lines
 instead of formatting every ACL chunk as hexadecimal, avoiding UI logging as a
 throughput bottleneck.
+
+The receive parser uses the platform-optimized CRC16 primitive and compacts a
+coalesced serial buffer only once per read. Server-to-client transfers therefore
+remain fast even when one read contains thousands of framed test packets.
 
 ## Packet format
 

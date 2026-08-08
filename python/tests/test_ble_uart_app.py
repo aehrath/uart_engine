@@ -124,6 +124,17 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(all(crc16_ccitt(frame[:-2]) == int.from_bytes(frame[-2:], "big")
                             for frame in frames))
 
+    def test_coalesced_large_receive_batch(self):
+        """Parse a large serial read without losing any back-to-back frames."""
+        total_size = 512 * 1024
+        wire = b"".join(build_test_transfer_frames(total_size, identifier=19))
+        frames = H4CrcStreamParser().feed(wire)
+        remainder = total_size % 230
+        self.assertEqual(len(frames), (total_size + 229) // 230)
+        self.assertTrue(all(frame.crc_valid for frame in frames))
+        self.assertEqual(frames[-1].test_transfer_info,
+                         (total_size, total_size - remainder, remainder, 0x02))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -38,10 +38,14 @@ BaseType_t UartDma_SendPacket(const PacketMessage_t *message, TickType_t ticks_t
 void UartDma_SetRxMode(UartDmaRxMode_t mode);
 /** Return the currently selected receive implementation. */
 UartDmaRxMode_t UartDma_GetRxMode(void);
-/** Return the number of receive-byte interrupts serviced since initialization. */
+/** Return receiver IRQ calls: RXNE calls in byte mode or DMA completions in DMA mode. */
 uint32_t UartDma_GetRxInterruptCount(void);
+/** Change the active circular RX ring capacity at a frame boundary. */
+bool UartDma_SetRxBufferSize(uint32_t size);
 /** Store RXNE bytes in IRQ mode and wake the producer on UART IDLE. */
 void USART_IRQHandler(void);
+/** Record one completed RX DMA transaction in DMA receive mode. */
+void DMA_RX_Complete_IRQHandler(void);
 /** Handle TX DMA completion and release the transmitter semaphore. */
 void DMA_TX_Complete_IRQHandler(void);
 

@@ -8,10 +8,15 @@
 #include <stdint.h>
 
 /** Capacity in bytes of the circular DMA receive area. */
-#define UART_DMA_RX_BUFFER_SIZE 1024U
+#define UART_DMA_RX_BUFFER_SIZE     1024U
+/** Largest runtime-selectable circular receive capacity. */
+#define UART_DMA_RX_BUFFER_MAX_SIZE (64U * 1024U)
 
 /** Reset the software read cursor to the start of the DMA buffer. */
 void UartDmaRingBuffer_Reset(void);
+/** Select the active circular capacity and reset both cursors.
+ * @return `true` for capacities from 256 bytes through the static maximum. */
+bool UartDmaRingBuffer_SetCapacity(uint32_t capacity);
 /** Obtain the storage address that must be programmed into RX DMA.
  * @return Mutable, cache-line-aligned receive storage. */
 uint8_t *UartDma_GetRxBuffer(void);

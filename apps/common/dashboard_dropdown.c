@@ -38,9 +38,10 @@ bool AppDashboard_UpwardDropdown(Rectangle bounds, Font font,
 
     const float row_height = 34.0f;
     const float gap = 6.0f;
+    const float upward_y = bounds.y - (float)item_count * row_height - gap;
     const Rectangle popup_bounds = {
         bounds.x,
-        bounds.y - (float)item_count * row_height - gap,
+        upward_y >= 8.0f ? upward_y : bounds.y + bounds.height + gap,
         bounds.width,
         (float)item_count * row_height,
     };

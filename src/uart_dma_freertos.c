@@ -125,6 +125,14 @@ uint32_t UartDma_GetRxInterruptCount(void) {
     return rxInterruptCount;
 }
 
+bool UartDma_SetRxBufferSize(uint32_t size) {
+    if (!UartDmaRingBuffer_SetCapacity(size)) {
+        return false;
+    }
+    DMA_RX_STREAM->NDTR = size;
+    return true;
+}
+
 void USART_IRQHandler(void) {
     BaseType_t xHigherPriorityTaskWoken = pdFALSE;
 
@@ -144,6 +152,12 @@ void USART_IRQHandler(void) {
     }
 
     portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+}
+
+void DMA_RX_Complete_IRQHandler(void) {
+    if (rxMode == UART_DMA_RX_MODE_DMA_IDLE) {
+        rxInterruptCount++;
+    }
 }
 
 void DMA_TX_Complete_IRQHandler(void) {

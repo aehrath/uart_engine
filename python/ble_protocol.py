@@ -6,6 +6,7 @@ The module mirrors the packed C wire protocol for the optional Python client.
 
 from __future__ import annotations
 
+import binascii
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -43,12 +44,7 @@ def crc16_ccitt(data: bytes) -> int:
     @param data Bytes protected by the checksum.
     @return CRC using polynomial `0x1021` and initial value `0xffff`.
     """
-    crc = 0xFFFF
-    for value in data:
-        crc ^= value << 8
-        for _ in range(8):
-            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if crc & 0x8000 else (crc << 1) & 0xFFFF
-    return crc
+    return binascii.crc_hqx(data, 0xFFFF)
 
 
 def add_crc(payload: bytes) -> bytes:
@@ -278,21 +274,22 @@ class H4CrcStreamParser:
         self._buffer.extend(data)
         frames: list[ParsedFrame] = []
 
-        while self._buffer:
-            packet_type = self._buffer[0]
+        cursor = 0
+        while cursor < len(self._buffer):
+            packet_type = self._buffer[cursor]
             header_length = self._HEADER_LENGTHS.get(packet_type)
             if header_length is None:
-                del self._buffer[0]
+                cursor += 1
                 self.discarded_bytes += 1
                 continue
 
-            h4_header_end = 1 + header_length
+            h4_header_end = cursor + 1 + header_length
             if len(self._buffer) < h4_header_end:
                 break
-            header = bytes(self._buffer[1:h4_header_end])
+            header = bytes(self._buffer[cursor + 1:h4_header_end])
             payload_length = self._payload_length(packet_type, header)
             if payload_length > MAX_HCI_PAYLOAD:
-                del self._buffer[0]
+                cursor += 1
                 self.discarded_bytes += 1
                 continue
 
@@ -301,12 +298,15 @@ class H4CrcStreamParser:
             if len(self._buffer) < framed_length:
                 break
 
-            h4_packet = bytes(self._buffer[:h4_length])
+            h4_packet = bytes(self._buffer[cursor:h4_length])
             received_crc = int.from_bytes(self._buffer[h4_length:framed_length], "big")
             frames.append(
                 ParsedFrame(packet_type, h4_packet, received_crc, crc16_ccitt(h4_packet))
             )
-            del self._buffer[:framed_length]
+            cursor = framed_length
+
+        if cursor != 0:
+            del self._buffer[:cursor]
 
         return frames
 

@@ -2,6 +2,7 @@
  * @brief Portable raylib/raygui BLE HCI UART client application. */
 #include "raylib.h"
 #include "dashboard_dropdown.h"
+#include "dashboard_log.h"
 #include "h4_wire.h"
 #include "serial_port.h"
 #include "test_transfer_protocol.h"
@@ -17,8 +18,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define MAX_LOG_LINES       9U
-#define MAX_LOG_LENGTH      220U
+#define MAX_LOG_LENGTH      APP_DASHBOARD_LOG_LINE_SIZE
 #define CONNECTION_PROBE_SIZE 128U
 #define CONNECTION_PROBE_TIMEOUT_SECONDS 2.5
 
@@ -101,14 +101,19 @@ static void drawPanel(Rectangle bounds, const char *title) {
     }
 }
 
-/** Draw one client telemetry card. */
-static void drawMetricCard(Rectangle bounds, const char *label,
+/** Draw one client telemetry card and report a completed click. */
+static bool drawMetricCard(Rectangle bounds, const char *label,
                            const char *value, Color accent) {
+    const bool hovered = CheckCollisionPointRec(GetMousePosition(), bounds);
     DrawRectangleRounded(bounds, 0.12f, 10, COLOR_PANEL_RAISED);
+    if (hovered) {
+        DrawRectangleRoundedLinesEx(bounds, 0.12f, 10, 1.0f, accent);
+    }
     DrawRectangleRounded((Rectangle){bounds.x, bounds.y, 5.0f, bounds.height},
                          0.5f, 6, accent);
     drawUiText(label, (int)bounds.x + 18, (int)bounds.y + 14, 14, COLOR_MUTED);
     drawDisplayText(value, (int)bounds.x + 18, (int)bounds.y + 42, 25, COLOR_TEXT);
+    return hovered && IsMouseButtonReleased(MOUSE_BUTTON_LEFT);
 }
 
 /** Draw a rounded high-contrast action button and report a completed click. */
@@ -149,10 +154,8 @@ typedef struct {
 
 /** Fixed-height rolling traffic log displayed by the UI. */
 typedef struct {
-    /** Render-ready text lines. */
-    char lines[MAX_LOG_LINES][MAX_LOG_LENGTH];
-    /** Number of populated lines. */
-    size_t count;
+    /** Retained scrollable traffic messages. */
+    AppDashboardLog_t messages;
     /** Complete H4 packets transmitted by this client. */
     uint32_t transmittedPackets;
     /** Complete H4 packets received by this client. */
@@ -171,6 +174,8 @@ typedef struct {
     bool testIrqActive;
     /** Next logical byte offset that produces a compact receive-progress log. */
     uint32_t testLogNextProgress;
+    /** Whether the current DMA read has been charged to an active test transfer. */
+    bool currentReadDmaAccounted;
 } TrafficLog_t;
 
 /** Incremental state for a nonblocking deterministic test transfer. */
@@ -199,8 +204,8 @@ typedef struct {
     bool verified;
     /** Whether an invalid acknowledgement requires an immediate disconnect. */
     bool failed;
-    /** Whether post-verification RX-mode synchronization has been requested. */
-    bool modeQuerySent;
+    /** Whether successful verification has been announced to the UI. */
+    bool readyAnnounced;
 } ConnectionHandshake_t;
 
 /** Objects used by the frame callback to update UI and handshake state. */
@@ -218,6 +223,14 @@ typedef struct {
     /** Logical payload size in bytes. */
     uint32_t size;
 } BulkSizePreset_t;
+
+/** One runtime receive-buffer choice. */
+typedef struct {
+    /** Human-readable size. */
+    const char *label;
+    /** Capacity in bytes. */
+    size_t size;
+} BufferSizePreset_t;
 
 static const Preset_t presets[] = {
     {"HCI Reset",          0x0C03U, {0U},            0U},
@@ -245,6 +258,21 @@ static const BulkSizePreset_t bulkSizePresets[] = {
 static const char *const bulkSizeOptions[] = {
     "16 KiB", "64 KiB", "128 KiB", "512 KiB", "1 MiB",
     "2 MiB", "4 MiB", "8 MiB", "16 MiB",
+};
+
+static const BufferSizePreset_t ringBufferPresets[] = {
+    {"256 B", 256U}, {"1 KiB", 1024U}, {"4 KiB", 4096U},
+    {"16 KiB", 16U * 1024U}, {"64 KiB", 64U * 1024U},
+};
+static const char *const ringBufferOptions[] = {
+    "256 B", "1 KiB", "4 KiB", "16 KiB", "64 KiB",
+};
+static const BufferSizePreset_t dmaBufferPresets[] = {
+    {"32 B", 32U}, {"64 B", 64U}, {"128 B", 128U}, {"256 B", 256U},
+    {"512 B", 512U}, {"1 KiB", 1024U}, {"4 KiB", 4096U},
+};
+static const char *const dmaBufferOptions[] = {
+    "32 B", "64 B", "128 B", "256 B", "512 B", "1 KiB", "4 KiB",
 };
 
 /** Return whether the platform's standard clipboard modifier is held. */
@@ -303,16 +331,20 @@ static void drawClipboardTextBox(Rectangle bounds, char *text, size_t capacity,
 
 /** Append a formatted line, evicting the oldest line when full. */
 static void appendLog(TrafficLog_t *log, const char *format, ...) {
-    if (log->count == MAX_LOG_LINES) {
-        memmove(log->lines, &log->lines[1],
-                (MAX_LOG_LINES - 1U) * sizeof(log->lines[0]));
-        log->count--;
-    }
+    char line[MAX_LOG_LENGTH];
     va_list arguments;
     va_start(arguments, format);
-    (void)vsnprintf(log->lines[log->count], MAX_LOG_LENGTH, format, arguments);
+    (void)vsnprintf(line, sizeof(line), format, arguments);
     va_end(arguments);
-    log->count++;
+    AppDashboardLog_Append(&log->messages, "%s", line);
+}
+
+/** Select the established traffic color for one retained client log line. */
+static Color clientLogColor(const char *line) {
+    return strncmp(line, "ERROR", 5U) == 0 ? (Color){255, 120, 120, 255}
+        : strncmp(line, "TX", 2U) == 0 ? (Color){100, 190, 255, 255}
+        : strncmp(line, "RX", 2U) == 0 ? (Color){105, 225, 150, 255}
+        : (Color){190, 198, 210, 255};
 }
 
 /** Send one typed packet and CRC trailer, optionally recording its bytes. */
@@ -365,14 +397,6 @@ static bool sendCommand(AppSerialPort_t *port, TrafficLog_t *log,
     return sendFramed(port, log, &command, commandLength);
 }
 
-/** Send a typed RX-mode set or query command. */
-static bool sendRxModeRequest(AppSerialPort_t *port, TrafficLog_t *log,
-                              uint8_t mode) {
-    BleHciCommandPacket_t command;
-    const size_t length = AppH4RxModeCommand_Init(&command, mode);
-    return sendFramed(port, log, &command, length);
-}
-
 /** Send the single deterministic transfer used to identify the server UART. */
 static bool sendConnectionProbe(AppSerialPort_t *port, TrafficLog_t *log,
                                 ConnectionHandshake_t *handshake) {
@@ -410,7 +434,7 @@ static bool sendConnectionProbe(AppSerialPort_t *port, TrafficLog_t *log,
     handshake->pending = true;
     handshake->verified = false;
     handshake->failed = false;
-    handshake->modeQuerySent = false;
+    handshake->readyAnnounced = false;
     handshake->deadline = GetTime() + CONNECTION_PROBE_TIMEOUT_SECONDS;
     appendLog(log, "VERIFY  Sent 128-byte server probe (id=%u)",
               handshake->identifier);
@@ -427,7 +451,6 @@ static void logFrame(const uint8_t *frame, size_t length, bool crcValid,
     const size_t h4Length = length - 2U;
     BleHciPacketIndicator_t indicator;
     memcpy(&indicator, frame, sizeof(indicator));
-    bool byteIrqMode = false;
     uint16_t completionIdentifier = 0U;
     uint8_t completionStatus = 0U;
     uint32_t completionSize = 0U;
@@ -469,8 +492,13 @@ static void logFrame(const uint8_t *frame, size_t length, bool crcValid,
         log->testIrqActive = true;
         log->testLogNextProgress = TEST_TRANSFER_PROGRESS_STEP;
     }
-    if (testFrame && log->testIrqActive && log->receiveByteIrqActive) {
-        log->testIrqCalls += (uint32_t)length;
+    if (testFrame && log->testIrqActive) {
+        if (log->receiveByteIrqActive) {
+            log->testIrqCalls += (uint32_t)length;
+        } else if (!log->currentReadDmaAccounted) {
+            log->testIrqCalls++;
+            log->currentReadDmaAccounted = true;
+        }
     }
     if (testFrame && log->testIrqActive &&
         (testFlags & TEST_TRANSFER_FLAG_END) != 0U) {
@@ -479,7 +507,7 @@ static void logFrame(const uint8_t *frame, size_t length, bool crcValid,
         irqCompletion = true;
     } else if (!testFrame) {
         log->transmissionIrqCount = log->receiveByteIrqActive
-            ? (uint32_t)length : 0U;
+            ? (uint32_t)length : 1U;
     }
     const bool suppressBytes = testFrame && testTotal > 128U;
     if (suppressBytes) {
@@ -496,11 +524,6 @@ static void logFrame(const uint8_t *frame, size_t length, bool crcValid,
                       (unsigned int)((received * 100ULL) / testTotal));
             log->testLogNextProgress += TEST_TRANSFER_PROGRESS_STEP;
         }
-    } else if (crcValid && AppH4RxModeEvent_Decode(frame, length, &byteIrqMode)) {
-        log->byteIrqMode = byteIrqMode;
-        log->receiveByteIrqActive = byteIrqMode;
-        appendLog(log, "RX  Mode synchronized: %s",
-                  byteIrqMode ? "per-byte IRQ" : "DMA + IDLE");
     } else {
         char hex[MAX_LOG_LENGTH - 56U];
         AppH4_FormatHex(hex, sizeof(hex), frame, length);
@@ -619,8 +642,8 @@ int main(void) {
     AppSerialPort_Init(&serial);
     AppH4StreamParser_t parser;
     AppH4StreamParser_Init(&parser);
-    TrafficLog_t log = {{{0}}, 0U, 0U, 0U, false, false,
-                        0U, 0U, 0U, false, 0U};
+    TrafficLog_t log = {0};
+    AppDashboardLog_Init(&log.messages);
     TestSender_t testSender = {0U, 0U, 0U, 0U, false};
     ConnectionHandshake_t handshake = {0};
     ClientFrameContext_t frameContext = {&log, &handshake};
@@ -643,23 +666,42 @@ int main(void) {
     bool rawEdit = false;
     bool presetDropdown = false;
     bool bulkSizeDropdown = false;
+    bool ringSizeDropdown = false;
+    bool dmaSizeDropdown = false;
     int presetIndex = 0;
     int previousPreset = 0;
     int bulkSizeIndex = 5;
+    int ringSizeIndex = 3;
+    int dmaSizeIndex = 3;
     presetToFields(0, opcodeText, sizeof(opcodeText), parametersText, sizeof(parametersText));
     appendLog(&log, "Ready. Start ble_uart_server and enter its printed port.");
+    static uint8_t receiveRing[64U * 1024U];
 
     while (!WindowShouldClose()) {
         if (serial.connected) {
-            uint8_t incoming[16U * 1024U];
-            const int received = AppSerialPort_Read(&serial, incoming, sizeof(incoming));
-            if (received > 0) {
-                if (log.receiveByteIrqActive) {
-                    log.absoluteIrqCount += (uint32_t)received;
+            uint8_t incoming[4096U];
+            size_t receivedThisFrame = 0U;
+            int received = 0;
+            do {
+                const size_t ringRemaining = ringBufferPresets[ringSizeIndex].size
+                    - receivedThisFrame;
+                const size_t readCapacity = dmaBufferPresets[dmaSizeIndex].size
+                    < ringRemaining ? dmaBufferPresets[dmaSizeIndex].size : ringRemaining;
+                received = AppSerialPort_Read(
+                    &serial, incoming, readCapacity);
+                if (received <= 0) {
+                    break;
                 }
+                memcpy(&receiveRing[receivedThisFrame], incoming, (size_t)received);
+                log.absoluteIrqCount += log.receiveByteIrqActive
+                    ? (uint32_t)received : 1U;
+                log.currentReadDmaAccounted = false;
                 (void)AppH4StreamParser_Feed(
-                    &parser, incoming, (size_t)received, logFrame, &frameContext);
-            } else if (received < 0) {
+                    &parser, &receiveRing[receivedThisFrame], (size_t)received,
+                    logFrame, &frameContext);
+                receivedThisFrame += (size_t)received;
+            } while (receivedThisFrame < ringBufferPresets[ringSizeIndex].size);
+            if (received < 0) {
                 appendLog(&log, "ERROR  Serial connection lost");
                 AppSerialPort_Close(&serial);
                 (void)snprintf(statusText, sizeof(statusText), "Disconnected after read error");
@@ -683,11 +725,10 @@ int main(void) {
                            "Wrong UART: BLE UART server did not acknowledge probe");
             appendLog(&log, "ERROR  Selected UART is not a BLE UART server (timeout)");
         } else if (serial.connected && handshake.verified &&
-                   !handshake.modeQuerySent) {
-            handshake.modeQuerySent = true;
+                   !handshake.readyAnnounced) {
+            handshake.readyAnnounced = true;
             (void)snprintf(statusText, sizeof(statusText), "Connected to %s", portText);
             appendLog(&log, "Connected to %s; server identity verified", portText);
-            (void)sendRxModeRequest(&serial, &log, BLE_HCI_RX_MODE_QUERY);
         }
         pumpTestTransfer(&testSender, &serial, &log);
 
@@ -718,14 +759,23 @@ int main(void) {
                        (unsigned int)log.receivedPackets);
         (void)snprintf(irqMetric, sizeof(irqMetric), "%u",
                        (unsigned int)log.absoluteIrqCount);
-        drawMetricCard((Rectangle){24, 100, 259, 84}, "RX PACKETS", rxMetric, COLOR_BLUE);
-        drawMetricCard((Rectangle){295, 100, 259, 84}, "TX PACKETS", txMetric, COLOR_CYAN);
-        drawMetricCard((Rectangle){566, 100, 259, 84}, "RX IRQ CALLS", irqMetric, COLOR_PURPLE);
-        drawMetricCard((Rectangle){837, 100, 259, 84}, "TRANSPORT",
-                       handshake.pending ? "VERIFYING" : serial.connected
-                           ? (log.byteIrqMode ? "BYTE IRQ" : "DMA + IDLE")
-                           : "OFFLINE",
-                       serial.connected ? COLOR_CYAN : COLOR_MUTED);
+        if (drawMetricCard((Rectangle){24, 100, 259, 84}, "RX PACKETS",
+                           rxMetric, COLOR_BLUE)) {
+            log.receivedPackets = 0U;
+        }
+        if (drawMetricCard((Rectangle){295, 100, 259, 84}, "TX PACKETS",
+                           txMetric, COLOR_CYAN)) {
+            log.transmittedPackets = 0U;
+        }
+        if (drawMetricCard((Rectangle){566, 100, 259, 84}, "RX IRQ CALLS",
+                           irqMetric, COLOR_PURPLE)) {
+            log.absoluteIrqCount = 0U;
+        }
+        (void)drawMetricCard((Rectangle){837, 100, 259, 84}, "TRANSPORT",
+                             handshake.pending ? "VERIFYING" : serial.connected
+                                 ? (log.byteIrqMode ? "BYTE IRQ" : "DMA + IDLE")
+                                 : "OFFLINE",
+                             serial.connected ? COLOR_CYAN : COLOR_MUTED);
 
         drawPanel((Rectangle){24, 204, 1072, 136}, "CONNECTION");
         GuiLabel((Rectangle){44, 247, 50, 38}, "Port");
@@ -764,9 +814,10 @@ int main(void) {
                 }
             }
         }
-        GuiStatusBar((Rectangle){44, 298, 882, 28}, statusText);
+        GuiStatusBar((Rectangle){44, 298, 414, 28}, statusText);
+        drawUiText("Ring", 480, 305, 13, COLOR_MUTED);
+        drawUiText("DMA", 640, 305, 13, COLOR_MUTED);
         drawUiText("Native clipboard shortcuts enabled", 46, 329, 11, COLOR_MUTED);
-        const bool previousRxMode = log.byteIrqMode;
         const bool connectionReady = serial.connected && handshake.verified;
         if (!connectionReady) {
             GuiDisable();
@@ -776,10 +827,10 @@ int main(void) {
         if (!connectionReady) {
             GuiEnable();
         }
-        if (rxModeChanged && !sendRxModeRequest(
-                &serial, &log, log.byteIrqMode
-                    ? BLE_HCI_RX_MODE_BYTE_IRQ : BLE_HCI_RX_MODE_DMA)) {
-            log.byteIrqMode = previousRxMode;
+        if (rxModeChanged) {
+            log.receiveByteIrqActive = log.byteIrqMode;
+            appendLog(&log, "RX  Local receive mode: %s",
+                      log.byteIrqMode ? "per-byte IRQ" : "DMA batches");
         }
 
         drawPanel((Rectangle){24, 360, 1072, 216}, "HCI COMMAND BUILDER");
@@ -855,22 +906,28 @@ int main(void) {
         drawPanel((Rectangle){24, 740, 1072, 196}, "LIVE UART TRAFFIC");
         DrawRectangleRounded((Rectangle){44, 777, 1032, 142}, 0.04f, 6,
                              (Color){7, 11, 20, 255});
-        for (size_t index = 0U; index < log.count; index++) {
-            const Color color = strncmp(log.lines[index], "ERROR", 5U) == 0
-                ? (Color){255, 120, 120, 255}
-                : strncmp(log.lines[index], "TX", 2U) == 0
-                    ? (Color){100, 190, 255, 255}
-                    : strncmp(log.lines[index], "RX", 2U) == 0
-                        ? (Color){105, 225, 150, 255}
-                        : (Color){190, 198, 210, 255};
-            drawUiText(log.lines[index], 58, 786 + (int)index * 15, 13, color);
-        }
+        AppDashboardLog_Draw(&log.messages,
+                             (Rectangle){58, 786, 1004, 135}, uiFont,
+                             13.0f, 15.0f, clientLogColor);
 
         /* Draw last so the expanded selector overlays the traffic panel. */
         (void)AppDashboard_UpwardDropdown(
             (Rectangle){392, 638, 132, 42}, uiFont, bulkSizeOptions,
             sizeof(bulkSizeOptions) / sizeof(bulkSizeOptions[0]),
             &bulkSizeIndex, &bulkSizeDropdown);
+        const bool ringSizeChanged = AppDashboard_UpwardDropdown(
+            (Rectangle){520, 298, 100, 28}, uiFont, ringBufferOptions,
+            sizeof(ringBufferOptions) / sizeof(ringBufferOptions[0]),
+            &ringSizeIndex, &ringSizeDropdown);
+        const bool dmaSizeChanged = AppDashboard_UpwardDropdown(
+            (Rectangle){680, 298, 100, 28}, uiFont, dmaBufferOptions,
+            sizeof(dmaBufferOptions) / sizeof(dmaBufferOptions[0]),
+            &dmaSizeIndex, &dmaSizeDropdown);
+        if (ringSizeChanged || dmaSizeChanged) {
+            appendLog(&log, "RX  Buffers: ring=%u bytes, DMA=%u bytes",
+                      (unsigned int)ringBufferPresets[ringSizeIndex].size,
+                      (unsigned int)dmaBufferPresets[dmaSizeIndex].size);
+        }
         EndDrawing();
     }
 

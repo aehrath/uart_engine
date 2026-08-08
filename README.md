@@ -59,11 +59,11 @@ cross-compilation builds may explicitly omit documentation with
 See [`apps/README.md`](apps/README.md) for the C server and clients, and
 [`python/README.md`](python/README.md) for the Python client.
 
-All graphical apps expose the same synchronized **Per-byte IRQ** toggle. The
-default receive path uses circular DMA plus UART IDLE notification; the optional
-path stores each byte from RXNE in the same ring buffer. A typed HCI vendor
-command/event exchange keeps the server dashboard and connected client state in
-sync.
+All graphical apps expose an application-local **Per-byte IRQ** toggle. The
+default path counts one receiver IRQ for each completed DMA/read transaction;
+the optional path counts one RXNE receiver IRQ for every received wire byte.
+Ring-buffer capacity and DMA transaction size are independently selectable in
+each dashboard.
 
 The graphical server can also originate the same HCI, raw H4, 128-byte, and
 selectable large test traffic as the clients. Its live metrics include the
@@ -79,4 +79,5 @@ dark instrument-panel layout.
 IRQ counters are deliberately application-local rather than synchronized over
 HCI. Dashboards show a cumulative process-lifetime value, while logs show a
 fresh per-packet value once an ordinary packet—or an entire chunked test
-transmission—has completed.
+transmission—has completed. Each graphical log retains 256 lines and supports
+mouse-wheel or scrollbar navigation without forcing a user back to the tail.

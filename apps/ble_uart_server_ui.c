@@ -2,6 +2,7 @@
  * @brief Portable graphical supervisor for the continuous BLE UART server. */
 #include "raylib.h"
 #include "dashboard_dropdown.h"
+#include "dashboard_log.h"
 #include "h4_wire.h"
 #include "test_transfer_protocol.h"
 #include "uart_dma/app_version.h"
@@ -22,8 +23,6 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-#define MAX_LOG_LINES       11U
-#define MAX_LOG_LENGTH      220U
 #define PROCESS_BUFFER_SIZE 2048U
 
 static Font uiFont;
@@ -125,6 +124,14 @@ typedef struct {
     uint32_t size;
 } BulkSizePreset_t;
 
+/** One runtime receive-buffer choice. */
+typedef struct {
+    /** Human-readable size. */
+    const char *label;
+    /** Capacity in bytes. */
+    uint32_t size;
+} BufferSizePreset_t;
+
 static const Preset_t presets[] = {
     {"HCI Reset",           0x0C03U, {0U},             0U},
     {"Read Local Version",  0x1001U, {0U},             0U},
@@ -150,16 +157,25 @@ static const char *const bulkSizeOptions[] = {
     "16 KiB", "64 KiB", "128 KiB", "512 KiB", "1 MiB",
     "2 MiB", "4 MiB", "8 MiB", "16 MiB",
 };
+static const BufferSizePreset_t ringBufferPresets[] = {
+    {"256 B", 256U}, {"1 KiB", 1024U}, {"4 KiB", 4096U},
+    {"16 KiB", 16U * 1024U}, {"64 KiB", 64U * 1024U},
+};
+static const char *const ringBufferOptions[] = {
+    "256 B", "1 KiB", "4 KiB", "16 KiB", "64 KiB",
+};
+static const BufferSizePreset_t dmaBufferPresets[] = {
+    {"32 B", 32U}, {"64 B", 64U}, {"128 B", 128U}, {"256 B", 256U},
+    {"512 B", 512U}, {"1 KiB", 1024U}, {"4 KiB", 4096U},
+};
+static const char *const dmaBufferOptions[] = {
+    "32 B", "64 B", "128 B", "256 B", "512 B", "1 KiB", "4 KiB",
+};
 static const char presetOptions[] =
     "HCI Reset;Read Local Version;Read BD_ADDR;LE Read Buffer Size;LE Enable Scan;LE Disable Scan";
 
-/** Fixed-height rolling server log. */
-typedef struct {
-    /** Render-ready lines. */
-    char lines[MAX_LOG_LINES][MAX_LOG_LENGTH];
-    /** Number of populated lines. */
-    size_t count;
-} ServerLog_t;
+/** Retained scrollable server log. */
+typedef AppDashboardLog_t ServerLog_t;
 
 /** Child-process and partial-line state for the server engine. */
 typedef struct {
@@ -193,12 +209,22 @@ typedef struct {
     bool byteIrqMode;
     /** Actual number of RXNE interrupts serviced by the UART ISR. */
     uint32_t rxInterruptCount;
+    /** RX packet total hidden by the most recent dashboard reset. */
+    unsigned int receivedCommandsBaseline;
+    /** TX activity total hidden by the most recent dashboard reset. */
+    unsigned int transmittedEventsBaseline;
+    /** RX interrupt total hidden by the most recent dashboard reset. */
+    uint32_t rxInterruptBaseline;
     /** Logical bytes sent by a dashboard-originated test transfer. */
     uint32_t testSent;
     /** Requested dashboard-originated test-transfer size. */
     uint32_t testTotal;
     /** Whether the server is currently generating test chunks. */
     bool testActive;
+    /** Active circular ring capacity. */
+    uint32_t ringBufferSize;
+    /** Active simulated RX DMA transaction size. */
+    uint32_t dmaBufferSize;
 } ServerState_t;
 
 /** Return whether the platform clipboard modifier is currently held. */
@@ -248,15 +274,17 @@ static void drawClipboardTextBox(Rectangle bounds, char *text, size_t capacity,
     }
 }
 
-/** Append one server log line, evicting the oldest line when full. */
+/** Append one server log line. */
 static void appendLog(ServerLog_t *log, const char *line) {
-    if (log->count == MAX_LOG_LINES) {
-        memmove(log->lines, &log->lines[1],
-                (MAX_LOG_LINES - 1U) * sizeof(log->lines[0]));
-        log->count--;
-    }
-    (void)snprintf(log->lines[log->count], MAX_LOG_LENGTH, "%s", line);
-    log->count++;
+    AppDashboardLog_Append(log, "%s", line);
+}
+
+/** Select the established traffic color for one retained server log line. */
+static Color serverLogColor(const char *line) {
+    return strncmp(line, "ERROR", 5U) == 0 ? (Color){255, 120, 120, 255}
+        : strncmp(line, "RX DMA", 6U) == 0 ? (Color){100, 190, 255, 255}
+        : strncmp(line, "TX DMA", 6U) == 0 ? (Color){105, 225, 150, 255}
+        : (Color){190, 198, 210, 255};
 }
 
 /** Update metrics and connection state from one complete engine log line. */
@@ -277,6 +305,16 @@ static void handleServerLine(ServerLog_t *log, ServerState_t *state,
     unsigned int total = 0U;
     unsigned int transmissionIrqs = 0U;
     if (sscanf(line, "RX IRQ COUNT -> %u", &parsed) == 1) {
+        state->rxInterruptCount = parsed;
+        return;
+    } else if (sscanf(line, "RX BUFFERS -> ring=%u dma=%u",
+                      &parsed, &total) == 2) {
+        state->ringBufferSize = parsed;
+        state->dmaBufferSize = total;
+        return;
+    } else if (sscanf(line,
+                      "RX IRQ PROGRESS -> absolute=%u transmission=%u",
+                      &parsed, &transmissionIrqs) == 2) {
         state->rxInterruptCount = parsed;
         return;
     } else if (sscanf(line,
@@ -388,6 +426,9 @@ static bool startServer(ServerProcess_t *process, ServerLog_t *log,
     state->exitStatus = 0;
     state->byteIrqMode = false;
     state->rxInterruptCount = 0U;
+    state->receivedCommandsBaseline = 0U;
+    state->transmittedEventsBaseline = 0U;
+    state->rxInterruptBaseline = 0U;
     state->testSent = 0U;
     state->testTotal = 0U;
     state->testActive = false;
@@ -518,14 +559,19 @@ static bool startServerTest(ServerProcess_t *process, ServerLog_t *log,
     return true;
 }
 
-/** Render one dashboard metric card. */
-static void drawMetricCard(Rectangle bounds, const char *label,
+/** Render one dashboard metric card and report a completed click. */
+static bool drawMetricCard(Rectangle bounds, const char *label,
                            const char *value, Color accent) {
+    const bool hovered = CheckCollisionPointRec(GetMousePosition(), bounds);
     DrawRectangleRounded(bounds, 0.12f, 10, COLOR_PANEL_RAISED);
+    if (hovered) {
+        DrawRectangleRoundedLinesEx(bounds, 0.12f, 10, 1.0f, accent);
+    }
     DrawRectangleRounded((Rectangle){bounds.x, bounds.y, 5.0f, bounds.height},
                          0.5f, 4, accent);
     drawUiText(label, (int)bounds.x + 18, (int)bounds.y + 14, 14, COLOR_MUTED);
     drawDisplayText(value, (int)bounds.x + 18, (int)bounds.y + 42, 25, COLOR_TEXT);
+    return hovered && IsMouseButtonReleased(MOUSE_BUTTON_LEFT);
 }
 
 /** Draw a rounded high-contrast action button and report a completed click. */
@@ -563,8 +609,9 @@ int main(void) {
     loadUiFont();
 
     ServerProcess_t process = {0, -1, -1, false, false, {0}, 0U};
-    ServerState_t state = {{0}, 0U, 0U, 0, false, 0U, 0U, 0U, false};
-    ServerLog_t log = {{{0}}, 0U};
+    ServerState_t state = {0};
+    ServerLog_t log;
+    AppDashboardLog_Init(&log);
     char opcodeText[16] = "0C03";
     char parametersText[768] = "";
     char rawText[1024] = "04 0E 04 01 03 0C 00";
@@ -573,9 +620,13 @@ int main(void) {
     bool rawEdit = false;
     bool presetDropdown = false;
     bool bulkSizeDropdown = false;
+    bool ringSizeDropdown = false;
+    bool dmaSizeDropdown = false;
     int presetIndex = 0;
     int previousPreset = 0;
     int bulkSizeIndex = 5;
+    int ringSizeIndex = 1;
+    int dmaSizeIndex = 3;
     unsigned int statsFrame = 0U;
     presetToFields(0, opcodeText, sizeof(opcodeText),
                    parametersText, sizeof(parametersText));
@@ -609,30 +660,55 @@ int main(void) {
         char rxValue[32];
         char txValue[32];
         char irqValue[32];
-        (void)snprintf(rxValue, sizeof(rxValue), "%u", state.receivedCommands);
-        (void)snprintf(txValue, sizeof(txValue), "%u", state.transmittedEvents);
+        const unsigned int visibleRx = state.receivedCommands >= state.receivedCommandsBaseline
+            ? state.receivedCommands - state.receivedCommandsBaseline : state.receivedCommands;
+        const unsigned int visibleTx = state.transmittedEvents >= state.transmittedEventsBaseline
+            ? state.transmittedEvents - state.transmittedEventsBaseline : state.transmittedEvents;
+        const uint32_t visibleIrq = state.rxInterruptCount >= state.rxInterruptBaseline
+            ? state.rxInterruptCount - state.rxInterruptBaseline : state.rxInterruptCount;
+        (void)snprintf(rxValue, sizeof(rxValue), "%u", visibleRx);
+        (void)snprintf(txValue, sizeof(txValue), "%u", visibleTx);
         (void)snprintf(irqValue, sizeof(irqValue), "%u",
-                       (unsigned int)state.rxInterruptCount);
-        drawMetricCard((Rectangle){24, 100, 259, 84}, "RX PACKETS", rxValue, COLOR_BLUE);
-        drawMetricCard((Rectangle){295, 100, 259, 84}, "TX ACTIVITY", txValue, COLOR_CYAN);
-        drawMetricCard((Rectangle){566, 100, 259, 84}, "RX IRQ CALLS", irqValue, COLOR_PURPLE);
-        drawMetricCard((Rectangle){837, 100, 259, 84}, "TRANSPORT",
-                       process.running
-                           ? (state.byteIrqMode ? "BYTE IRQ" : "DMA + IDLE")
-                           : "OFFLINE",
-                       serverColor);
+                       (unsigned int)visibleIrq);
+        if (drawMetricCard((Rectangle){24, 100, 259, 84}, "RX PACKETS",
+                           rxValue, COLOR_BLUE)) {
+            state.receivedCommandsBaseline = state.receivedCommands;
+        }
+        if (drawMetricCard((Rectangle){295, 100, 259, 84}, "TX ACTIVITY",
+                           txValue, COLOR_CYAN)) {
+            state.transmittedEventsBaseline = state.transmittedEvents;
+        }
+        if (drawMetricCard((Rectangle){566, 100, 259, 84}, "RX IRQ CALLS",
+                           irqValue, COLOR_PURPLE)) {
+            state.rxInterruptBaseline = state.rxInterruptCount;
+        }
+        (void)drawMetricCard((Rectangle){837, 100, 259, 84}, "TRANSPORT",
+                             process.running
+                                 ? (state.byteIrqMode ? "BYTE IRQ" : "DMA + IDLE")
+                                 : "OFFLINE",
+                             serverColor);
 
         drawPanel((Rectangle){24, 204, 1072, 136}, "SERVER CONTROL");
         DrawCircle(50, 255, 7.0f, serverColor);
         drawUiText(process.running ? (process.stopping ? "Stopping engine" : "Server running")
                                    : "Server stopped",
                    68, 244, 18, COLOR_TEXT);
+        drawUiText("Ring", 430, 247, 13, COLOR_MUTED);
+        drawUiText("DMA", 620, 247, 13, COLOR_MUTED);
         if (brightButton((Rectangle){876, 232, 200, 40},
                          process.running ? "Stop server" : "Start server", true)) {
             if (process.running) {
                 requestServerStop(&process, &log);
             } else {
-                (void)startServer(&process, &log, &state);
+                if (startServer(&process, &log, &state)) {
+                    char command[48];
+                    (void)snprintf(command, sizeof(command), "ring %u\n",
+                                   (unsigned int)ringBufferPresets[ringSizeIndex].size);
+                    (void)sendServerCommand(&process, command);
+                    (void)snprintf(command, sizeof(command), "dma-buffer %u\n",
+                                   (unsigned int)dmaBufferPresets[dmaSizeIndex].size);
+                    (void)sendServerCommand(&process, command);
+                }
             }
         }
         GuiLabel((Rectangle){44, 289, 122, 38}, "Pseudo-UART");
@@ -756,22 +832,34 @@ int main(void) {
         drawPanel((Rectangle){24, 740, 1072, 196}, "LIVE DMA / HCI TRAFFIC");
         DrawRectangleRounded((Rectangle){44, 777, 1032, 142}, 0.04f, 6,
                              (Color){7, 11, 20, 255});
-        for (size_t index = 0U; index < log.count; index++) {
-            const Color color = strncmp(log.lines[index], "ERROR", 5U) == 0
-                ? (Color){255, 120, 120, 255}
-                : strncmp(log.lines[index], "RX DMA", 6U) == 0
-                    ? (Color){100, 190, 255, 255}
-                    : strncmp(log.lines[index], "TX DMA", 6U) == 0
-                        ? (Color){105, 225, 150, 255}
-                        : (Color){190, 198, 210, 255};
-            drawUiText(log.lines[index], 58, 786 + (int)index * 15, 13, color);
-        }
+        AppDashboardLog_Draw(&log, (Rectangle){58, 786, 1004, 135}, uiFont,
+                             13.0f, 15.0f, serverLogColor);
 
         /* Draw dropdowns last so their expanded lists overlay lower panels. */
         (void)AppDashboard_UpwardDropdown(
             (Rectangle){392, 638, 132, 42}, uiFont, bulkSizeOptions,
             sizeof(bulkSizeOptions) / sizeof(bulkSizeOptions[0]),
             &bulkSizeIndex, &bulkSizeDropdown);
+        const bool ringSizeChanged = AppDashboard_UpwardDropdown(
+            (Rectangle){470, 238, 120, 34}, uiFont, ringBufferOptions,
+            sizeof(ringBufferOptions) / sizeof(ringBufferOptions[0]),
+            &ringSizeIndex, &ringSizeDropdown);
+        const bool dmaSizeChanged = AppDashboard_UpwardDropdown(
+            (Rectangle){660, 238, 120, 34}, uiFont, dmaBufferOptions,
+            sizeof(dmaBufferOptions) / sizeof(dmaBufferOptions[0]),
+            &dmaSizeIndex, &dmaSizeDropdown);
+        if (process.running && ringSizeChanged) {
+            char command[48];
+            (void)snprintf(command, sizeof(command), "ring %u\n",
+                           (unsigned int)ringBufferPresets[ringSizeIndex].size);
+            (void)sendServerCommand(&process, command);
+        }
+        if (process.running && dmaSizeChanged) {
+            char command[48];
+            (void)snprintf(command, sizeof(command), "dma-buffer %u\n",
+                           (unsigned int)dmaBufferPresets[dmaSizeIndex].size);
+            (void)sendServerCommand(&process, command);
+        }
         EndDrawing();
     }
 
