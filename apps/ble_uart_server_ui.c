@@ -1,6 +1,7 @@
 /** @file
  * @brief Portable graphical supervisor for the continuous BLE UART server. */
 #include "raylib.h"
+#include "dashboard_font.h"
 #include "dashboard_dropdown.h"
 #include "dashboard_log.h"
 #include "h4_wire.h"
@@ -26,9 +27,7 @@
 #define PROCESS_BUFFER_SIZE 2048U
 
 static Font uiFont;
-static Font displayFont;
-static bool customUiFont;
-static bool customDisplayFont;
+static AppDashboardFontSet_t dashboardFonts;
 
 static const Color COLOR_CANVAS = {10, 15, 28, 255};
 static const Color COLOR_PANEL = {20, 28, 46, 255};
@@ -44,14 +43,12 @@ static const Color COLOR_PURPLE = {167, 139, 250, 255};
 static void loadUiFont(void) {
     const char *path = TextFormat("%s%s", GetApplicationDirectory(),
                                   UART_DMA_UI_FONT_FILE);
-    uiFont = LoadFontEx(path, 36, NULL, 0);
-    customUiFont = uiFont.texture.id != 0U;
-    if (!customUiFont) {
-        uiFont = GetFontDefault();
-    }
-    SetTextureFilter(uiFont.texture, TEXTURE_FILTER_BILINEAR);
+    const char *displayPath = TextFormat("%s%s", GetApplicationDirectory(),
+                                         UART_DMA_UI_DISPLAY_FONT_FILE);
+    AppDashboardFont_Load(&dashboardFonts, path, displayPath);
+    uiFont = AppDashboardFont_Regular(&dashboardFonts, 15);
     GuiSetFont(uiFont);
-    GuiSetStyle(DEFAULT, TEXT_SIZE, 17);
+    GuiSetStyle(DEFAULT, TEXT_SIZE, AppDashboardFont_RenderSize(15));
     GuiSetStyle(DEFAULT, BORDER_WIDTH, 1);
     GuiSetStyle(DEFAULT, TEXT_PADDING, 10);
     GuiSetStyle(DEFAULT, BORDER_COLOR_NORMAL, ColorToInt(COLOR_BORDER));
@@ -72,26 +69,31 @@ static void loadUiFont(void) {
     GuiSetStyle(DROPDOWNBOX, TEXT_COLOR_FOCUSED, ColorToInt((Color){7, 22, 28, 255}));
     GuiSetStyle(DROPDOWNBOX, BASE_COLOR_PRESSED, ColorToInt(COLOR_BLUE));
     GuiSetStyle(DROPDOWNBOX, TEXT_COLOR_PRESSED, ColorToInt(WHITE));
+    GuiSetStyle(TEXTBOX, BORDER_WIDTH, 0);
+    GuiSetStyle(TEXTBOX, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
+    GuiSetStyle(TEXTBOX, TEXT_PADDING, 10);
+    GuiSetStyle(TEXTBOX, BASE_COLOR_NORMAL, ColorToInt(BLANK));
+    GuiSetStyle(TEXTBOX, BASE_COLOR_FOCUSED, ColorToInt(BLANK));
+    GuiSetStyle(TEXTBOX, BASE_COLOR_PRESSED, ColorToInt(BLANK));
+    GuiSetStyle(STATUSBAR, BORDER_WIDTH, 0);
+    GuiSetStyle(STATUSBAR, TEXT_ALIGNMENT, TEXT_ALIGN_LEFT);
+    GuiSetStyle(STATUSBAR, TEXT_PADDING, 10);
+    GuiSetStyle(STATUSBAR, BASE_COLOR_NORMAL, ColorToInt(BLANK));
 
-    const char *displayPath = TextFormat("%s%s", GetApplicationDirectory(),
-                                         UART_DMA_UI_DISPLAY_FONT_FILE);
-    displayFont = LoadFontEx(displayPath, 42, NULL, 0);
-    customDisplayFont = displayFont.texture.id != 0U;
-    if (!customDisplayFont) {
-        displayFont = uiFont;
-    }
-    SetTextureFilter(displayFont.texture, TEXTURE_FILTER_BILINEAR);
 }
 
 /** Draw antialiased text using the shared UI typeface. */
 static void drawUiText(const char *text, int x, int y, int size, Color color) {
-    DrawTextEx(uiFont, text, (Vector2){(float)x, (float)y}, (float)size, 0.0f, color);
+    const Font font = AppDashboardFont_Regular(&dashboardFonts, size);
+    DrawTextEx(font, text, (Vector2){(float)x, (float)y},
+               (float)AppDashboardFont_RenderSize(size), 0.0f, color);
 }
 
 /** Draw title and metric text using the technical display face. */
 static void drawDisplayText(const char *text, int x, int y, int size, Color color) {
-    DrawTextEx(displayFont, text, (Vector2){(float)x, (float)y},
-               (float)size, 0.5f, color);
+    const Font font = AppDashboardFont_Bold(&dashboardFonts, size);
+    DrawTextEx(font, text, (Vector2){(float)x, (float)y},
+               (float)AppDashboardFont_RenderSize(size), 0.5f, color);
 }
 
 /** Draw one rounded dashboard panel with an optional section title. */
@@ -100,8 +102,42 @@ static void drawPanel(Rectangle bounds, const char *title) {
     DrawRectangleRoundedLinesEx(bounds, 0.08f, 10, 1.0f, COLOR_BORDER);
     if (title != NULL) {
         drawDisplayText(title, (int)bounds.x + 20, (int)bounds.y + 15,
-                        16, COLOR_MUTED);
+                        14, COLOR_MUTED);
     }
+}
+
+/** Draw the shared slightly-rounded field surface. */
+static void drawFieldSurface(Rectangle bounds, bool focused) {
+    DrawRectangleRounded(bounds, 16.0f / bounds.height, 12, COLOR_PANEL_RAISED);
+    DrawRectangleRoundedLinesEx(bounds, 16.0f / bounds.height, 12, 1.0f,
+                                focused ? COLOR_CYAN : COLOR_BORDER);
+}
+
+/** Draw one left-aligned, non-editable field. */
+static void drawStatusField(Rectangle bounds, const char *text) {
+    drawFieldSurface(bounds, false);
+    GuiStatusBar((Rectangle){bounds.x + 1.0f, bounds.y + 1.0f,
+                             bounds.width - 2.0f, bounds.height - 2.0f}, text);
+}
+
+/** Draw the shared rounded receive-mode toggle and report a state change. */
+static bool toggleControl(Rectangle bounds, const char *label,
+                          bool *value, bool enabled) {
+    const bool hovered = enabled && CheckCollisionPointRec(GetMousePosition(), bounds);
+    const Rectangle track = {bounds.x, bounds.y + 2.0f, 38.0f, 20.0f};
+    const Color trackColor = *value && enabled ? COLOR_CYAN
+        : hovered ? (Color){50, 72, 111, 255} : (Color){37, 52, 81, 255};
+    DrawRectangleRounded(track, 1.0f, 12, trackColor);
+    DrawCircle((int)(track.x + (*value ? 29.0f : 9.0f)),
+               (int)(track.y + 10.0f), 8.0f,
+               *value && enabled ? (Color){7, 22, 28, 255} : COLOR_MUTED);
+    drawUiText(label, (int)bounds.x + 46, (int)bounds.y + 2, 15,
+               enabled ? COLOR_TEXT : (Color){94, 107, 127, 255});
+    if (hovered && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+        *value = !*value;
+        return true;
+    }
+    return false;
 }
 
 /** HCI command preset mirrored from the client applications. */
@@ -140,6 +176,10 @@ static const Preset_t presets[] = {
     {"LE Enable Scan",      0x200CU, {0x01U, 0x00U},  2U},
     {"LE Disable Scan",     0x200CU, {0x00U, 0x00U},  2U},
 };
+static const char *const presetOptions[] = {
+    "HCI Reset", "Read Local Version", "Read BD_ADDR",
+    "LE Read Buffer Size", "LE Enable Scan", "LE Disable Scan",
+};
 
 static const BulkSizePreset_t bulkSizePresets[] = {
     {"16 KiB",  16U * 1024U},
@@ -171,8 +211,6 @@ static const BufferSizePreset_t dmaBufferPresets[] = {
 static const char *const dmaBufferOptions[] = {
     "32 B", "64 B", "128 B", "256 B", "512 B", "1 KiB", "4 KiB",
 };
-static const char presetOptions[] =
-    "HCI Reset;Read Local Version;Read BD_ADDR;LE Read Buffer Size;LE Enable Scan;LE Disable Scan";
 
 /** Retained scrollable server log. */
 typedef AppDashboardLog_t ServerLog_t;
@@ -269,7 +307,10 @@ static void drawClipboardTextBox(Rectangle bounds, char *text, size_t capacity,
     } else if (paste) {
         pasteClipboardText(text, capacity);
     }
-    if (GuiTextBox(bounds, text, (int)capacity, shortcut ? false : *editing)) {
+    drawFieldSurface(bounds, *editing);
+    const Rectangle content = {bounds.x + 1.0f, bounds.y + 1.0f,
+                               bounds.width - 2.0f, bounds.height - 2.0f};
+    if (GuiTextBox(content, text, (int)capacity, shortcut ? false : *editing)) {
         *editing = !*editing;
     }
 }
@@ -563,14 +604,15 @@ static bool startServerTest(ServerProcess_t *process, ServerLog_t *log,
 static bool drawMetricCard(Rectangle bounds, const char *label,
                            const char *value, Color accent) {
     const bool hovered = CheckCollisionPointRec(GetMousePosition(), bounds);
-    DrawRectangleRounded(bounds, 0.12f, 10, COLOR_PANEL_RAISED);
+    DrawRectangleRounded(bounds, 0.30f, 12, COLOR_PANEL_RAISED);
     if (hovered) {
-        DrawRectangleRoundedLinesEx(bounds, 0.12f, 10, 1.0f, accent);
+        DrawRectangleRoundedLinesEx(bounds, 0.30f, 12, 1.0f, accent);
     }
-    DrawRectangleRounded((Rectangle){bounds.x, bounds.y, 5.0f, bounds.height},
-                         0.5f, 4, accent);
-    drawUiText(label, (int)bounds.x + 18, (int)bounds.y + 14, 14, COLOR_MUTED);
-    drawDisplayText(value, (int)bounds.x + 18, (int)bounds.y + 42, 25, COLOR_TEXT);
+    DrawRectangleRounded((Rectangle){bounds.x + 18.0f, bounds.y + 14.0f,
+                                     4.0f, 55.0f},
+                         1.0f, 8, accent);
+    drawDisplayText(label, (int)bounds.x + 34, (int)bounds.y + 14, 12, COLOR_MUTED);
+    drawDisplayText(value, (int)bounds.x + 34, (int)bounds.y + 42, 22, COLOR_TEXT);
     return hovered && IsMouseButtonReleased(MOUSE_BUTTON_LEFT);
 }
 
@@ -582,19 +624,12 @@ static bool brightButton(Rectangle bounds, const char *label, bool enabled) {
         : pressed ? (Color){34, 197, 181, 255}
         : hovered ? (Color){103, 232, 249, 255}
         : (Color){45, 212, 191, 255};
-    DrawRectangleRounded(bounds, 0.34f, 12, fill);
-    if (enabled) {
-        DrawRectangleRoundedLinesEx(bounds, 0.34f, 12, 1.0f,
-                                    hovered ? (Color){207, 250, 254, 255}
-                                            : (Color){94, 234, 212, 255});
-    }
-    const int fontSize = 16;
-    const Vector2 measured = MeasureTextEx(uiFont, label, (float)fontSize, 0.0f);
-    DrawTextEx(uiFont, label,
-               (Vector2){bounds.x + (bounds.width - measured.x) * 0.5f,
-                         bounds.y + (bounds.height - measured.y) * 0.5f - 1.0f},
-               (float)fontSize, 0.0f,
-               enabled ? (Color){7, 22, 28, 255} : (Color){94, 107, 127, 255});
+    DrawRectangleRounded(bounds, 16.0f / bounds.height, 12, fill);
+    const int fontSize = AppDashboardFont_RenderSize(16);
+    const Font font = AppDashboardFont_Bold(&dashboardFonts, 16);
+    AppDashboardFont_DrawCentered(
+        font, label, bounds, (float)fontSize,
+        enabled ? (Color){7, 22, 28, 255} : (Color){94, 107, 127, 255});
     return enabled && hovered && IsMouseButtonReleased(MOUSE_BUTTON_LEFT);
 }
 
@@ -603,6 +638,7 @@ int main(void) {
     char windowTitle[96];
     (void)snprintf(windowTitle, sizeof(windowTitle), "BLE UART Server v%s",
                    UART_DMA_APP_VERSION);
+    SetConfigFlags(FLAG_WINDOW_HIGHDPI | FLAG_MSAA_4X_HINT);
     InitWindow(1120, 960, windowTitle);
     SetWindowMinSize(980, 820);
     SetTargetFPS(60);
@@ -650,9 +686,9 @@ int main(void) {
         char heading[96];
         (void)snprintf(heading, sizeof(heading), "BLE UART DMA Server  v%s",
                        UART_DMA_APP_VERSION);
-        drawDisplayText(heading, 28, 22, 32, COLOR_TEXT);
+        drawDisplayText(heading, 28, 22, 28, COLOR_TEXT);
         drawUiText("FREERTOS ENGINE  /  CIRCULAR RX DMA  /  LIVE HCI TELEMETRY",
-                   30, 62, 14, COLOR_MUTED);
+                   30, 62, 12, COLOR_MUTED);
 
         const Color serverColor = process.running
             ? (process.stopping ? (Color){240, 170, 60, 255} : (Color){45, 185, 105, 255})
@@ -693,8 +729,8 @@ int main(void) {
         drawUiText(process.running ? (process.stopping ? "Stopping engine" : "Server running")
                                    : "Server stopped",
                    68, 244, 18, COLOR_TEXT);
-        drawUiText("Ring", 430, 247, 13, COLOR_MUTED);
-        drawUiText("DMA", 620, 247, 13, COLOR_MUTED);
+        drawUiText("Ring", 430, 247, 12, COLOR_MUTED);
+        drawUiText("DMA", 620, 247, 12, COLOR_MUTED);
         if (brightButton((Rectangle){876, 232, 200, 40},
                          process.running ? "Stop server" : "Start server", true)) {
             if (process.running) {
@@ -712,8 +748,9 @@ int main(void) {
             }
         }
         GuiLabel((Rectangle){44, 289, 122, 38}, "Pseudo-UART");
-        GuiStatusBar((Rectangle){170, 289, 570, 38},
-                     state.port[0] != '\0' ? state.port : "Start the server to create a port");
+        drawStatusField((Rectangle){170, 289, 570, 38},
+                        state.port[0] != '\0'
+                            ? state.port : "Start the server to create a port");
         if (brightButton((Rectangle){758, 289, 152, 38}, "Copy port",
                          state.port[0] != '\0')) {
             if (state.port[0] != '\0') {
@@ -722,14 +759,9 @@ int main(void) {
             }
         }
         const bool previousMode = state.byteIrqMode;
-        if (!process.running) {
-            GuiDisable();
-        }
-        const bool modeChanged = GuiCheckBox((Rectangle){942, 296, 24, 24},
-                                             "Per-byte IRQ", &state.byteIrqMode) != 0;
-        if (!process.running) {
-            GuiEnable();
-        }
+        const bool modeChanged = toggleControl(
+            (Rectangle){942, 296, 134, 24}, "Per-byte IRQ",
+            &state.byteIrqMode, process.running);
         if (modeChanged && !sendServerMode(&process, state.byteIrqMode)) {
             state.byteIrqMode = previousMode;
             appendLog(&log, "ERROR  Unable to send receive-mode request");
@@ -737,10 +769,6 @@ int main(void) {
 
         drawPanel((Rectangle){24, 360, 1072, 216}, "HCI COMMAND BUILDER");
         GuiLabel((Rectangle){44, 397, 64, 38}, "Preset");
-        if (GuiDropdownBox((Rectangle){112, 397, 360, 38}, presetOptions,
-                           &presetIndex, presetDropdown)) {
-            presetDropdown = !presetDropdown;
-        }
         if (presetIndex != previousPreset) {
             presetToFields(presetIndex, opcodeText, sizeof(opcodeText),
                            parametersText, sizeof(parametersText));
@@ -819,23 +847,29 @@ int main(void) {
         }
         const float progress = state.testTotal == 0U ? 0.0f
             : (float)state.testSent / (float)state.testTotal;
-        DrawRectangleRounded((Rectangle){792, 638, 284, 16}, 0.5f, 6,
+        DrawRectangleRounded((Rectangle){792, 638, 284, 16}, 1.0f, 12,
                              (Color){35, 45, 65, 255});
         DrawRectangleRounded((Rectangle){792, 638, 284.0f * progress, 16},
-                             0.5f, 6, COLOR_BLUE);
+                             1.0f, 12, COLOR_BLUE);
         char progressText[96];
         (void)snprintf(progressText, sizeof(progressText), "%u / %u bytes",
                        (unsigned int)state.testSent,
                        (unsigned int)state.testTotal);
-        drawUiText(progressText, 792, 665, 14, COLOR_MUTED);
+        drawUiText(progressText, 792, 665, 12, COLOR_MUTED);
 
         drawPanel((Rectangle){24, 740, 1072, 196}, "LIVE DMA / HCI TRAFFIC");
-        DrawRectangleRounded((Rectangle){44, 777, 1032, 142}, 0.04f, 6,
+        DrawRectangleRounded((Rectangle){44, 777, 1032, 142}, 16.0f / 142.0f, 12,
                              (Color){7, 11, 20, 255});
-        AppDashboardLog_Draw(&log, (Rectangle){58, 786, 1004, 135}, uiFont,
-                             13.0f, 15.0f, serverLogColor);
+        AppDashboardLog_Draw(&log, (Rectangle){58, 786, 1004, 135},
+                             AppDashboardFont_Regular(&dashboardFonts, 12),
+                             (float)AppDashboardFont_RenderSize(12),
+                             15.0f, serverLogColor);
 
         /* Draw dropdowns last so their expanded lists overlay lower panels. */
+        (void)AppDashboard_UpwardDropdown(
+            (Rectangle){112, 397, 360, 38}, uiFont, presetOptions,
+            sizeof(presetOptions) / sizeof(presetOptions[0]),
+            &presetIndex, &presetDropdown);
         (void)AppDashboard_UpwardDropdown(
             (Rectangle){392, 638, 132, 42}, uiFont, bulkSizeOptions,
             sizeof(bulkSizeOptions) / sizeof(bulkSizeOptions[0]),
@@ -869,12 +903,7 @@ int main(void) {
         close(process.outputDescriptor);
         close(process.inputDescriptor);
     }
-    if (customUiFont) {
-        UnloadFont(uiFont);
-    }
-    if (customDisplayFont) {
-        UnloadFont(displayFont);
-    }
+    AppDashboardFont_Unload(&dashboardFonts);
     CloseWindow();
     return 0;
 }

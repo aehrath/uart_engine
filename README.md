@@ -71,10 +71,14 @@ actual number of receive-byte IRQ handler invocations.
 
 Application releases are numbered from the repository [`VERSION`](VERSION)
 file. Every dashboard displays that version in its window title and heading.
-The native dashboards bundle Space Grotesk for a geometric, antialiased visual
-system, while the Python dashboard selects the closest native sans-serif UI
-family. All dashboards use bright rounded action controls against a layered
-dark instrument-panel layout.
+The native and Python dashboards select the same platform UI family: Avenir
+Next on macOS, Segoe UI on Windows, and DejaVu Sans on Linux. Native builds
+retain bundled Space Grotesk as a fallback. All dashboards use matching bright,
+8-pixel-radius buttons and fields against a layered dark instrument-panel
+layout; telemetry cards retain their roomier 13-pixel corners. Editable text is
+left-aligned, while button and dropdown values are centered. Native dashboards
+use high-DPI backing surfaces and DPI-scaled font atlases on Retina/HiDPI
+displays.
 
 IRQ counters are deliberately application-local rather than synchronized over
 HCI. Dashboards show a cumulative process-lifetime value, while logs show a

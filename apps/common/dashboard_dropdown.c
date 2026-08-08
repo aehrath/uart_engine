@@ -2,15 +2,12 @@
  * @brief Implementation of the shared upward-opening dashboard dropdown. */
 
 #include "dashboard_dropdown.h"
+#include "dashboard_font.h"
 
 /** Draw centered text inside one dropdown row. */
 static void drawCentered(Font font, const char *text, Rectangle bounds,
                          float font_size, Color color) {
-    const Vector2 size = MeasureTextEx(font, text, font_size, 0.0f);
-    DrawTextEx(font, text,
-               (Vector2){bounds.x + (bounds.width - size.x) * 0.5f,
-                         bounds.y + (bounds.height - size.y) * 0.5f - 1.0f},
-               font_size, 0.0f, color);
+    AppDashboardFont_DrawCentered(font, text, bounds, font_size, color);
 }
 
 bool AppDashboard_UpwardDropdown(Rectangle bounds, Font font,
@@ -58,9 +55,10 @@ bool AppDashboard_UpwardDropdown(Rectangle bounds, Font font,
             };
             const bool hovered = CheckCollisionPointRec(mouse, item_bounds);
             const bool is_selected = index == (size_t)*selected;
-            DrawRectangleRounded(item_bounds, 0.18f, 6,
+            DrawRectangleRounded(item_bounds, 16.0f / item_bounds.height, 12,
                                  hovered ? hover : is_selected ? chosen : row);
-            drawCentered(font, items[index], item_bounds, 16.0f,
+            drawCentered(font, items[index], item_bounds,
+                         (float)AppDashboardFont_RenderSize(15),
                          hovered ? dark_text : text);
             if (hovered && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
                 changed = *selected != (int)index;
@@ -70,14 +68,14 @@ bool AppDashboard_UpwardDropdown(Rectangle bounds, Font font,
         }
     }
 
-    DrawRectangleRounded(bounds, 0.22f, 8,
+    DrawRectangleRounded(bounds, 16.0f / bounds.height, 12,
                          field_hovered ? field_hover : field);
-    DrawRectangleRoundedLinesEx(bounds, 0.22f, 8, 1.0f,
+    DrawRectangleRoundedLinesEx(bounds, 16.0f / bounds.height, 12, 1.0f,
                                 field_hovered || *expanded ? border
                                                           : (Color){64, 85, 116, 255});
     drawCentered(font, items[*selected],
                  (Rectangle){bounds.x, bounds.y, bounds.width - 24.0f, bounds.height},
-                 16.0f, text);
+                 (float)AppDashboardFont_RenderSize(15), text);
     const float arrow_x = bounds.x + bounds.width - 15.0f;
     const float arrow_y = bounds.y + bounds.height * 0.5f;
     DrawTriangle((Vector2){arrow_x - 5.0f, arrow_y + 3.0f},

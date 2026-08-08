@@ -98,10 +98,14 @@ engine. Large transfers retain the same typed 255-byte H4/CRC frames but mirror
 the fast client sender by coalescing them into 64 KiB serial batches, avoiding
 thousands of host scheduler wakeups and writes.
 
-Both native dashboards display the repository release version and use the same
-bundled Space Grotesk family for legible, consistent controls and logs. Their
-shared telemetry row reports TX, RX, receive IRQ, and transport state above
-rounded high-contrast action controls.
+Both native dashboards display the repository release version and load the
+same platform UI family as the Python client: Avenir Next on macOS, Segoe UI on
+Windows, and DejaVu Sans on Linux, with bundled Space Grotesk as a fallback.
+Their shared telemetry row reports TX, RX, receive IRQ, and transport state
+above consistently styled controls. Every action, dropdown, editable field,
+status field, toggle, progress indicator, and log surface uses the shared
+rounded geometry and alignment rules. Native windows request high-DPI backing
+surfaces and rasterize their fonts at physical display resolution.
 
 The **Ring** selector changes the active circular receive capacity from 256 B
 through 64 KiB. The independent **DMA** selector changes a receive transaction

@@ -177,10 +177,11 @@ if(UART_DMA_BUILD_PORTABLE_UI)
     set(UART_DMA_UI_DISPLAY_FONT_SOURCE
         "${space_grotesk_SOURCE_DIR}/ttf/static/SpaceGrotesk-Bold.ttf")
 
-    add_executable(ble_uart_client_ui
-        apps/ble_uart_client_ui.c
-        apps/common/dashboard_dropdown.c
-        apps/common/dashboard_log.c)
+        add_executable(ble_uart_client_ui
+            apps/ble_uart_client_ui.c
+            apps/common/dashboard_font.c
+            apps/common/dashboard_dropdown.c
+            apps/common/dashboard_log.c)
     target_include_directories(ble_uart_client_ui PRIVATE "${raygui_SOURCE_DIR}/src")
     target_link_libraries(ble_uart_client_ui PRIVATE raylib ble_uart_app_common)
     target_compile_definitions(ble_uart_client_ui PRIVATE
@@ -220,6 +221,7 @@ if(UART_DMA_BUILD_PORTABLE_UI)
     if(UNIX AND TARGET ble_uart_server)
         add_executable(ble_uart_server_ui
             apps/ble_uart_server_ui.c
+            apps/common/dashboard_font.c
             apps/common/dashboard_dropdown.c
             apps/common/dashboard_log.c)
         add_dependencies(ble_uart_server_ui ble_uart_server)

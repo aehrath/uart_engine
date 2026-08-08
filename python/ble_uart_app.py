@@ -88,7 +88,7 @@ def run_gui() -> None:
             enabled = self._state != tk.DISABLED
             fill = "#67E8F9" if enabled and self._hovered else (
                 "#2DD4BF" if enabled else "#273143")
-            radius = 13
+            radius = 8
             self.create_rectangle(radius, 0, self._width - radius, self._height,
                                   fill=fill, outline=fill)
             self.create_rectangle(0, radius, self._width, self._height - radius,
@@ -118,6 +118,85 @@ def run_gui() -> None:
             return super().configure(cnf, **kwargs)
 
         config = configure
+
+    class RoundedToggle(tk.Canvas):
+        """Shared pill toggle used instead of a square platform checkbox."""
+
+        def __init__(self, parent: tk.Misc, text: str, variable: tk.BooleanVar,
+                     command: Callable[[], None], width: int = 120,
+                     height: int = 30) -> None:
+            super().__init__(parent, width=width, height=height,
+                             background="#141C2E", highlightthickness=0,
+                             borderwidth=0, cursor="hand2")
+            self._text = text
+            self._variable = variable
+            self._command = command
+            self._state = tk.NORMAL
+            self._width = width
+            self._height = height
+            self.bind("<ButtonRelease-1>", self._activate)
+            self._draw()
+
+        def _draw(self) -> None:
+            self.delete("all")
+            enabled = self._state != tk.DISABLED
+            selected = self._variable.get()
+            track = "#2DD4BF" if selected and enabled else "#253451"
+            knob = "#07161C" if selected and enabled else "#8F9EB5"
+            self.create_rectangle(10, 5, 28, 25, fill=track, outline=track)
+            self.create_oval(0, 5, 20, 25, fill=track, outline=track)
+            self.create_oval(18, 5, 38, 25, fill=track, outline=track)
+            knob_x = 19 if selected else 1
+            self.create_oval(knob_x, 7, knob_x + 16, 23, fill=knob, outline=knob)
+            self.create_text(46, self._height / 2, text=self._text, anchor=tk.W,
+                             fill="#E8EFF9" if enabled else "#5E6B7F",
+                             font=(preferred_family, -15))
+
+        def _activate(self, _event: object = None) -> None:
+            if self._state == tk.DISABLED:
+                return
+            self._variable.set(not self._variable.get())
+            self._draw()
+            self._command()
+
+        def configure(self, cnf: object = None, **kwargs: object) -> object:
+            if "state" in kwargs:
+                self._state = str(kwargs.pop("state"))
+                self._draw()
+            return super().configure(cnf, **kwargs)
+
+        config = configure
+
+    class RoundedProgress(tk.Canvas):
+        """Rounded progress indicator sharing the field corner geometry."""
+
+        def __init__(self, parent: tk.Misc, variable: tk.DoubleVar) -> None:
+            super().__init__(parent, background="#141C2E", highlightthickness=0,
+                             borderwidth=0)
+            self._variable = variable
+            self._variable.trace_add("write", lambda *_args: self._draw())
+            self.bind("<Configure>", lambda _event: self._draw())
+
+        def _draw(self) -> None:
+            self.delete("all")
+            width = max(1, self.winfo_width())
+            height = max(1, self.winfo_height())
+            progress = min(1.0, max(0.0, self._variable.get()))
+            radius = min(8, height // 2)
+
+            def pill(x1: float, color: str) -> None:
+                if x1 <= 0:
+                    return
+                local_radius = min(radius, int(x1 / 2))
+                self.create_rectangle(local_radius, 0, max(local_radius, x1-local_radius),
+                                      height, fill=color, outline=color)
+                self.create_oval(0, 0, local_radius*2, height,
+                                 fill=color, outline=color)
+                self.create_oval(max(0, x1-local_radius*2), 0, x1, height,
+                                 fill=color, outline=color)
+
+            pill(width, "#232D41")
+            pill(width * progress, "#4C94FF")
 
     class RoundedSurface(tk.Frame):
         """Canvas-backed rounded container matching the native dashboard panels."""
@@ -161,6 +240,181 @@ def run_gui() -> None:
             self._canvas.delete("all")
             self._rounded_rectangle(0, self._radius, self._border)
             self._rounded_rectangle(1, max(1, self._radius - 1), self._fill)
+
+    class RoundedEntry(tk.Frame):
+        """Single-line left-aligned field with the shared rounded surface."""
+
+        def __init__(self, parent: tk.Misc, variable: tk.StringVar,
+                     *, readonly: bool = False) -> None:
+            super().__init__(parent, background="#141C2E", borderwidth=0,
+                             highlightthickness=0)
+            self._canvas = tk.Canvas(self, background="#141C2E", borderwidth=0,
+                                     highlightthickness=0)
+            self._canvas.place(x=0, y=0, relwidth=1, relheight=1)
+            self.entry = tk.Entry(
+                self, textvariable=variable, background="#1B253B",
+                foreground="#E8EFF9", insertbackground="#E8EFF9",
+                readonlybackground="#1B253B", relief=tk.FLAT, borderwidth=0,
+                highlightthickness=0, font=(preferred_family, -15), justify=tk.LEFT)
+            self.entry.place(x=10, y=2, relwidth=1, width=-20,
+                             relheight=1, height=-4)
+            if readonly:
+                self.entry.configure(state="readonly")
+            self.entry.bind("<FocusIn>", lambda _event: self._draw(True))
+            self.entry.bind("<FocusOut>", lambda _event: self._draw(False))
+            self.bind("<Configure>", lambda _event: self._draw(False))
+
+        def _draw(self, focused: bool) -> None:
+            self._canvas.delete("all")
+            width = max(2, self.winfo_width() - 1)
+            height = max(2, self.winfo_height() - 1)
+            border = "#2DD4BF" if focused else "#405574"
+            radius = min(8, height // 2)
+            for inset, color in ((0, border), (1, "#1B253B")):
+                x0 = y0 = inset
+                x1, y1 = width - inset, height - inset
+                r = max(1, radius - inset)
+                self._canvas.create_rectangle(x0 + r, y0, x1 - r, y1,
+                                              fill=color, outline=color)
+                self._canvas.create_rectangle(x0, y0 + r, x1, y1 - r,
+                                              fill=color, outline=color)
+                self._canvas.create_oval(x0, y0, x0 + 2 * r, y0 + 2 * r,
+                                         fill=color, outline=color)
+                self._canvas.create_oval(x1 - 2 * r, y0, x1, y0 + 2 * r,
+                                         fill=color, outline=color)
+                self._canvas.create_oval(x0, y1 - 2 * r, x0 + 2 * r, y1,
+                                         fill=color, outline=color)
+                self._canvas.create_oval(x1 - 2 * r, y1 - 2 * r, x1, y1,
+                                         fill=color, outline=color)
+
+    class RoundedCombo(tk.Frame):
+        """Rounded dropdown with centered selections and a matching popup."""
+
+        def __init__(self, parent: tk.Misc, variable: tk.StringVar,
+                     values: tuple[str, ...] = (), *, editable: bool = False) -> None:
+            super().__init__(parent, background="#141C2E", borderwidth=0,
+                             highlightthickness=0)
+            self.variable = variable
+            self.values = tuple(values)
+            self.editable = editable
+            self.popup: tk.Toplevel | None = None
+            self._canvas = tk.Canvas(self, background="#141C2E", borderwidth=0,
+                                     highlightthickness=0, cursor="hand2")
+            self._canvas.place(x=0, y=0, relwidth=1, relheight=1)
+            self.entry = tk.Entry(
+                self, textvariable=variable, background="#1B253B",
+                foreground="#E8EFF9", insertbackground="#E8EFF9",
+                readonlybackground="#1B253B", relief=tk.FLAT, borderwidth=0,
+                highlightthickness=0, font=(preferred_family, -15),
+                justify=tk.LEFT if editable else tk.CENTER)
+            self.entry.place(x=10, y=2, relwidth=1, width=-42,
+                             relheight=1, height=-4)
+            if not editable:
+                self.entry.configure(state="readonly", cursor="hand2")
+                self.entry.bind("<Button-1>", self._open_popup)
+            self.entry.bind("<FocusIn>", lambda _event: self._draw(True))
+            self.entry.bind("<FocusOut>", lambda _event: self._draw(False))
+            self._canvas.bind("<Button-1>", self._open_popup)
+            self.bind("<Configure>", lambda _event: self._draw(False))
+
+        def __setitem__(self, key: str, value: object) -> None:
+            if key != "values":
+                raise KeyError(key)
+            self.values = tuple(str(item) for item in value)  # type: ignore[arg-type]
+
+        def _draw(self, focused: bool) -> None:
+            self._canvas.delete("all")
+            width = max(2, self.winfo_width() - 1)
+            height = max(2, self.winfo_height() - 1)
+            border = "#2DD4BF" if focused or self.popup is not None else "#405574"
+            radius = min(8, height // 2)
+            for inset, color in ((0, border), (1, "#1B253B")):
+                x0 = y0 = inset
+                x1, y1 = width - inset, height - inset
+                r = max(1, radius - inset)
+                self._canvas.create_rectangle(x0 + r, y0, x1 - r, y1,
+                                              fill=color, outline=color)
+                self._canvas.create_rectangle(x0, y0 + r, x1, y1 - r,
+                                              fill=color, outline=color)
+                for oval in ((x0, y0, x0 + 2*r, y0 + 2*r),
+                             (x1 - 2*r, y0, x1, y0 + 2*r),
+                             (x0, y1 - 2*r, x0 + 2*r, y1),
+                             (x1 - 2*r, y1 - 2*r, x1, y1)):
+                    self._canvas.create_oval(*oval, fill=color, outline=color)
+            arrow_x, arrow_y = width - 17, height // 2
+            self._canvas.create_polygon(arrow_x - 5, arrow_y - 3,
+                                        arrow_x + 5, arrow_y - 3,
+                                        arrow_x, arrow_y + 4,
+                                        fill="#E8EFF9", outline="")
+
+        def _open_popup(self, _event: object = None) -> str:
+            if not self.values or self.popup is not None:
+                return "break"
+            popup = tk.Toplevel(self)
+            self.popup = popup
+            popup.overrideredirect(True)
+            popup.configure(background="#0E1626")
+            row_height = 32
+            popup_height = row_height * len(self.values) + 4
+            popup.update_idletasks()
+            x = self.winfo_rootx()
+            y = self.winfo_rooty() + self.winfo_height() + 4
+            if y + popup_height > self.winfo_screenheight() - 8:
+                y = self.winfo_rooty() - popup_height - 4
+            popup.geometry(f"{self.winfo_width()}x{popup_height}+{x}+{y}")
+            canvas = tk.Canvas(popup, background="#0E1626", borderwidth=0,
+                               highlightthickness=0, cursor="hand2")
+            canvas.pack(fill=tk.BOTH, expand=True)
+
+            def draw_popup(hovered: int = -1) -> None:
+                canvas.delete("all")
+                for index, item in enumerate(self.values):
+                    y0 = 2 + index * row_height
+                    selected = item == self.variable.get()
+                    fill = "#67E8F9" if index == hovered else (
+                        "#4C94FF" if selected else "#141C2E")
+                    color = "#07161C" if index == hovered else "#F1F6FF"
+                    x0, x1 = 2, self.winfo_width() - 2
+                    y1, radius = y0 + row_height - 2, 6
+                    canvas.create_rectangle(x0 + radius, y0, x1 - radius, y1,
+                                            fill=fill, outline=fill)
+                    canvas.create_rectangle(x0, y0 + radius, x1, y1 - radius,
+                                            fill=fill, outline=fill)
+                    for oval in ((x0, y0, x0 + 2*radius, y0 + 2*radius),
+                                 (x1 - 2*radius, y0, x1, y0 + 2*radius),
+                                 (x0, y1 - 2*radius, x0 + 2*radius, y1),
+                                 (x1 - 2*radius, y1 - 2*radius, x1, y1)):
+                        canvas.create_oval(*oval, fill=fill, outline=fill)
+                    canvas.create_text(self.winfo_width() / 2,
+                                       y0 + (row_height - 2) / 2,
+                                       text=item, fill=color,
+                                       font=(preferred_family, -15))
+
+            def motion(event: tk.Event) -> None:
+                draw_popup(min(len(self.values) - 1,
+                               max(0, (event.y - 2) // row_height)))
+
+            def select(event: tk.Event) -> None:
+                index = min(len(self.values) - 1, max(0, (event.y - 2) // row_height))
+                self.variable.set(self.values[index])
+                self.event_generate("<<ComboboxSelected>>")
+                self._close_popup()
+
+            canvas.bind("<Motion>", motion)
+            canvas.bind("<Leave>", lambda _event: draw_popup())
+            canvas.bind("<ButtonRelease-1>", select)
+            popup.bind("<Escape>", lambda _event: self._close_popup())
+            popup.bind("<FocusOut>", lambda _event: self._close_popup())
+            draw_popup()
+            popup.focus_force()
+            self._draw(True)
+            return "break"
+
+        def _close_popup(self) -> None:
+            popup, self.popup = self.popup, None
+            if popup is not None and popup.winfo_exists():
+                popup.destroy()
+            self._draw(self.entry.focus_get() == self.entry)
 
     class BleUartApp:
         """Coordinates Tk widgets, serial I/O, parsing, and test transfers."""
@@ -239,17 +493,17 @@ def run_gui() -> None:
                             relief=tk.FLAT)
             style.configure("Card.TFrame", background="#1B253B")
             style.configure("App.TLabel", background="#141C2E", foreground="#E8EFF9",
-                            font=(body, -17))
+                            font=(body, -15))
             style.configure("Muted.TLabel", background="#141C2E", foreground="#8F9EB5",
-                            font=(body, -13))
+                            font=(body, -12))
             style.configure("Section.TLabel", background="#141C2E", foreground="#8F9EB5",
-                            font=(body, -16, "bold"))
-            style.configure("CardLabel.TLabel", background="#1B253B", foreground="#8F9EB5",
                             font=(body, -14, "bold"))
+            style.configure("CardLabel.TLabel", background="#1B253B", foreground="#8F9EB5",
+                            font=(body, -12, "bold"))
             style.configure("CardValue.TLabel", background="#1B253B", foreground="#E8EFF9",
-                            font=(body, -25, "bold"))
+                            font=(body, -22, "bold"))
             style.configure("Status.TLabel", background="#1B253B", foreground="#E8EFF9",
-                            borderwidth=0, relief=tk.FLAT, padding=(10, 8), font=(body, -16))
+                            borderwidth=0, relief=tk.FLAT, padding=(10, 6), font=(body, -15))
             style.configure("TButton", background="#253451", foreground="#F4F8FF",
                             bordercolor="#405574", padding=(12, 9), font=(body, -16, "bold"))
             style.map("TButton", background=[("active", "#32486F"), ("pressed", "#3B5B8E")])
@@ -261,7 +515,7 @@ def run_gui() -> None:
                             insertcolor="#E8EFF9", bordercolor="#405574",
                             lightcolor="#405574", darkcolor="#405574",
                             focuscolor="#2DD4BF", borderwidth=1, relief=tk.FLAT,
-                            padding=8, font=(body, -17))
+                            padding=7, font=(body, -15))
             style.map("TEntry",
                       bordercolor=[("focus", "#2DD4BF"), ("active", "#405574")],
                       lightcolor=[("focus", "#2DD4BF"), ("active", "#405574")],
@@ -270,7 +524,7 @@ def run_gui() -> None:
                             background="#253451", arrowcolor="#8F9EB5",
                             bordercolor="#405574", lightcolor="#405574",
                             darkcolor="#405574", focuscolor="#2DD4BF",
-                            borderwidth=1, relief=tk.FLAT, padding=7, font=(body, -17))
+                            borderwidth=1, relief=tk.FLAT, padding=6, font=(body, -15))
             style.map("TCombobox", fieldbackground=[("readonly", "#1B253B")],
                       foreground=[("readonly", "#E8EFF9")],
                       bordercolor=[("focus", "#2DD4BF"), ("active", "#405574")],
@@ -281,7 +535,7 @@ def run_gui() -> None:
             self.root.option_add("*TCombobox*Listbox.selectBackground", "#67E8F9")
             self.root.option_add("*TCombobox*Listbox.selectForeground", "#07161C")
             style.configure("TCheckbutton", background="#141C2E", foreground="#E8EFF9",
-                            font=(body, -17, "bold"), indicatorcolor="#1B253B",
+                            font=(body, -15, "bold"), indicatorcolor="#1B253B",
                             indicatorrelief=tk.FLAT)
             style.map("TCheckbutton", background=[("active", "#141C2E")],
                       indicatorcolor=[("selected", "#2DD4BF")])
@@ -297,20 +551,20 @@ def run_gui() -> None:
         def _build_ui(self) -> None:
             """Create the shared telemetry-first client dashboard layout."""
             self._configure_styles()
-            container = ttk.Frame(self.root, padding=24, style="App.TFrame")
+            container = ttk.Frame(self.root, style="App.TFrame")
             container.pack(fill=tk.BOTH, expand=True)
 
             tk.Label(container,
                      text=f"BLE UART HCI Client  v{application_version()}",
                      background="#0A0F1C", foreground="#E8EFF9",
-                     font=(preferred_family, -32, "bold")).pack(anchor=tk.W)
+                     font=(preferred_family, -28, "bold")).place(x=28, y=17)
             tk.Label(container,
                      text="PORTABLE H4 CONSOLE  /  CRC16-CCITT  /  LIVE PACKET TELEMETRY",
                      background="#0A0F1C", foreground="#8F9EB5",
-                     font=(preferred_family, -14, "bold")).pack(anchor=tk.W, pady=(3, 16))
+                     font=(preferred_family, -12, "bold")).place(x=30, y=61)
 
             metrics = ttk.Frame(container, style="App.TFrame")
-            metrics.pack(fill=tk.X, pady=(0, 16))
+            metrics.place(x=24, y=100, width=1072, height=84)
             for column in range(4):
                 metrics.columnconfigure(column, weight=1, uniform="metric")
 
@@ -322,6 +576,8 @@ def run_gui() -> None:
                 card = surface.content
                 surface.grid(row=0, column=column, sticky=tk.EW,
                              padx=(0 if column == 0 else 6, 0 if column == 3 else 6))
+                surface.configure(height=84)
+                surface.grid_propagate(False)
                 stripe = tk.Frame(card, width=4, height=55, background=accent)
                 stripe.pack(side=tk.LEFT, padx=(0, 12))
                 content = ttk.Frame(card, style="Card.TFrame")
@@ -357,12 +613,13 @@ def run_gui() -> None:
                         reset_rx_irq_calls)
             metric_card(3, "TRANSPORT", self.transport_var, "#2DD4BF", None)
 
-            def panel(title: str, expand: bool = False) -> ttk.Frame:
+            def panel(title: str, bounds: tuple[int, int, int, int]) -> ttk.Frame:
                 surface = RoundedSurface(container, fill="#141C2E", border="#31415C",
                                          style="Panel.TFrame", radius=13,
                                          content_padding=(18, 6))
-                surface.pack(fill=tk.BOTH if expand else tk.X,
-                             expand=expand, pady=(0, 14))
+                surface.place(x=bounds[0], y=bounds[1],
+                              width=bounds[2], height=bounds[3])
+                surface.pack_propagate(False)
                 outer = surface.content
                 ttk.Label(outer, text=title, style="Section.TLabel").pack(anchor=tk.W,
                                                                           pady=(0, 10))
@@ -370,107 +627,128 @@ def run_gui() -> None:
                 body.pack(fill=tk.BOTH, expand=True)
                 return body
 
-            connection = panel("CONNECTION")
-            connection_grid = ttk.Frame(connection, style="Panel.TFrame")
-            connection_grid.pack(fill=tk.X)
-            ttk.Label(connection_grid, text="Port", style="App.TLabel").grid(
-                row=0, column=0, sticky=tk.W)
-            self.port_combo = ttk.Combobox(connection_grid, textvariable=self.port_var, width=42)
-            self.port_combo.grid(row=0, column=1, padx=(8, 18), sticky=tk.EW)
-            self.port_combo.bind("<Button-1>", lambda _event: self.refresh_ports())
-            ttk.Label(connection_grid, text="Baud", style="App.TLabel").grid(row=0, column=2)
-            ttk.Combobox(connection_grid, textvariable=self.baud_var, width=11,
-                         values=("9600", "57600", "115200", "460800", "921600",
-                                 "1000000", "2000000", "3000000", "4000000")).grid(
-                                     row=0, column=3, padx=8)
+            connection = panel("CONNECTION", (24, 204, 1072, 136))
+            ttk.Label(connection, text="Port", style="App.TLabel").place(
+                x=0, y=3, width=50, height=38)
+            self.port_combo = RoundedCombo(connection, self.port_var, editable=True)
+            self.port_combo.place(x=52, y=3, width=426, height=38)
+            self.port_combo.entry.bind("<FocusIn>", lambda _event: self.refresh_ports(), add="+")
+            ttk.Label(connection, text="Baud", style="App.TLabel").place(
+                x=498, y=3, width=52, height=38)
+            RoundedCombo(
+                connection, self.baud_var,
+                ("9600", "57600", "115200", "460800", "921600",
+                 "1000000", "2000000", "3000000", "4000000"),
+                editable=True).place(x=554, y=3, width=138, height=38)
             self.connect_button = RoundedActionButton(
-                connection_grid, "Connect", self.toggle_connection, width=170, height=42)
-            self.connect_button.grid(row=0, column=4)
-            self.rx_mode_toggle = ttk.Checkbutton(
-                connection_grid, text="Per-byte IRQ", variable=self.byte_irq_var,
-                command=self.send_rx_mode_request, state=tk.DISABLED)
-            self.rx_mode_toggle.grid(row=0, column=5, sticky=tk.E, padx=(20, 0))
-            ttk.Label(connection_grid, textvariable=self.status_var, style="Status.TLabel").grid(
-                row=1, column=0, columnspan=2, sticky=tk.EW, pady=(10, 0))
-            ttk.Label(connection_grid, text="Ring", style="Muted.TLabel").grid(
-                row=1, column=2, sticky=tk.E, pady=(10, 0), padx=(10, 4))
-            ring_combo = ttk.Combobox(
-                connection_grid, textvariable=self.ring_buffer_var,
-                values=tuple(label for label, _size in RING_BUFFER_SIZES),
-                state="readonly", width=8)
-            ring_combo.grid(row=1, column=3, pady=(10, 0), sticky=tk.W)
+                connection, "Connect", self.toggle_connection, width=170, height=38)
+            self.connect_button.place(x=712, y=3)
+            self.rx_mode_toggle = RoundedToggle(
+                connection, "Per-byte IRQ", self.byte_irq_var,
+                self.send_rx_mode_request)
+            self.rx_mode_toggle.configure(state=tk.DISABLED)
+            self.rx_mode_toggle.place(x=914, y=7, width=120, height=30)
+            RoundedEntry(connection, self.status_var, readonly=True).place(
+                x=0, y=54, width=414, height=28)
+            ttk.Label(connection, text="Ring", style="Muted.TLabel").place(
+                x=436, y=54, width=36, height=28)
+            ring_combo = RoundedCombo(
+                connection, self.ring_buffer_var,
+                tuple(label for label, _size in RING_BUFFER_SIZES))
+            ring_combo.place(x=476, y=54, width=100, height=28)
             ring_combo.bind("<<ComboboxSelected>>", self._configure_receive_buffers)
-            ttk.Label(connection_grid, text="DMA", style="Muted.TLabel").grid(
-                row=1, column=4, sticky=tk.E, pady=(10, 0), padx=(8, 4))
-            dma_combo = ttk.Combobox(
-                connection_grid, textvariable=self.dma_buffer_var,
-                values=tuple(label for label, _size in DMA_BUFFER_SIZES),
-                state="readonly", width=8)
-            dma_combo.grid(row=1, column=5, pady=(10, 0), sticky=tk.W)
+            ttk.Label(connection, text="DMA", style="Muted.TLabel").place(
+                x=596, y=54, width=36, height=28)
+            dma_combo = RoundedCombo(
+                connection, self.dma_buffer_var,
+                tuple(label for label, _size in DMA_BUFFER_SIZES))
+            dma_combo.place(x=636, y=54, width=100, height=28)
             dma_combo.bind("<<ComboboxSelected>>", self._configure_receive_buffers)
-            connection_grid.columnconfigure(1, weight=1)
+            ttk.Label(connection, text="Native clipboard shortcuts enabled",
+                      style="Muted.TLabel").place(x=2, y=82, height=16)
 
-            command = panel("HCI COMMAND BUILDER")
-            ttk.Label(command, text="Preset", style="App.TLabel").grid(row=0, column=0,
-                                                                         sticky=tk.W)
-            preset = ttk.Combobox(command, textvariable=self.preset_var,
-                                  values=tuple(COMMAND_PRESETS), state="readonly", width=32)
-            preset.grid(row=0, column=1, padx=(8, 24), sticky=tk.EW, ipady=2)
+            command = panel("HCI COMMAND BUILDER", (24, 360, 1072, 216))
+            ttk.Label(command, text="Preset", style="App.TLabel").place(
+                x=0, y=3, width=64, height=38)
+            preset = RoundedCombo(command, self.preset_var, tuple(COMMAND_PRESETS))
+            preset.place(x=68, y=3, width=360, height=38)
             preset.bind("<<ComboboxSelected>>", lambda _event: self.select_preset())
-            ttk.Label(command, text="Opcode", style="App.TLabel").grid(row=0, column=2)
-            ttk.Entry(command, textvariable=self.opcode_var, width=12).grid(row=0, column=3, padx=8)
-            ttk.Label(command, text="Parameters", style="App.TLabel").grid(
-                row=1, column=0, sticky=tk.W, pady=(12, 0))
-            ttk.Entry(command, textvariable=self.parameters_var).grid(row=1, column=1, columnspan=3,
-                                                                       padx=8, pady=(12, 0), sticky=tk.EW)
+            ttk.Label(command, text="Opcode", style="App.TLabel").place(
+                x=452, y=3, width=66, height=38)
+            RoundedEntry(command, self.opcode_var).place(x=522, y=3, width=164, height=38)
+            ttk.Label(command, text="Parameters", style="App.TLabel").place(
+                x=0, y=58, width=132, height=38)
+            RoundedEntry(command, self.parameters_var).place(
+                x=136, y=58, width=646, height=38)
             self.send_command_button = RoundedActionButton(
-                command, "Send command", self.send_command, width=210, height=42)
+                command, "Send command", self.send_command, width=226, height=38)
             self.send_command_button.configure(state=tk.DISABLED)
-            self.send_command_button.grid(row=1, column=4, padx=(12, 0), pady=(12, 0))
-            ttk.Label(command, text="Raw H4 bytes", style="App.TLabel").grid(
-                row=2, column=0, sticky=tk.W, pady=(12, 0))
-            ttk.Entry(command, textvariable=self.raw_var).grid(
-                row=2, column=1, columnspan=3, padx=8, pady=(12, 0), sticky=tk.EW)
+            self.send_command_button.place(x=806, y=58)
+            ttk.Label(command, text="Raw H4 bytes", style="App.TLabel").place(
+                x=0, y=118, width=132, height=38)
+            RoundedEntry(command, self.raw_var).place(x=136, y=118, width=646, height=38)
             self.send_raw_button = RoundedActionButton(
-                command, "Append CRC + send", self.send_raw, width=210, height=42)
+                command, "Append CRC + send", self.send_raw, width=226, height=38)
             self.send_raw_button.configure(state=tk.DISABLED)
-            self.send_raw_button.grid(row=2, column=4, padx=(12, 0), pady=(12, 0))
-            command.columnconfigure(1, weight=1)
+            self.send_raw_button.place(x=806, y=118)
 
-            bulk = panel("TEST TRANSMISSIONS")
+            bulk = panel("TEST TRANSMISSIONS", (24, 596, 1072, 124))
             self.send_small_button = RoundedActionButton(
                 bulk, "Send 128-byte packet", lambda: self.start_test_transfer(128),
-                width=210, height=42)
+                width=220, height=42)
             self.send_small_button.configure(state=tk.DISABLED)
-            self.send_small_button.grid(row=0, column=0)
-            ttk.Label(bulk, text="Block size", style="App.TLabel").grid(
-                row=0, column=1, padx=(20, 8))
-            ttk.Combobox(bulk, textvariable=self.bulk_size_var,
-                         values=tuple(label for label, _size in TEST_TRANSFER_SIZES),
-                         state="readonly", width=9,
-                         height=len(TEST_TRANSFER_SIZES)).grid(row=0, column=2)
+            self.send_small_button.place(x=0, y=5)
+            ttk.Label(bulk, text="Block size", style="App.TLabel").place(
+                x=248, y=5, width=92, height=38)
+            RoundedCombo(
+                bulk, self.bulk_size_var,
+                tuple(label for label, _size in TEST_TRANSFER_SIZES)).place(
+                    x=348, y=5, width=132, height=42)
             self.send_large_button = RoundedActionButton(
                 bulk, "Send selected block", self.send_selected_test_transfer,
-                width=210, height=42)
+                width=218, height=42)
             self.send_large_button.configure(state=tk.DISABLED)
-            self.send_large_button.grid(row=0, column=3, padx=(16, 24))
-            ttk.Progressbar(bulk, variable=self.transfer_progress, maximum=1.0,
-                            style="Transfer.Horizontal.TProgressbar").grid(
-                                row=0, column=4, sticky=tk.EW)
-            ttk.Label(bulk, textvariable=self.transfer_status_var, style="App.TLabel").grid(
-                row=1, column=4, sticky=tk.W, pady=(6, 0))
-            bulk.columnconfigure(4, weight=1)
+            self.send_large_button.place(x=504, y=5)
+            RoundedProgress(bulk, self.transfer_progress).place(
+                x=748, y=5, width=284, height=16)
+            ttk.Label(bulk, textvariable=self.transfer_status_var, style="Muted.TLabel").place(
+                x=748, y=27, width=284, height=20)
 
-            traffic = panel("LIVE UART TRAFFIC", expand=True)
-            log_frame = ttk.Frame(traffic, style="Panel.TFrame")
+            traffic = panel("LIVE UART TRAFFIC", (24, 740, 1072, 196))
+            log_frame = tk.Frame(traffic, background="#141C2E",
+                                 borderwidth=0, highlightthickness=0)
             log_frame.pack(fill=tk.BOTH, expand=True)
-            log_scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL,
+            log_background = tk.Canvas(log_frame, background="#141C2E",
+                                       borderwidth=0, highlightthickness=0)
+            log_background.place(x=0, y=0, relwidth=1, relheight=1)
+
+            def draw_log_background(_event: object = None) -> None:
+                log_background.delete("all")
+                width, height = log_frame.winfo_width() - 1, log_frame.winfo_height() - 1
+                radius = min(8, max(1, height // 2))
+                color = "#070B14"
+                log_background.create_rectangle(radius, 0, width-radius, height,
+                                                fill=color, outline=color)
+                log_background.create_rectangle(0, radius, width, height-radius,
+                                                fill=color, outline=color)
+                for oval in ((0, 0, 2*radius, 2*radius),
+                             (width-2*radius, 0, width, 2*radius),
+                             (0, height-2*radius, 2*radius, height),
+                             (width-2*radius, height-2*radius, width, height)):
+                    log_background.create_oval(*oval, fill=color, outline=color)
+
+            log_frame.bind("<Configure>", draw_log_background)
+            log_content = tk.Frame(log_frame, background="#070B14",
+                                   borderwidth=0, highlightthickness=0)
+            log_content.place(x=6, y=4, relwidth=1, width=-12,
+                              relheight=1, height=-8)
+            log_scroll = ttk.Scrollbar(log_content, orient=tk.VERTICAL,
                                        style="Dark.Vertical.TScrollbar")
             log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
-            self.log = tk.Text(log_frame, height=9, state=tk.DISABLED, wrap=tk.NONE,
+            self.log = tk.Text(log_content, height=9, state=tk.DISABLED, wrap=tk.NONE,
                                background="#070B14", foreground="#BEC6D2",
                                insertbackground="#BEC6D2", relief=tk.FLAT,
-                               highlightthickness=0, font=("Menlo", -13), padx=12, pady=10,
+                               highlightthickness=0, font=("Menlo", -12), padx=12, pady=8,
                                yscrollcommand=log_scroll.set)
             self.log.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
             log_scroll.configure(command=self.log.yview)
@@ -959,7 +1237,7 @@ def run_gui() -> None:
         "Avenir Next" if sys.platform == "darwin" else "DejaVu Sans")
     for named_font in ("TkDefaultFont", "TkTextFont", "TkMenuFont",
                        "TkCaptionFont", "TkSmallCaptionFont"):
-        tkfont.nametofont(named_font).configure(family=preferred_family, size=-17)
+        tkfont.nametofont(named_font).configure(family=preferred_family, size=-15)
     BleUartApp(root)
     root.mainloop()
 

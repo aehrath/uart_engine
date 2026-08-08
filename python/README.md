@@ -35,15 +35,15 @@ unresponsive driver can be cancelled and cannot freeze the window.
 The Python window mirrors the portable C client: both use the same 1120x960
 four-panel layout, command presets, editable HCI fields, 128-byte quick-test
 button, selectable 16 KiB through 16 MiB large transfers, progress display, and
-a color-coded 256-line scrollable traffic log. Tk entry fields retain their
-platform-native selection and clipboard behavior.
+a color-coded 256-line scrollable traffic log. Custom rounded entry fields
+retain Tk's native selection and clipboard behavior.
 
 The title and heading display the shared repository release version. The UI
 uses Segoe UI, Avenir Next, or DejaVu Sans according to the host platform, with
-the same dark telemetry cards and rounded high-contrast action controls as the
-native dashboards.
+the same dark telemetry cards, 8-pixel control corners, centered dropdown and
+button text, and left-aligned editable fields as the native dashboards.
 
-The **Per-byte IRQ** checkbox controls this Python process only. Byte mode counts
+The **Per-byte IRQ** toggle controls this Python process only. Byte mode counts
 one receiver IRQ per received wire byte. DMA mode counts one IRQ per completed
 serial read batch. The adjacent **Ring** and **DMA** selectors set the queued
 receive capacity and maximum read transaction size, respectively.
