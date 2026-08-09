@@ -333,6 +333,131 @@ The server's settings describe its local receive path. A client's settings
 describe that client's local receive path. They are deliberately not
 synchronized between processes.
 
+### Visual dashboard tour
+
+The native server dashboard controls the pseudo-UART and the FreeRTOS-backed
+simulation engine. The screenshot below shows the server before it has been
+started. Controls that require a live peer are dimmed intentionally.
+
+![BLE UART DMA server dashboard](docs/screenshots/ble-uart-server.png)
+
+**Figure 1.** Native C server dashboard at startup. Click the image in a
+Markdown viewer to inspect the full-resolution controls.
+
+Read the server from top to bottom:
+
+| Area | What it shows or controls |
+| --- | --- |
+| Statistic cards | Complete RX packets, TX activity, cumulative local RX IRQ calls, and current transport state. Each card is clickable and resets only its own displayed counter. |
+| Server control | Starts or stops the engine; selects clock, baud, ring, DMA transaction size, and byte-IRQ mode; displays and copies the generated pseudo-UART path. |
+| HCI command builder | Sends a typed preset or custom opcode/parameters from server to client, or appends CRC16-CCITT to a complete raw H4 packet. |
+| Test transmissions | Sends a deterministic 128-byte diagnostic packet or the selected 16 KiB through 16 MiB block. The bar reports logical bytes completed. |
+| Live traffic | Retains color-coded protocol, progress, completion, warning, and error messages in a scrollable log. |
+| Pipeline headroom | Plots producer and consumer rates plus queue, ring, and DMA utilization. The horizontal meters report recent queue and ring peaks; the footer reports latency, headroom, and drops. |
+
+The native C client is shown below. The Python client intentionally mirrors
+this organization, control order, labels, defaults, colors, field alignment,
+and behavior, so the same instructions apply to both clients.
+
+![BLE UART HCI client dashboard](docs/screenshots/ble-uart-client.png)
+
+**Figure 2.** Native C client dashboard at startup. The Python client presents
+the same workflow with platform-native high-resolution text rendering.
+
+The client replaces **Server control** with **Connection**. Enter or select a
+port, choose the local receive simulation settings, and click **Connect**. The
+client does not enable its send controls merely because the operating system
+opened the device: it first sends the 128-byte identity probe described below
+and changes **TRANSPORT** from **VERIFYING** to the active receive mode only
+after the exact acknowledgement arrives.
+
+The values shown in a screenshot can reflect saved settings from the previous
+run. Click **Defaults** before following a baseline example; this selects a
+20 MHz clock, 4 Mbaud, 16 KiB ring, 256-byte DMA transaction, 2 MiB block, and
+DMA plus IDLE receive mode.
+
+### Example 1: connect and verify the correct UART
+
+1. In the server, click **Start server**.
+2. Wait for **Pseudo-UART** to contain a device path and **TRANSPORT** to become
+   active.
+3. Click **Copy port**.
+4. Paste the path into either client's **Port** field.
+5. Click **Defaults** on both apps, then click **Connect** on the client.
+6. Watch the client enter **VERIFYING** while it sends its diagnostic probe.
+7. Confirm that the client log reports a verified BLE UART server and that its
+   send buttons become bright and enabled.
+
+If a different UART is selected, the expected acknowledgement will not arrive.
+The client closes that device and leaves a visible verification error instead
+of silently treating an unrelated serial port as the server.
+
+### Example 2: send an HCI Reset preset
+
+1. Connect and complete verification.
+2. Select **HCI Reset** in **Preset**. The builder fills opcode `0C03` and an
+   empty parameter field.
+3. Click **Send command**.
+4. Observe **TX PACKETS** increase on the sender and **RX PACKETS** increase on
+   the receiver.
+5. Check the logs for the transmitted Command packet and the returned Command
+   Complete Event. Both frames must report a valid CRC.
+
+For a custom command, type a four-digit hexadecimal opcode and hexadecimal byte
+pairs in **Parameters**. For a complete packet, type the H4 indicator, typed HCI
+header, and payload in **Raw H4 bytes**, then click **Append CRC + send**.
+
+### Example 3: compare a 128-byte packet with a 2 MiB transfer
+
+1. Click **Send 128-byte packet** and observe the complete packet in the log.
+   The transfer is small enough that displaying its bytes does not affect
+   throughput measurements.
+2. Set **Block size** to **2 MiB** and click **Send selected block**.
+3. Watch the progress bar move smoothly while the sender's other send controls
+   and the receiver's send controls remain disabled by half-duplex lockout.
+4. Watch producer and consumer rates in the pipeline panel. Queue, ring, and DMA
+   traces are percentages of their independently configured capacities.
+5. At completion, confirm the log reports the full logical byte total, pattern
+   verification, CRC status, elapsed time, and receive IRQ calls for that one
+   complete transmission.
+
+At 4 Mbaud, the 2 MiB logical transfer should be near 4.2 seconds in either
+direction, plus framing and host scheduling overhead. Large packet bodies are
+not printed, because converting and displaying megabytes of hexadecimal text
+would become the bottleneck being measured.
+
+### Example 4: compare DMA and per-byte IRQ accounting
+
+1. Leave **Per-byte IRQ** off, set **DMA** to **256 B**, and send the 128-byte
+   diagnostic. The receiver normally needs one DMA completion for that wire
+   frame.
+2. Record the receiver's **RX IRQ CALLS** card and the per-transmission IRQ value
+   in its completion log.
+3. Click the **RX IRQ CALLS** card to reset that local cumulative display.
+4. Enable **Per-byte IRQ** on the receiver and repeat the same transmission.
+5. The completion log should now report one receive IRQ per wire byte. The count
+   is therefore slightly larger than 128 because H4, ACL/test metadata, and CRC
+   bytes are also carried on the wire.
+
+The toggle is local to each application. Change it on the side whose receive
+implementation you want to study; it is not mirrored to the peer.
+
+### Example 5: expose ring pressure and recovery
+
+1. Click **Defaults**, then reduce the receiver's **Ring** selection to
+   **256 B** while leaving its DMA transaction at **256 B**.
+2. Send a test packet whose complete IDLE-delimited wire frame approaches or
+   exceeds the selected ring capacity.
+3. Observe **R%** and **R PEAK** approach 100 percent. A genuine overwrite
+   increments the ring-drop total and causes packet validation to fail.
+4. Restore **Ring** to **16 KiB** and repeat. The frame should validate, ring
+   utilization should fall substantially, and the quiet sample after transfer
+   completion should return the live utilization to zero.
+
+This experiment demonstrates capacity, not an artificial throughput throttle:
+the ring must retain a complete IDLE-delimited span, while the DMA selection
+controls how many bytes are grouped into each simulated DMA completion IRQ.
+
 ### Top statistic cards
 
 - **RX PACKETS** counts complete packets received by this application.

@@ -21,6 +21,7 @@ from reportlab.platypus import (
     BaseDocTemplate,
     Frame,
     KeepTogether,
+    Image as ReportLabImage,
     ListFlowable,
     ListItem,
     PageTemplate,
@@ -244,7 +245,8 @@ def list_flowable(items: Iterable[str], ordered: bool,
 
 
 def markdown_story(markdown: str, styles: dict[str, ParagraphStyle],
-                   available: float) -> list[object]:
+                   available: float,
+                   source_directory: pathlib.Path) -> list[object]:
     """Parse the README's block Markdown into a ReportLab Platypus story."""
     lines = markdown.splitlines()
     story: list[object] = []
@@ -303,6 +305,23 @@ def markdown_story(markdown: str, styles: dict[str, ParagraphStyle],
         if line.startswith("### "):
             flush_paragraph()
             story.append(Paragraph(inline_markup(line[4:]), styles["h3"]))
+            index += 1
+            continue
+        image_match = re.match(r"^!\[([^]]*)\]\(([^)]+)\)$", line.strip())
+        if image_match:
+            flush_paragraph()
+            image_path = (source_directory / image_match.group(2)).resolve()
+            if not image_path.is_file():
+                raise FileNotFoundError(
+                    f"README image does not exist: {image_path}")
+            illustration = ReportLabImage(str(image_path))
+            scale = min(available / illustration.imageWidth,
+                        (6.4 * inch) / illustration.imageHeight)
+            illustration.drawWidth = illustration.imageWidth * scale
+            illustration.drawHeight = illustration.imageHeight * scale
+            illustration.hAlign = "CENTER"
+            story.append(illustration)
+            story.append(Spacer(1, 5))
             index += 1
             continue
         if line.startswith("| ") and index + 1 < len(lines) and \
@@ -365,7 +384,7 @@ def build_pdf(input_path: pathlib.Path, output_path: pathlib.Path) -> None:
         subject="Build, operation, simulation, testing, and porting instructions")
     document.addPageTemplates(PageTemplate(id="guide", frames=[frame]))
     story = markdown_story(input_path.read_text(encoding="utf-8"), styles,
-                           width - left - right)
+                           width - left - right, input_path.parent)
     document.build(story, canvasmaker=NumberedCanvas)
 
 
