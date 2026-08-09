@@ -63,12 +63,26 @@ See [`apps/README.md`](apps/README.md) for the C server and clients, and
 All graphical apps expose an application-local **Per-byte IRQ** toggle. The
 default path counts one receiver IRQ for each completed DMA/read transaction;
 the optional path counts one RXNE receiver IRQ for every received wire byte.
+Clock, baud, ring capacity, DMA size, large-transfer size, and IRQ mode are
+restored across launches. The C and Python clients share client preferences,
+the server keeps an independent settings file, and every UI provides a
+**Defaults** button that immediately reapplies the common baseline settings.
 Ring-buffer capacity and DMA transaction size are independently selectable in
-each dashboard.
+each dashboard. Ring choices run from 32 B through 64 KiB; DMA choices run from
+32 B through 4 KiB.
 
 The graphical server can also originate the same HCI, raw H4, 128-byte, and
-selectable large test traffic as the clients. Its live metrics include the
-actual number of receive-byte IRQ handler invocations.
+selectable large test traffic as the clients. Every graphical app's live metrics include the
+actual number of receive-byte IRQ handler invocations. A rolling pipeline
+chart compares measured FreeRTOS producer and consumer byte rates over the last
+minute. Queue and circular-ring gauges, enqueue-to-consume latency, drop counts,
+and measured time-to-overrun make the remaining receive headroom visible while
+clock, baud, DMA, ring, and IRQ-mode parameters are changed. The native C and
+Python clients expose the same parameter row and monitor as the server while
+retaining application-local measurements.
+Queue (**Q%**), ring (**R%**), and DMA (**D%**) histories use their own selected
+capacities as 100%, so differently sized buffers remain directly comparable and
+an overflow cannot escape the chart bounds.
 
 Application releases are numbered from the repository [`VERSION`](VERSION)
 file. Every dashboard displays that version in its window title and heading.

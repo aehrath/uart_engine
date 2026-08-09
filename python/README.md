@@ -19,7 +19,7 @@ The repository's local `.venv` is excluded from version control.
 
 The application uses the same component boundaries as the C dashboards.
 `dashboard_config.py`, `dashboard_font.py`, `dashboard_dropdown.py`,
-`dashboard_log.py`, and `dashboard_ui.py` mirror the corresponding files in
+`dashboard_log.py`, `dashboard_pipeline.py`, and `dashboard_ui.py` mirror the corresponding files in
 `apps/common`. `lpuart_sim.py` mirrors the native KW47 OSR/SBR divisor search
 and deterministic 8-N-1 sampler. `ble_protocol.py` contains H4/CRC framing and test-message
 generation, `serial_ports.py` handles port discovery, and `ble_uart_app.py`
@@ -47,10 +47,39 @@ uses Segoe UI, Avenir Next, or DejaVu Sans according to the host platform, with
 the same dark telemetry cards, 8-pixel control corners, centered dropdown and
 button text, and left-aligned editable fields as the native dashboards.
 
-The **Per-byte IRQ** toggle controls this Python process only. Byte mode counts
-one receiver IRQ per received wire byte. DMA mode counts one IRQ per completed
-serial read batch. The adjacent **Ring** and **DMA** selectors set the queued
-receive capacity and maximum read transaction size, respectively.
+The selected UART port is restored on the next launch. The Python and C clients
+use the same `client-port.txt` location in the platform user configuration
+directory, and save typed, dropdown-selected, and attempted port names.
+They also share `client-settings.txt`, which restores clock, baud, ring, DMA,
+large-block size, and per-byte IRQ mode. The **Defaults** button applies and
+saves the common 20 MHz, 4 Mbaud, 16 KiB ring, 256 B DMA, 2 MiB block, and
+DMA + IDLE defaults. The C server keeps its equivalent controls independently
+in `server-settings.txt`.
+
+The **Clock**, **Baud**, **Ring**, **DMA**, and **Per-byte IRQ** controls match
+the native server and C client. The toggle controls this Python process only.
+Byte mode counts one receiver IRQ per received wire byte. DMA mode counts
+`ceil(frame bytes / DMA size)` transaction completions. The adjacent **Ring**
+and **DMA** selectors set the IDLE-delimited frame capacity and maximum DMA
+transaction size, respectively.
+The ring menu includes 32 B, 64 B, 128 B, and 256 B alongside its larger sizes,
+matching the small DMA choices.
+The background reader continuously drains configured DMA-sized transactions;
+ring capacity validates each completed H4 frame and does not throttle bytes to
+one ring-capacity span per Tk refresh.
+
+The lower monitor applies the same pipeline units as the FreeRTOS server: a
+16-slot completed-packet queue, H4 wire bytes in the circular ring, and bytes in
+one DMA transaction. It retains one minute of half-second rate samples, reports
+enqueue-to-consume latency and CRC/queue/ring drops, and derives time-to-overrun
+only when the measured producer rate exceeds the consumer rate.
+The graph also retains queue (**Q%**), ring (**R%**), and DMA (**D%**) peak
+utilization as percentages of their selected capacities, clamped at 100%.
+Short ring and DMA peaks remain visible for one half-second display interval,
+then clear on the next quiet sample.
+The monitor repaints at 20 Hz, labels its horizontal meters **Q PEAK** and
+**R PEAK**, and shows one-decimal percentages. Overlapping DMA and ring graph
+traces remain separately visible through a wide-gray/amber-centerline style.
 
 The IRQ dashboard count is local to this Python process and accumulates while
 incoming serial bytes are consumed through the selected receive path.
@@ -60,7 +89,9 @@ log only after the final chunk.
 
 Transfers larger than 128 bytes use compact start/progress/completion log lines
 instead of formatting every ACL chunk as hexadecimal, avoiding UI logging as a
-throughput bottleneck.
+throughput bottleneck. Separate gauge-only notifications advance the progress
+bar at approximately 60 Hz, matching the native C client and server without
+adding those animation updates to the log.
 
 The receive parser uses the platform-optimized CRC16 primitive and compacts a
 coalesced serial buffer only once per read. Server-to-client transfers therefore

@@ -90,13 +90,53 @@ handler calls in byte mode and completed simulated DMA transactions in DMA
 mode. It is local to that server process and is not synchronized to the client
 dashboards.
 
+Every graphical dashboard splits the retained traffic log from a real-time RX
+pipeline instrument. Blue and cyan traces show the measured bytes per second
+crossing the FreeRTOS producer and consumer tasks during each half-second
+sample, retaining one minute of history. The queue gauge reports occupied
+packet slots and the ring gauge reports the most recent producer wake-up burst.
+The footer reports measured enqueue-to-consume latency and CRC/queue/ring drops.
+Purple **Q%**, amber **R%**, and gray **D%** graph traces show each sampling
+interval's peak queue, ring, and DMA utilization on a normalized 0–100% scale.
+Live ring and DMA occupancy return to zero as soon as their bytes are consumed;
+the peak traces preserve short bursts for later inspection.
+
+Headroom is derived from observed backlog growth and currently free queue/ring
+capacity. It reads **stable** whenever the consumer is keeping pace. When the
+producer is measurably faster, it becomes a time-to-overrun estimate and changes
+to amber below ten seconds or red below two seconds. This is deliberately based
+on actual task traffic rather than the selected baud's theoretical capacity, so
+idle links and successfully drained high-rate links do not produce false
+warnings.
+
+The native C client and Python client now carry the same **Clock**, **Baud**,
+**Ring**, **DMA**, and **Per-byte IRQ** controls as the server. The C client
+measures its serial-read-to-parser path; the Python client measures its actual
+background-reader-to-Tk-consumer queue. Consequently, their traces and headroom
+remain local and can legitimately differ from the server during the same
+transfer.
+
 The dashboard also mirrors the client sending controls. It can transmit preset
 or custom typed HCI commands, arbitrary raw H4 packets, the 128-byte quick-test
 message, and selectable 16 KiB through 16 MiB deterministic ACL transfers to the
 connected client. Ordinary packets use the normal FreeRTOS TX queue and DMA
-engine. Large transfers retain the same typed 255-byte H4/CRC frames but mirror
-the fast client sender by coalescing them into 64 KiB serial batches, avoiding
-thousands of host scheduler wakeups and writes.
+engine. Large transfers retain the same typed 255-byte H4/CRC frames while
+coalescing serial writes instead of issuing one host write per frame. Both
+directions use the selected baud as the same logical payload clock, so a 2 MiB
+transfer at 4 Mbaud completes in about 4.2 seconds whether initiated by a client
+or by the server. This prevents pseudo-UART speed from depending on host task
+and syscall overhead while preserving responsive UIs.
+
+All three graphical senders advance their progress bars from silent,
+baud-derived gauge updates at approximately 60 Hz. Human-readable progress
+records remain limited to 256 KiB boundaries, so smooth animation does not
+consume the retained traffic log or reduce transfer throughput.
+
+`tools/benchmark_bidirectional.py` launches the real server engine and sends the
+same deterministic transfer in both directions. It checks CRCs, packet count,
+wire-byte count, completion, and timing parity; by default it fails when the
+slower direction takes more than 1.15 times as long as the faster direction.
+It also accepts `--baud`, `--mode`, `--ring`, and `--dma` for parameter sweeps.
 
 Both native dashboards display the repository release version and load the
 same platform UI family as the Python client: Avenir Next on macOS, Segoe UI on
@@ -144,10 +184,34 @@ input. The model follows the baud generator and 4-to-32-sample acquisition range
 described in NXP's [KW47 Reference Manual](https://www.nxp.com/docs/en/reference-manual/KW47RM.pdf)
 and [LPUART baud-rate application note](https://www.nxp.com/docs/en/application-note/AN14458.pdf).
 
-The **Ring** selector changes the active circular receive capacity from 256 B
-through 64 KiB. The independent **DMA** selector changes a receive transaction
-from 32 B through 4 KiB. Native logs retain 256 lines; use the mouse wheel over
-the log or click its scrollbar to inspect earlier traffic.
+The **Ring** selector changes the active circular receive capacity from 32 B
+through 64 KiB, including the same 32 B, 64 B, 128 B, and 256 B choices offered
+by the **DMA** selector. The independent DMA setting changes the maximum bytes
+in one receive transaction. Buffer histories in every pipeline graph are
+capacity percentages: **Q%** is the message queue, **R%** the circular ring, and
+**D%** the DMA transaction. A saturated or overwritten buffer is clamped to the
+100% chart boundary instead of drawing outside it.
+
+The server deliberately wakes its producer on UART IDLE, matching a common
+embedded DMA design. Consequently, the ring must retain the complete H4 wire
+frame that arrived before IDLE; selecting a smaller ring causes a real circular
+overwrite and drops that frame. DMA capacity instead controls how many
+transfer-complete interrupts occur (approximately `ceil(wire bytes / DMA
+size)`) without changing baud-limited throughput. The native C client applies
+the same IDLE-delimited frame and DMA-transaction accounting as the server, so
+the same frame produces the same ring percentage and IRQ count in either
+direction. Its live gauge holds a short interval peak for one 500 ms display
+sample and returns to zero on the next quiet sample. Both clients drain all
+completed DMA transactions already waiting in their serial drivers; ring size
+limits an individual IDLE-delimited frame and never acts as a per-render-frame
+throughput budget. Native logs retain 256 lines; use the mouse wheel over the
+log or click its scrollbar to inspect earlier traffic.
+
+The server dashboard polls live peak occupancy at 10 Hz while retaining graph
+samples at 2 Hz. The two horizontal meters are explicitly labeled **Q PEAK**
+and **R PEAK** and show one decimal place. When ring and DMA utilization are
+equal, the graph draws DMA as a wide gray underlay and ring utilization as an
+amber centerline so neither trace can hide the other.
 
 Each graphical app owns its IRQ dashboard counter. The value is cumulative for
 that app process. Each ordinary packet resets a separate transmission counter;
@@ -174,6 +238,20 @@ On macOS:
 ```sh
 open "build/BLE UART Server.app"
 ```
+
+The graphical C and Python clients remember their last selected UART port
+between launches. They also share saved client settings for clock, baud, ring
+capacity, DMA size, large-transfer size, and per-byte IRQ mode. The graphical
+server saves the same controls independently, so server receive settings do
+not overwrite the clients. **Defaults** immediately restores 20 MHz, 4 Mbaud,
+16 KiB ring, 256 B DMA, 2 MiB transfer, and DMA + IDLE receive mode.
+
+Preferences are stored in the platform user configuration directory:
+`~/Library/Application Support/BLE UART/client-port.txt` on macOS,
+`%APPDATA%\\BLE UART\\client-port.txt` on Windows, or
+`${XDG_CONFIG_HOME:-~/.config}/ble-uart/client-port.txt` on Linux.
+The adjacent `client-settings.txt` and `server-settings.txt` files hold the
+independent dashboard settings.
 
 On Linux:
 

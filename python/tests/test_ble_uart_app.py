@@ -2,7 +2,10 @@
 
 import pathlib
 import sys
+import tempfile
+import time
 import unittest
+from unittest import mock
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 
@@ -20,6 +23,10 @@ from ble_protocol import (  # noqa: E402
     parse_hex,
 )
 from dashboard_config import DMA_BUFFER_SIZES, RING_BUFFER_SIZES  # noqa: E402
+from dashboard_pipeline import PipelineTelemetry  # noqa: E402
+from client_preferences import (  # noqa: E402
+    DashboardSettings, load_port, load_settings, save_port, save_settings,
+)
 from lpuart_sim import LpuartSimulator  # noqa: E402
 
 
@@ -29,6 +36,29 @@ class ProtocolTests(unittest.TestCase):
     def test_crc_known_vector(self):
         """Verify the standard CRC16-CCITT `123456789` check value."""
         self.assertEqual(crc16_ccitt(b"123456789"), 0x29B1)
+
+    def test_pipeline_clears_live_buffers_and_retains_peaks(self):
+        """Match the server's queue, ring, and DMA percentages for one frame."""
+        telemetry = PipelineTelemetry()
+        telemetry.ring_capacity = 4096
+        telemetry.dma_capacity = 256
+        telemetry.record_arrival(255)
+        telemetry.record_produced(253, 1)
+        telemetry.record_consumed(253, 0, time.monotonic_ns())
+        telemetry.sample_time -= 1.0
+        telemetry.sample()
+        self.assertEqual(telemetry.producer_bps, telemetry.consumer_bps)
+        self.assertIsNone(telemetry.headroom_us)
+        self.assertEqual(len(telemetry.producer_history), 1)
+        self.assertAlmostEqual(telemetry.queue_history[0], 6.25)
+        self.assertAlmostEqual(telemetry.ring_history[0], 255 / 4096 * 100)
+        self.assertAlmostEqual(telemetry.dma_history[0], 255 / 256 * 100)
+        self.assertEqual(telemetry.ring_burst, 255)
+        self.assertEqual(telemetry.dma_burst, 255)
+        telemetry.sample_time -= 1.0
+        telemetry.sample()
+        self.assertEqual(telemetry.ring_burst, 0)
+        self.assertEqual(telemetry.dma_burst, 0)
 
     def test_build_reset_command(self):
         """Verify HCI Reset framing and its appended CRC."""
@@ -63,10 +93,41 @@ class ProtocolTests(unittest.TestCase):
 
     def test_receive_buffer_sizes_match_native_apps(self):
         """Keep the Python ring and DMA selectors aligned with both C UIs."""
-        self.assertEqual(dict(RING_BUFFER_SIZES)["16 KiB"], 16 * 1024)
-        self.assertEqual(dict(RING_BUFFER_SIZES)["64 KiB"], 64 * 1024)
+        self.assertEqual(RING_BUFFER_SIZES[:4], (
+            ("32 B", 32), ("64 B", 64), ("128 B", 128), ("256 B", 256)))
+        self.assertEqual(RING_BUFFER_SIZES[-2:], (
+            ("16 KiB", 16 * 1024), ("64 KiB", 64 * 1024)))
         self.assertEqual(dict(DMA_BUFFER_SIZES)["256 B"], 256)
         self.assertEqual(dict(DMA_BUFFER_SIZES)["4 KiB"], 4 * 1024)
+
+    def test_client_port_preference_round_trip(self):
+        """Persist and restore the last client port without touching user files."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory) / "client-port.txt"
+            with mock.patch("client_preferences.preference_path", return_value=path):
+                self.assertEqual(load_port("fallback"), "fallback")
+                self.assertTrue(save_port("/dev/ttys042"))
+                self.assertEqual(load_port("fallback"), "/dev/ttys042")
+                self.assertFalse(save_port("bad\nport"))
+                settings = DashboardSettings(
+                    clock=16_000_000, baud=3_000_000, ring=4096,
+                    dma=128, bulk=512 * 1024, byte_irq=True)
+                self.assertTrue(save_settings("client", settings))
+                self.assertEqual(load_settings("client"), settings)
+                self.assertEqual(load_settings("server"), DashboardSettings())
+
+    def test_pipeline_percentages_are_clamped_to_chart_capacity(self):
+        """Keep transient over-capacity samples inside the percentage graph."""
+        telemetry = PipelineTelemetry()
+        telemetry.queue_capacity = telemetry.ring_capacity = 32
+        telemetry.dma_capacity = 32
+        telemetry.record_arrival(128)
+        telemetry.record_produced(128, 128)
+        telemetry.sample_time -= 1.0
+        telemetry.sample()
+        self.assertEqual(telemetry.queue_history[-1], 100.0)
+        self.assertEqual(telemetry.ring_history[-1], 100.0)
+        self.assertEqual(telemetry.dma_history[-1], 100.0)
 
     def test_kw47_lpuart_clock_sampling(self):
         """Match native OSR/SBR selection and sampled packet failures."""

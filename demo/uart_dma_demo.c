@@ -53,6 +53,8 @@ static void injectControllerFrame(const void *payload, uint16_t payloadLength) {
 
     copyToDmaRing(payload, payloadLength);
     copyToDmaRing(&trailer, sizeof(trailer));
+    UartDmaRingBuffer_CommitDmaWrite(
+        dmaWriteIndex, (uint32_t)payloadLength + (uint32_t)sizeof(trailer));
 
     DMA_RX_STREAM->NDTR = dmaBufferSize - dmaWriteIndex;
     USART_HW->ISR = UART_IDLE_FLAG;

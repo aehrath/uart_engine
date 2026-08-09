@@ -1,11 +1,14 @@
 /** @file
  * @brief Portable raylib/raygui BLE HCI UART client application. */
 #include "raylib.h"
+#include "client_preferences.h"
 #include "dashboard_config.h"
 #include "dashboard_dropdown.h"
 #include "dashboard_log.h"
+#include "dashboard_pipeline.h"
 #include "dashboard_ui.h"
 #include "h4_wire.h"
+#include "lpuart_sim.h"
 #include "serial_port.h"
 #include "test_transfer_protocol.h"
 #include "uart_dma/app_version.h"
@@ -47,8 +50,6 @@ typedef struct {
     bool testIrqActive;
     /** Next logical byte offset that produces a compact receive-progress log. */
     uint32_t testLogNextProgress;
-    /** Whether the current DMA read has been charged to an active test transfer. */
-    bool currentReadDmaAccounted;
 } TrafficLog_t;
 
 /** Incremental state for a nonblocking deterministic test transfer. */
@@ -63,6 +64,8 @@ typedef struct {
     uint32_t nextProgress;
     /** Whether the render loop should continue producing chunks. */
     bool active;
+    /** Monotonic start used to pace both directions from selected baud. */
+    double startedAt;
 } TestSender_t;
 
 /** State of the connection-time server identity check. */
@@ -87,6 +90,12 @@ typedef struct {
     TrafficLog_t *log;
     /** Active connection verification state. */
     ConnectionHandshake_t *handshake;
+    /** App-local producer/consumer telemetry updated by completed frames. */
+    AppDashboardPipeline_t *pipeline;
+    /** H4 bytes validated by the producer during the current sample. */
+    uint64_t *producedSinceSample;
+    /** H4 bytes synchronously delivered to the consumer during the sample. */
+    uint64_t *consumedSinceSample;
 } ClientFrameContext_t;
 
 /** Append a formatted line, evicting the oldest line when full. */
@@ -207,6 +216,42 @@ static void logFrame(const uint8_t *frame, size_t length, bool crcValid,
     ClientFrameContext_t *const frameContext = context;
     TrafficLog_t *const log = frameContext->log;
     ConnectionHandshake_t *const handshake = frameContext->handshake;
+    AppDashboardPipeline_t *const pipeline = frameContext->pipeline;
+    const uint32_t wireLength = (uint32_t)length;
+    const uint32_t irqCalls = log->receiveByteIrqActive ? wireLength
+        : pipeline->dmaCapacity == 0U ? 0U
+        : (wireLength + pipeline->dmaCapacity - 1U) / pipeline->dmaCapacity;
+    log->absoluteIrqCount += irqCalls;
+    pipeline->ringBurstBytes = wireLength < pipeline->ringCapacity
+        ? wireLength : pipeline->ringCapacity;
+    if (pipeline->ringBurstBytes > pipeline->ringHighWaterBytes) {
+        pipeline->ringHighWaterBytes = pipeline->ringBurstBytes;
+    }
+    pipeline->dmaBurstBytes = wireLength < pipeline->dmaCapacity
+        ? wireLength : pipeline->dmaCapacity;
+    if (pipeline->dmaBurstBytes > pipeline->dmaHighWaterBytes) {
+        pipeline->dmaHighWaterBytes = pipeline->dmaBurstBytes;
+    }
+    if (wireLength > pipeline->ringCapacity) {
+        pipeline->ringDrops++;
+        appendLog(log, "ERROR  RX ring overwrite: frame=%u capacity=%u",
+                  (unsigned int)wireLength,
+                  (unsigned int)pipeline->ringCapacity);
+        return;
+    }
+    if (!crcValid) frameContext->pipeline->crcDrops++;
+    if (crcValid) {
+        const uint64_t h4Length = wireLength - sizeof(BleHciCrcTrailer_t);
+        *frameContext->producedSinceSample += h4Length;
+        *frameContext->consumedSinceSample += h4Length;
+        /* Mirror the server's FreeRTOS producer/consumer hand-off. The
+         * synchronous UI consumer drains immediately, but the enqueue still
+         * reaches a one-packet high-water mark in the shared 16-slot queue. */
+        if (pipeline->queueHighWater < 1U) {
+            pipeline->queueHighWater = 1U;
+        }
+        pipeline->queueDepth = 1U;
+    }
     log->receivedPackets++;
     const size_t h4Length = length - 2U;
     BleHciPacketIndicator_t indicator;
@@ -253,12 +298,7 @@ static void logFrame(const uint8_t *frame, size_t length, bool crcValid,
         log->testLogNextProgress = TEST_TRANSFER_PROGRESS_STEP;
     }
     if (testFrame && log->testIrqActive) {
-        if (log->receiveByteIrqActive) {
-            log->testIrqCalls += (uint32_t)length;
-        } else if (!log->currentReadDmaAccounted) {
-            log->testIrqCalls++;
-            log->currentReadDmaAccounted = true;
-        }
+        log->testIrqCalls += irqCalls;
     }
     if (testFrame && log->testIrqActive &&
         (testFlags & TEST_TRANSFER_FLAG_END) != 0U) {
@@ -266,8 +306,7 @@ static void logFrame(const uint8_t *frame, size_t length, bool crcValid,
         log->testIrqActive = false;
         irqCompletion = true;
     } else if (!testFrame) {
-        log->transmissionIrqCount = log->receiveByteIrqActive
-            ? (uint32_t)length : 1U;
+        log->transmissionIrqCount = irqCalls;
     }
     const bool suppressBytes = testFrame && testTotal > 128U;
     if (suppressBytes) {
@@ -321,17 +360,25 @@ static void startTestTransfer(TestSender_t *sender, AppSerialPort_t *port,
     sender->offset = 0U;
     sender->nextProgress = TEST_TRANSFER_PROGRESS_STEP;
     sender->active = true;
+    sender->startedAt = GetTime();
     appendLog(log, "TEST  Sending %u bytes (id=%u)",
               (unsigned int)totalSize, sender->identifier);
 }
 
 /** Generate and send a bounded batch of test chunks during one render frame. */
 static void pumpTestTransfer(TestSender_t *sender, AppSerialPort_t *port,
-                             TrafficLog_t *log) {
+                             TrafficLog_t *log, uint32_t baud) {
     if (!sender->active) {
         return;
     }
-    for (unsigned int packet = 0U; packet < 64U && sender->offset < sender->totalSize; packet++) {
+    const uint64_t available = (uint64_t)((GetTime() - sender->startedAt) *
+                               ((double)baud / 8.0));
+    const uint32_t target = available < sender->totalSize
+        ? (uint32_t)available : sender->totalSize;
+    static uint8_t wireBatch[64U * 1024U];
+    size_t batchLength = 0U;
+    uint32_t batchPackets = 0U;
+    while (sender->offset < target) {
         const uint32_t remaining = sender->totalSize - sender->offset;
         const uint16_t chunkSize = (uint16_t)(remaining < TEST_TRANSFER_CHUNK_DATA_SIZE
             ? remaining : TEST_TRANSFER_CHUNK_DATA_SIZE);
@@ -358,13 +405,26 @@ static void pumpTestTransfer(TestSender_t *sender, AppSerialPort_t *port,
         for (uint16_t index = 0U; index < chunkSize; index++) {
             acl.data[index] = TestTransfer_PatternByte(sender->offset + index);
         }
-        if (!sendFramedEx(port, log, &acl, sizeof(acl.h4) + aclLength, false)) {
+        const size_t h4Length = sizeof(acl.h4) + aclLength;
+        const BleHciCrcTrailer_t trailer = {
+            BleHciWire_ToBe16(AppH4_Crc16(&acl, h4Length))
+        };
+        const size_t wireLength = h4Length + sizeof(trailer);
+        if (batchLength + wireLength > sizeof(wireBatch)) break;
+        memcpy(&wireBatch[batchLength], &acl, h4Length);
+        memcpy(&wireBatch[batchLength + h4Length], &trailer, sizeof(trailer));
+        batchLength += wireLength;
+        batchPackets++;
+        sender->offset += chunkSize;
+    }
+    if (batchLength != 0U) {
+        if (!AppSerialPort_Write(port, wireBatch, batchLength)) {
             sender->active = false;
             appendLog(log, "ERROR  Test transfer stopped after %u bytes",
                       (unsigned int)sender->offset);
             return;
         }
-        sender->offset += chunkSize;
+        log->transmittedPackets += batchPackets;
         if (sender->offset >= sender->nextProgress) {
             appendLog(log, "TEST  Sent %u/%u bytes (%u%%)",
                       (unsigned int)sender->offset, (unsigned int)sender->totalSize,
@@ -398,9 +458,16 @@ int main(void) {
     AppH4StreamParser_Init(&parser);
     TrafficLog_t log = {0};
     AppDashboardLog_Init(&log.messages);
-    TestSender_t testSender = {0U, 0U, 0U, 0U, false};
+    TestSender_t testSender = {0U, 0U, 0U, 0U, false, 0.0};
     ConnectionHandshake_t handshake = {0};
-    ClientFrameContext_t frameContext = {&log, &handshake};
+    AppDashboardPipeline_t pipeline;
+    AppDashboardPipeline_Reset(&pipeline);
+    uint64_t producedSinceSample = 0U;
+    uint64_t consumedSinceSample = 0U;
+    ClientFrameContext_t frameContext = {
+        &log, &handshake, &pipeline,
+        &producedSinceSample, &consumedSinceSample
+    };
 #ifdef _WIN32
     char portText[128] = "COM3";
 #elif defined(__APPLE__)
@@ -408,13 +475,12 @@ int main(void) {
 #else
     char portText[128] = "/dev/ttyUSB0";
 #endif
-    char baudText[32] = "4000000";
+    (void)AppClientPreferences_LoadPort(portText, sizeof(portText));
     char opcodeText[16] = "0C03";
     char parametersText[768] = "";
     char rawText[1024] = "01 03 0C 00";
     char statusText[180] = "Disconnected";
     bool portEdit = false;
-    bool baudEdit = false;
     bool opcodeEdit = false;
     bool parametersEdit = false;
     bool rawEdit = false;
@@ -422,39 +488,76 @@ int main(void) {
     bool bulkSizeDropdown = false;
     bool ringSizeDropdown = false;
     bool dmaSizeDropdown = false;
+    bool clockDropdown = false;
+    bool baudDropdown = false;
     int presetIndex = 0;
     int previousPreset = 0;
-    int bulkSizeIndex = 5;
-    int ringSizeIndex = 3;
-    int dmaSizeIndex = 3;
+    AppDashboardSettings_t savedSettings;
+    (void)AppClientPreferences_LoadSettings(
+        APP_PREFERENCES_CLIENT, &savedSettings);
+    int bulkSizeIndex = AppDashboardConfig_FindSize(
+        APP_DASHBOARD_BULK_SIZES, APP_DASHBOARD_BULK_SIZE_COUNT,
+        savedSettings.bulkBytes, 5);
+    int ringSizeIndex = AppDashboardConfig_FindSize(
+        APP_DASHBOARD_RING_SIZES, APP_DASHBOARD_RING_SIZE_COUNT,
+        savedSettings.ringBytes, 6);
+    int dmaSizeIndex = AppDashboardConfig_FindSize(
+        APP_DASHBOARD_DMA_SIZES, APP_DASHBOARD_DMA_SIZE_COUNT,
+        savedSettings.dmaBytes, 3);
+    int clockIndex = AppDashboardConfig_FindSize(
+        APP_DASHBOARD_SYSTEM_CLOCKS, APP_DASHBOARD_SYSTEM_CLOCK_COUNT,
+        savedSettings.systemClockHz, 4);
+    int baudIndex = AppDashboardConfig_FindSize(
+        APP_DASHBOARD_BAUD_RATES, APP_DASHBOARD_BAUD_RATE_COUNT,
+        savedSettings.baud, 4);
+    savedSettings = (AppDashboardSettings_t){
+        .systemClockHz = (uint32_t)APP_DASHBOARD_SYSTEM_CLOCKS[clockIndex].size,
+        .baud = (uint32_t)APP_DASHBOARD_BAUD_RATES[baudIndex].size,
+        .ringBytes = (uint32_t)APP_DASHBOARD_RING_SIZES[ringSizeIndex].size,
+        .dmaBytes = (uint32_t)APP_DASHBOARD_DMA_SIZES[dmaSizeIndex].size,
+        .bulkBytes = (uint32_t)APP_DASHBOARD_BULK_SIZES[bulkSizeIndex].size,
+        .byteIrq = savedSettings.byteIrq,
+    };
+    log.byteIrqMode = savedSettings.byteIrq;
+    log.receiveByteIrqActive = savedSettings.byteIrq;
+    pipeline.queueCapacity = 16U;
+    pipeline.ringCapacity =
+        (uint32_t)APP_DASHBOARD_RING_SIZES[ringSizeIndex].size;
+    pipeline.dmaCapacity =
+        (uint32_t)APP_DASHBOARD_DMA_SIZES[dmaSizeIndex].size;
+    AppLpuartSimulator_t receiverSimulator;
+    (void)AppLpuartSim_Configure(
+        &receiverSimulator,
+        (uint32_t)APP_DASHBOARD_SYSTEM_CLOCKS[clockIndex].size,
+        (uint32_t)APP_DASHBOARD_BAUD_RATES[baudIndex].size);
+    double pipelineSampleTime = GetTime();
     AppDashboardConfig_PresetToFields(0, opcodeText, sizeof(opcodeText), parametersText, sizeof(parametersText));
     appendLog(&log, "Ready. Start ble_uart_server and enter its printed port.");
-    static uint8_t receiveRing[64U * 1024U];
 
     while (!WindowShouldClose()) {
         if (serial.connected) {
             uint8_t incoming[4096U];
-            size_t receivedThisFrame = 0U;
             int received = 0;
             do {
-                const size_t ringRemaining = APP_DASHBOARD_RING_SIZES[ringSizeIndex].size
-                    - receivedThisFrame;
-                const size_t readCapacity = APP_DASHBOARD_DMA_SIZES[dmaSizeIndex].size
-                    < ringRemaining ? APP_DASHBOARD_DMA_SIZES[dmaSizeIndex].size : ringRemaining;
+                /* Drain every completed DMA transaction already waiting in the
+                 * nonblocking driver. Ring capacity limits one IDLE-delimited
+                 * frame; it must not become a per-render-frame byte budget. */
+                const size_t readCapacity =
+                    APP_DASHBOARD_DMA_SIZES[dmaSizeIndex].size;
                 received = AppSerialPort_Read(
                     &serial, incoming, readCapacity);
                 if (received <= 0) {
                     break;
                 }
-                memcpy(&receiveRing[receivedThisFrame], incoming, (size_t)received);
-                log.absoluteIrqCount += log.receiveByteIrqActive
-                    ? (uint32_t)received : 1U;
-                log.currentReadDmaAccounted = false;
+                const double queuedAt = GetTime();
                 (void)AppH4StreamParser_Feed(
-                    &parser, &receiveRing[receivedThisFrame], (size_t)received,
+                    &parser, incoming, (size_t)received,
                     logFrame, &frameContext);
-                receivedThisFrame += (size_t)received;
-            } while (receivedThisFrame < APP_DASHBOARD_RING_SIZES[ringSizeIndex].size);
+                pipeline.latencyUs = (uint64_t)((GetTime() - queuedAt) * 1000000.0);
+                if (pipeline.latencyUs > pipeline.latencyMaxUs) {
+                    pipeline.latencyMaxUs = pipeline.latencyUs;
+                }
+            } while (received > 0);
             if (received < 0) {
                 appendLog(&log, "ERROR  Serial connection lost");
                 AppSerialPort_Close(&serial);
@@ -484,12 +587,38 @@ int main(void) {
             (void)snprintf(statusText, sizeof(statusText), "Connected to %s", portText);
             appendLog(&log, "Connected to %s; server identity verified", portText);
         }
-        pumpTestTransfer(&testSender, &serial, &log);
+        pumpTestTransfer(&testSender, &serial, &log,
+                         (uint32_t)APP_DASHBOARD_BAUD_RATES[baudIndex].size);
+
+        const double sampleNow = GetTime();
+        if (sampleNow - pipelineSampleTime >= 0.5) {
+            const double elapsed = sampleNow - pipelineSampleTime;
+            pipeline.producerBps = (uint64_t)((double)producedSinceSample / elapsed);
+            pipeline.consumerBps = (uint64_t)((double)consumedSinceSample / elapsed);
+            pipeline.queueDepth = 0U;
+            pipeline.queueCapacity = 16U;
+            pipeline.queuedBytes = 0U;
+            pipeline.ringCapacity =
+                (uint32_t)APP_DASHBOARD_RING_SIZES[ringSizeIndex].size;
+            pipeline.dmaCapacity =
+                (uint32_t)APP_DASHBOARD_DMA_SIZES[dmaSizeIndex].size;
+            if (pipeline.producerBps > pipeline.consumerBps) {
+                const uint64_t growth = pipeline.producerBps - pipeline.consumerBps;
+                const uint64_t freeBytes = pipeline.ringCapacity > pipeline.ringBurstBytes
+                    ? pipeline.ringCapacity - pipeline.ringBurstBytes : 0U;
+                pipeline.headroomUs = freeBytes * 1000000ULL / growth;
+            } else {
+                pipeline.headroomUs = UINT64_MAX;
+            }
+            AppDashboardPipeline_Sample(&pipeline);
+            producedSinceSample = 0U;
+            consumedSinceSample = 0U;
+            pipelineSampleTime = sampleNow;
+        }
 
         /* Raygui text boxes have caller-owned focus; keep exactly one active. */
         if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT)) {
             portEdit = false;
-            baudEdit = false;
             opcodeEdit = false;
             parametersEdit = false;
             rawEdit = false;
@@ -535,9 +664,6 @@ int main(void) {
         GuiLabel((Rectangle){44, 247, 50, 38}, "Port");
         AppDashboardUi_TextBox((Rectangle){96, 247, 426, 38}, portText,
                              sizeof(portText), &portEdit);
-        GuiLabel((Rectangle){542, 247, 52, 38}, "Baud");
-        AppDashboardUi_TextBox((Rectangle){598, 247, 138, 38}, baudText,
-                             sizeof(baudText), &baudEdit);
         if (AppDashboardUi_Button((Rectangle){756, 247, 170, 38},
                          serial.connected ? "Disconnect" : "Connect", true)) {
             if (serial.connected) {
@@ -547,13 +673,21 @@ int main(void) {
                 (void)snprintf(statusText, sizeof(statusText), "Disconnected");
                 appendLog(&log, "Disconnected from %s", portText);
             } else {
-                char *end = NULL;
-                const unsigned long baud = strtoul(baudText, &end, 10);
+                const unsigned long baud =
+                    APP_DASHBOARD_BAUD_RATES[baudIndex].size;
                 char error[180];
-                if (end == baudText || *end != '\0') {
-                    (void)snprintf(statusText, sizeof(statusText), "Invalid baud rate");
-                } else if (AppSerialPort_Open(&serial, portText, baud, error, sizeof(error))) {
+                (void)AppClientPreferences_SavePort(portText);
+                if (AppSerialPort_Open(&serial, portText, baud, error, sizeof(error))) {
                     AppH4StreamParser_Init(&parser);
+                    AppDashboardPipeline_Reset(&pipeline);
+                    pipeline.queueCapacity = 16U;
+                    pipeline.ringCapacity =
+                        (uint32_t)APP_DASHBOARD_RING_SIZES[ringSizeIndex].size;
+                    pipeline.dmaCapacity =
+                        (uint32_t)APP_DASHBOARD_DMA_SIZES[dmaSizeIndex].size;
+                    producedSinceSample = 0U;
+                    consumedSinceSample = 0U;
+                    pipelineSampleTime = GetTime();
                     (void)snprintf(statusText, sizeof(statusText),
                                    "Verifying BLE UART server on %s...", portText);
                     appendLog(&log, "Opened %s at %lu baud; verifying server", portText, baud);
@@ -568,10 +702,13 @@ int main(void) {
                 }
             }
         }
-        AppDashboardUi_StatusField((Rectangle){44, 298, 414, 28}, statusText);
-        AppDashboardUi_DrawText("Ring", 480, 305, 12, COLOR_MUTED);
-        AppDashboardUi_DrawText("DMA", 640, 305, 12, COLOR_MUTED);
-        AppDashboardUi_DrawText("Native clipboard shortcuts enabled", 46, 329, 12, COLOR_MUTED);
+        AppDashboardUi_StatusField((Rectangle){44, 292, 166, 34}, statusText);
+        AppDashboardUi_DrawText("Clock", 230, 300, 12, COLOR_MUTED);
+        AppDashboardUi_DrawText("Baud", 390, 300, 12, COLOR_MUTED);
+        AppDashboardUi_DrawText("Ring", 548, 300, 12, COLOR_MUTED);
+        AppDashboardUi_DrawText("DMA", 706, 300, 12, COLOR_MUTED);
+        const bool restoreDefaults = AppDashboardUi_Button(
+            (Rectangle){858, 292, 90, 34}, "Defaults", true);
         const bool connectionReady = serial.connected && handshake.verified;
         const bool rxModeChanged = AppDashboardUi_Toggle(
             (Rectangle){958, 254, 118, 24}, "Per-byte IRQ",
@@ -647,41 +784,106 @@ int main(void) {
                        (unsigned int)testSender.totalSize);
         AppDashboardUi_DrawText(progressText, 792, 665, 12, COLOR_MUTED);
 
-        AppDashboardUi_DrawPanel((Rectangle){24, 740, 1072, 196}, "LIVE UART TRAFFIC");
-        DrawRectangleRounded((Rectangle){44, 777, 1032, 142}, 16.0f / 142.0f, 12,
+        AppDashboardUi_DrawPanel((Rectangle){24, 740, 1072, 196},
+                                 "LIVE UART TRAFFIC + PIPELINE HEADROOM");
+        DrawRectangleRounded((Rectangle){44, 777, 540, 142}, 16.0f / 142.0f, 12,
                              (Color){7, 11, 20, 255});
         AppDashboardLog_Draw(&log.messages,
-                             (Rectangle){58, 786, 1004, 135},
+                             (Rectangle){58, 786, 512, 135},
                              AppDashboardUi_RegularFont(12),
                              (float)AppDashboardUi_RenderSize(12),
                              15.0f, clientLogColor);
+        AppDashboardPipeline_Draw(&pipeline, (Rectangle){600, 777, 476, 142});
 
         /* Draw last so the expanded selector overlays the traffic panel. */
         (void)AppDashboard_UpwardDropdown(
             (Rectangle){112, 397, 360, 38}, AppDashboardUi_Font(), APP_DASHBOARD_PRESET_OPTIONS,
             APP_DASHBOARD_PRESET_COUNT,
             &presetIndex, &presetDropdown);
-        (void)AppDashboard_UpwardDropdown(
+        const bool bulkSizeChanged = AppDashboard_UpwardDropdown(
             (Rectangle){392, 638, 132, 42}, AppDashboardUi_Font(), APP_DASHBOARD_BULK_SIZE_OPTIONS,
             APP_DASHBOARD_BULK_SIZE_COUNT,
             &bulkSizeIndex, &bulkSizeDropdown);
         const bool ringSizeChanged = AppDashboard_UpwardDropdown(
-            (Rectangle){520, 298, 100, 28}, AppDashboardUi_Font(), APP_DASHBOARD_RING_SIZE_OPTIONS,
+            (Rectangle){582, 292, 104, 34}, AppDashboardUi_Font(), APP_DASHBOARD_RING_SIZE_OPTIONS,
             APP_DASHBOARD_RING_SIZE_COUNT,
             &ringSizeIndex, &ringSizeDropdown);
         const bool dmaSizeChanged = AppDashboard_UpwardDropdown(
-            (Rectangle){680, 298, 100, 28}, AppDashboardUi_Font(), APP_DASHBOARD_DMA_SIZE_OPTIONS,
+            (Rectangle){742, 292, 104, 34}, AppDashboardUi_Font(), APP_DASHBOARD_DMA_SIZE_OPTIONS,
             APP_DASHBOARD_DMA_SIZE_COUNT,
             &dmaSizeIndex, &dmaSizeDropdown);
+        const bool clockChanged = AppDashboard_UpwardDropdown(
+            (Rectangle){276, 292, 104, 34}, AppDashboardUi_Font(),
+            APP_DASHBOARD_SYSTEM_CLOCK_OPTIONS, APP_DASHBOARD_SYSTEM_CLOCK_COUNT,
+            &clockIndex, &clockDropdown);
+        const bool baudChanged = AppDashboard_UpwardDropdown(
+            (Rectangle){430, 292, 104, 34}, AppDashboardUi_Font(),
+            APP_DASHBOARD_BAUD_RATE_OPTIONS, APP_DASHBOARD_BAUD_RATE_COUNT,
+            &baudIndex, &baudDropdown);
+        if (clockChanged || baudChanged) {
+            (void)AppLpuartSim_Configure(
+                &receiverSimulator,
+                (uint32_t)APP_DASHBOARD_SYSTEM_CLOCKS[clockIndex].size,
+                (uint32_t)APP_DASHBOARD_BAUD_RATES[baudIndex].size);
+            appendLog(&log, "RX  Timing: clock=%u baud=%u OSR=%u SBR=%u actual=%u",
+                      receiverSimulator.sourceClockHz,
+                      receiverSimulator.requestedBaud, receiverSimulator.osr,
+                      receiverSimulator.sbr, receiverSimulator.actualBaud);
+        }
         if (ringSizeChanged || dmaSizeChanged) {
+            pipeline.ringCapacity =
+                (uint32_t)APP_DASHBOARD_RING_SIZES[ringSizeIndex].size;
+            pipeline.dmaCapacity =
+                (uint32_t)APP_DASHBOARD_DMA_SIZES[dmaSizeIndex].size;
+            pipeline.ringBurstBytes = 0U;
+            pipeline.ringHighWaterBytes = 0U;
+            pipeline.dmaBurstBytes = 0U;
+            pipeline.dmaHighWaterBytes = 0U;
             appendLog(&log, "RX  Buffers: ring=%u bytes, DMA=%u bytes",
                       (unsigned int)APP_DASHBOARD_RING_SIZES[ringSizeIndex].size,
                       (unsigned int)APP_DASHBOARD_DMA_SIZES[dmaSizeIndex].size);
+        }
+        if (restoreDefaults) {
+            AppClientPreferences_DefaultSettings(&savedSettings);
+            bulkSizeIndex = 5;
+            ringSizeIndex = 6;
+            dmaSizeIndex = 3;
+            clockIndex = 4;
+            baudIndex = 4;
+            log.byteIrqMode = false;
+            log.receiveByteIrqActive = false;
+            AppDashboardPipeline_Reset(&pipeline);
+            pipeline.queueCapacity = 16U;
+            pipeline.ringCapacity = (uint32_t)savedSettings.ringBytes;
+            pipeline.dmaCapacity = (uint32_t)savedSettings.dmaBytes;
+            producedSinceSample = 0U;
+            consumedSinceSample = 0U;
+            pipelineSampleTime = GetTime();
+            (void)AppLpuartSim_Configure(
+                &receiverSimulator, savedSettings.systemClockHz,
+                savedSettings.baud);
+            appendLog(&log, "SETTINGS  Restored application defaults");
+        }
+        if (restoreDefaults || bulkSizeChanged || ringSizeChanged ||
+            dmaSizeChanged || clockChanged || baudChanged || rxModeChanged) {
+            savedSettings = (AppDashboardSettings_t){
+                .systemClockHz = (uint32_t)APP_DASHBOARD_SYSTEM_CLOCKS[clockIndex].size,
+                .baud = (uint32_t)APP_DASHBOARD_BAUD_RATES[baudIndex].size,
+                .ringBytes = (uint32_t)APP_DASHBOARD_RING_SIZES[ringSizeIndex].size,
+                .dmaBytes = (uint32_t)APP_DASHBOARD_DMA_SIZES[dmaSizeIndex].size,
+                .bulkBytes = (uint32_t)APP_DASHBOARD_BULK_SIZES[bulkSizeIndex].size,
+                .byteIrq = log.byteIrqMode,
+            };
+            (void)AppClientPreferences_SaveSettings(
+                APP_PREFERENCES_CLIENT, &savedSettings);
         }
         EndDrawing();
     }
 
     AppSerialPort_Close(&serial);
+    (void)AppClientPreferences_SavePort(portText);
+    (void)AppClientPreferences_SaveSettings(
+        APP_PREFERENCES_CLIENT, &savedSettings);
     AppDashboardUi_Shutdown();
     CloseWindow();
     return 0;

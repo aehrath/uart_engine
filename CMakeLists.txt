@@ -123,6 +123,7 @@ endif()
 option(UART_DMA_BUILD_CLIENT "Build the C UART HCI client" ON)
 
 add_library(ble_uart_app_common STATIC
+    apps/common/client_preferences.c
     apps/common/h4_wire.c
     apps/common/lpuart_sim.c
     apps/common/serial_port.c
@@ -198,6 +199,7 @@ if(UART_DMA_BUILD_PORTABLE_UI)
             apps/ble_uart_client_ui.c
             apps/common/dashboard_config.c
             apps/common/dashboard_font.c
+            apps/common/dashboard_pipeline.c
             apps/common/dashboard_ui.c
             apps/common/dashboard_dropdown.c
             apps/common/dashboard_log.c)
@@ -242,6 +244,7 @@ if(UART_DMA_BUILD_PORTABLE_UI)
             apps/ble_uart_server_ui.c
             apps/common/dashboard_config.c
             apps/common/dashboard_font.c
+            apps/common/dashboard_pipeline.c
             apps/common/dashboard_ui.c
             apps/common/dashboard_dropdown.c
             apps/common/dashboard_log.c)
@@ -325,6 +328,24 @@ if(BUILD_TESTING)
                     -s "${CMAKE_CURRENT_SOURCE_DIR}/python/tests"
                     -p "test_*.py"
         )
+        if(UNIX AND TARGET ble_uart_server)
+            add_test(
+                NAME ble_uart_bidirectional_tests
+                COMMAND "${Python3_EXECUTABLE}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/benchmark_bidirectional.py"
+                        "$<TARGET_FILE:ble_uart_server>"
+                        --size 524288 --baud 4000000 --mode dma
+                        --ring 16384 --dma 256 --max-ratio 1.20
+            )
+            set_tests_properties(ble_uart_bidirectional_tests PROPERTIES TIMEOUT 30)
+            add_test(
+                NAME ble_uart_buffer_effect_tests
+                COMMAND "${Python3_EXECUTABLE}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_buffer_effects.py"
+                        "$<TARGET_FILE:ble_uart_server>"
+            )
+            set_tests_properties(ble_uart_buffer_effect_tests PROPERTIES TIMEOUT 15)
+        endif()
     endif()
 endif()
 

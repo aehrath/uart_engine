@@ -10,6 +10,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -18,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #define UART_IDLE_FLAG       (1UL << 4)
@@ -53,6 +55,72 @@ static AppLpuartSimulator_t hostReceiver;
 static uint32_t invalidTestPackets;
 static uint32_t invalidTestChangedBytes;
 static uint32_t invalidTestFramingErrors;
+static UartDmaPipelineMetrics_t previousPipelineMetrics;
+static uint64_t previousPipelineTimeUs;
+
+/** Provide sub-tick queue latency measurements for the desktop simulation. */
+uint64_t UartDma_PlatformTimeUs(void) {
+    struct timespec now = {0, 0};
+    (void)clock_gettime(CLOCK_MONOTONIC, &now);
+    return (uint64_t)now.tv_sec * 1000000ULL + (uint64_t)now.tv_nsec / 1000ULL;
+}
+
+/** Print one measured producer/consumer sample for the live dashboard. */
+static void reportPipelineStats(void) {
+    UartDmaPipelineMetrics_t current;
+    UartDma_GetPipelineMetrics(&current);
+    const uint64_t nowUs = UartDma_PlatformTimeUs();
+    const uint64_t elapsedUs = previousPipelineTimeUs == 0U
+        ? 0U : nowUs - previousPipelineTimeUs;
+    const uint64_t producedDelta = current.producedBytes -
+        previousPipelineMetrics.producedBytes;
+    const uint64_t consumedDelta = current.consumedBytes -
+        previousPipelineMetrics.consumedBytes;
+    const uint32_t producedPacketDelta = current.producedPackets -
+        previousPipelineMetrics.producedPackets;
+    const uint64_t producerBps = elapsedUs == 0U ? 0U
+        : producedDelta * 1000000ULL / elapsedUs;
+    const uint64_t consumerBps = elapsedUs == 0U ? 0U
+        : consumedDelta * 1000000ULL / elapsedUs;
+    const uint64_t growthBps = producerBps > consumerBps
+        ? producerBps - consumerBps : 0U;
+    const uint64_t averagePacketBytes = producedPacketDelta == 0U
+        ? UART_DMA_MAX_PACKET_SIZE
+        : producedDelta / producedPacketDelta;
+    const uint64_t freeQueueBytes = current.queueCapacity > current.queueDepth
+        ? (uint64_t)(current.queueCapacity - current.queueDepth) * averagePacketBytes
+        : 0U;
+    const uint64_t freeRingBytes = current.ringCapacity > current.ringBurstBytes
+        ? current.ringCapacity - current.ringBurstBytes : 0U;
+    const bool droppedThisSample =
+        current.crcDrops != previousPipelineMetrics.crcDrops ||
+        current.queueDrops != previousPipelineMetrics.queueDrops ||
+        current.ringDrops != previousPipelineMetrics.ringDrops;
+    const bool capacityExhausted = current.queueDepth >= current.queueCapacity ||
+        current.ringBurstBytes >= current.ringCapacity;
+    const uint64_t headroomUs = droppedThisSample || capacityExhausted ? 0U
+        : growthBps == 0U ? UINT64_MAX
+        : (freeQueueBytes + freeRingBytes) * 1000000ULL / growthBps;
+
+    printf("RX PIPELINE -> producer_bps=%" PRIu64
+           " consumer_bps=%" PRIu64
+           " queued=%u queue=%u/%u queue_peak=%u"
+           " ring=%u/%u ring_peak=%u latency_us=%" PRIu64
+           " latency_max_us=%" PRIu64 " headroom_us=%" PRIu64
+           " crc_drop=%u queue_drop=%u ring_drop=%u\n",
+           producerBps, consumerBps, (unsigned int)current.queuedBytes,
+           (unsigned int)current.queueDepth, (unsigned int)current.queueCapacity,
+           (unsigned int)current.queueHighWater,
+           (unsigned int)current.ringBurstBytes,
+           (unsigned int)current.ringCapacity,
+           (unsigned int)current.ringHighWaterBytes,
+           current.lastLatencyUs, current.maxLatencyUs, headroomUs,
+           (unsigned int)current.crcDrops, (unsigned int)current.queueDrops,
+           (unsigned int)current.ringDrops);
+    fflush(stdout);
+    previousPipelineMetrics = current;
+    previousPipelineTimeUs = nowUs;
+}
 
 /** Print the divisor pair selected for the current simulated KW47 clock. */
 static void reportUartTiming(void) {
@@ -165,6 +233,7 @@ static void injectDmaFrame(const uint8_t *frame, uint16_t length) {
                 dmaBuffer[dmaWriteIndex] = frame[offset + index];
                 dmaWriteIndex = (dmaWriteIndex + 1U) % dmaBufferSize;
             }
+            UartDmaRingBuffer_CommitDmaWrite(dmaWriteIndex, transfer);
             offset = (uint16_t)(offset + transfer);
             DMA_RX_STREAM->NDTR = dmaBufferSize - dmaWriteIndex;
             DMA_RX_Complete_IRQHandler();
@@ -248,7 +317,7 @@ static bool testTransferFrameFlags(const uint8_t *frame, uint16_t length,
 
 /** Queue one dashboard-originated H4 packet for the server TX engine. */
 static void sendDashboardPacket(const char *encodedPacket) {
-    PacketMessage_t packet = {{0U}, 0U};
+    PacketMessage_t packet = {{0U}, 0U, 0U};
     const size_t length = parseDashboardPacket(
         encodedPacket, packet.payload, sizeof(packet.payload) - sizeof(BleHciCrcTrailer_t));
     if (length == SIZE_MAX || length == 0U) {
@@ -352,6 +421,23 @@ static bool writeAll(const uint8_t *data, size_t size) {
     return written;
 }
 
+/** Pace a logical test payload to the same selected-baud clock in both directions. */
+static void paceTestTransfer(uint64_t startedUs, uint32_t logicalBytes,
+                             uint32_t baud) {
+    const uint64_t deadline = startedUs +
+        (uint64_t)logicalBytes * 8000000ULL / baud;
+    while (!stopRequested) {
+        const uint64_t now = UartDma_PlatformTimeUs();
+        if (now >= deadline) return;
+        const uint64_t remaining = deadline - now;
+        const struct timespec pause = {
+            .tv_sec = (time_t)(remaining / 1000000ULL),
+            .tv_nsec = (long)((remaining % 1000000ULL) * 1000ULL),
+        };
+        (void)nanosleep(&pause, NULL);
+    }
+}
+
 /** Host implementation of the platform TX DMA hook. */
 void UartDma_PlatformTransmitDma(uint8_t *data, uint16_t size) {
     static uint8_t sampled[MAX_WIRE_FRAME];
@@ -440,7 +526,7 @@ static void controlReaderTask(void *parameters) {
                 } else if (strcmp(command, "stats") == 0) {
                     printf("RX IRQ COUNT -> %u\n",
                            (unsigned int)UartDma_GetRxInterruptCount());
-                    fflush(stdout);
+                    reportPipelineStats();
                 } else if (strcmp(command, "buffers") == 0) {
                     printf("RX BUFFERS -> ring=%u dma=%u\n",
                            (unsigned int)UartDma_GetRxBufferSize(),
@@ -476,7 +562,7 @@ static void controlReaderTask(void *parameters) {
                         puts("ERROR  Cannot resize the ring during a receive transfer");
                     } else if (*end != '\0' || requested > UINT32_MAX ||
                         !UartDma_SetRxBufferSize((uint32_t)requested)) {
-                        puts("ERROR  Ring buffer must be between 256 and 65536 bytes");
+                        puts("ERROR  Ring buffer must be between 32 and 65536 bytes");
                     } else {
                         dmaWriteIndex = 0U;
                         printf("RX BUFFERS -> ring=%u dma=%u\n",
@@ -548,8 +634,18 @@ static void outboundTestTask(void *parameters) {
         fflush(stdout);
 
         uint32_t offset = 0U;
+        const uint64_t startedUs = UartDma_PlatformTimeUs();
+        (void)pthread_mutex_lock(&uartTimingMutex);
+        const uint32_t transferBaud = uartReceiver.requestedBaud;
+        (void)pthread_mutex_unlock(&uartTimingMutex);
+        const uint32_t gaugeTarget = transferBaud / 8U / 60U;
+        const uint32_t gaugeStep = gaugeTarget > TEST_TRANSFER_CHUNK_DATA_SIZE
+            ? (gaugeTarget / TEST_TRANSFER_CHUNK_DATA_SIZE) *
+                TEST_TRANSFER_CHUNK_DATA_SIZE
+            : TEST_TRANSFER_CHUNK_DATA_SIZE;
         uint32_t nextProgress = TEST_TRANSFER_PROGRESS_STEP;
         size_t batchLength = 0U;
+        uint32_t batchPayload = 0U;
         bool sent = true;
         uint32_t invalidPackets = 0U;
         uint32_t changedBytes = 0U;
@@ -599,22 +695,31 @@ static void outboundTestTask(void *parameters) {
                 framingErrors += (uint32_t)simulation.framingErrors;
             }
             if (batchLength + wireLength > sizeof(wireBatch)) {
+                paceTestTransfer(startedUs, offset, transferBaud);
                 if (!writeAll(wireBatch, batchLength)) {
                     sent = false;
                     break;
                 }
                 batchLength = 0U;
+                batchPayload = 0U;
             }
             memcpy(&wireBatch[batchLength], sampledWire, wireLength);
             batchLength += wireLength;
+            batchPayload += chunkSize;
 
-            if (batchLength >= sizeof(wireBatch) - MAX_WIRE_FRAME &&
-                !writeAll(wireBatch, batchLength)) {
-                sent = false;
-                break;
-            }
-            if (batchLength >= sizeof(wireBatch) - MAX_WIRE_FRAME) {
+            if (batchLength >= sizeof(wireBatch) - MAX_WIRE_FRAME ||
+                batchPayload >= gaugeStep) {
+                paceTestTransfer(startedUs, offset + chunkSize, transferBaud);
+                if (!writeAll(wireBatch, batchLength)) {
+                    sent = false;
+                    break;
+                }
                 batchLength = 0U;
+                batchPayload = 0U;
+                printf("TX DMA <- TEST gauge %u/%u bytes\n",
+                       (unsigned int)(offset + chunkSize),
+                       (unsigned int)totalSize);
+                fflush(stdout);
             }
             offset += chunkSize;
             if (offset >= nextProgress) {
@@ -625,8 +730,15 @@ static void outboundTestTask(void *parameters) {
                 nextProgress += TEST_TRANSFER_PROGRESS_STEP;
             }
         }
-        if (sent && batchLength != 0U && !writeAll(wireBatch, batchLength)) {
-            sent = false;
+        if (sent && batchLength != 0U) {
+            paceTestTransfer(startedUs, offset, transferBaud);
+            if (!writeAll(wireBatch, batchLength)) {
+                sent = false;
+            } else {
+                printf("TX DMA <- TEST gauge %u/%u bytes\n",
+                       (unsigned int)offset, (unsigned int)totalSize);
+                fflush(stdout);
+            }
         }
         if (invalidPackets != 0U) {
             printf("WARNING UART SIM TX transfer invalid: failed_packets=%u changed_bytes=%u framing_errors=%u\n",

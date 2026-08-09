@@ -20,7 +20,8 @@ TEST_TRANSFER_SIZES: tuple[tuple[str, int], ...] = (
 )
 
 RING_BUFFER_SIZES: tuple[tuple[str, int], ...] = (
-    ("256 B", 256), ("1 KiB", 1024), ("4 KiB", 4096),
+    ("32 B", 32), ("64 B", 64), ("128 B", 128), ("256 B", 256),
+    ("1 KiB", 1024), ("4 KiB", 4096),
     ("16 KiB", 16 * 1024), ("64 KiB", 64 * 1024),
 )
 

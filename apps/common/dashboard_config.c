@@ -36,11 +36,12 @@ const size_t APP_DASHBOARD_BULK_SIZE_COUNT =
     sizeof(APP_DASHBOARD_BULK_SIZES) / sizeof(APP_DASHBOARD_BULK_SIZES[0]);
 
 const AppDashboardSizeChoice_t APP_DASHBOARD_RING_SIZES[] = {
-    {"256 B", 256U}, {"1 KiB", 1024U}, {"4 KiB", 4096U},
+    {"32 B", 32U}, {"64 B", 64U}, {"128 B", 128U}, {"256 B", 256U},
+    {"1 KiB", 1024U}, {"4 KiB", 4096U},
     {"16 KiB", 16U * 1024U}, {"64 KiB", 64U * 1024U},
 };
 const char *const APP_DASHBOARD_RING_SIZE_OPTIONS[] = {
-    "256 B", "1 KiB", "4 KiB", "16 KiB", "64 KiB",
+    "32 B", "64 B", "128 B", "256 B", "1 KiB", "4 KiB", "16 KiB", "64 KiB",
 };
 const size_t APP_DASHBOARD_RING_SIZE_COUNT =
     sizeof(APP_DASHBOARD_RING_SIZES) / sizeof(APP_DASHBOARD_RING_SIZES[0]);
@@ -76,6 +77,15 @@ const char *const APP_DASHBOARD_BAUD_RATE_OPTIONS[] = {
 };
 const size_t APP_DASHBOARD_BAUD_RATE_COUNT = sizeof(APP_DASHBOARD_BAUD_RATES) /
     sizeof(APP_DASHBOARD_BAUD_RATES[0]);
+
+int AppDashboardConfig_FindSize(const AppDashboardSizeChoice_t *choices,
+                                size_t count, uint32_t value,
+                                int defaultIndex) {
+    for (size_t index = 0U; choices != NULL && index < count; index++) {
+        if (choices[index].size == value) return (int)index;
+    }
+    return defaultIndex >= 0 && (size_t)defaultIndex < count ? defaultIndex : 0;
+}
 
 void AppDashboardConfig_PresetToFields(size_t presetIndex,
                                        char *opcode, size_t opcodeSize,

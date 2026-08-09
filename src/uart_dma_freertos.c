@@ -61,6 +61,14 @@ static QueueHandle_t      xTxPacketQueueHandle = NULL;
 static SemaphoreHandle_t  xTxDmaSemaphore      = NULL;
 static volatile UartDmaRxMode_t rxMode = UART_DMA_RX_MODE_DMA_IDLE;
 static volatile uint32_t rxInterruptCount;
+static UartDmaPipelineMetrics_t pipelineMetrics;
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((weak))
+#endif
+uint64_t UartDma_PlatformTimeUs(void) {
+    return (uint64_t)xTaskGetTickCount() * 1000000ULL / configTICK_RATE_HZ;
+}
 
 /* --- Priority Scheduling Matrix --- */
 #define PRIORITY_PRODUCER_TASK  (configMAX_PRIORITIES - 1) /* Critical Hardware Layer */
@@ -78,6 +86,9 @@ void vTxEngineTask(void *pvParameters);
 void UartDmaSystem_Init(void) {
     UartDmaRingBuffer_Reset();
     rxInterruptCount = 0U;
+    memset(&pipelineMetrics, 0, sizeof(pipelineMetrics));
+    pipelineMetrics.queueCapacity = QUEUE_STORAGE_SIZE;
+    pipelineMetrics.ringCapacity = UartDma_GetRxBufferSize();
     UartDma_SetRxMode(UART_DMA_RX_MODE_DMA_IDLE);
     /* 1. Allocate Inter-Process Communication Pipelines */
     xRxPacketQueueHandle = xQueueCreate(QUEUE_STORAGE_SIZE, sizeof(PacketMessage_t));
@@ -130,7 +141,26 @@ bool UartDma_SetRxBufferSize(uint32_t size) {
         return false;
     }
     DMA_RX_STREAM->NDTR = size;
+    taskENTER_CRITICAL();
+    pipelineMetrics.ringCapacity = size;
+    pipelineMetrics.ringBurstBytes = 0U;
+    pipelineMetrics.ringHighWaterBytes = 0U;
+    taskEXIT_CRITICAL();
     return true;
+}
+
+void UartDma_GetPipelineMetrics(UartDmaPipelineMetrics_t *metrics) {
+    if (metrics == NULL) {
+        return;
+    }
+    taskENTER_CRITICAL();
+    *metrics = pipelineMetrics;
+    pipelineMetrics.queueHighWater = 0U;
+    pipelineMetrics.ringHighWaterBytes = 0U;
+    taskEXIT_CRITICAL();
+    metrics->queueDepth = xRxPacketQueueHandle == NULL ? 0U
+        : (uint32_t)uxQueueMessagesWaiting(xRxPacketQueueHandle);
+    metrics->ringCapacity = UartDma_GetRxBufferSize();
 }
 
 void USART_IRQHandler(void) {
@@ -189,9 +219,21 @@ void vProducerTask(void *pvParameters) {
             ? UartDmaRingBuffer_GetWriteIndex()
             : UartDma_GetRxBufferSize() - DMA_RX_STREAM->NDTR;
 
+        const uint32_t ringBurst = UartDmaRingBuffer_GetUnreadCount(
+            currentWriteIndex);
+        taskENTER_CRITICAL();
+        pipelineMetrics.ringBurstBytes = ringBurst;
+        if (ringBurst > pipelineMetrics.ringHighWaterBytes) {
+            pipelineMetrics.ringHighWaterBytes = ringBurst;
+        }
+        taskEXIT_CRITICAL();
+
         uint32_t dataLength = 0;
         const bool validLayout = UartDmaRingBuffer_ReadTo(
             currentWriteIndex, newPacket.payload, sizeof(newPacket.payload), &dataLength);
+        taskENTER_CRITICAL();
+        pipelineMetrics.ringBurstBytes = 0U;
+        taskEXIT_CRITICAL();
         newPacket.length = dataLength;
 
         /* Core Framing Integrity Verification (CRC16 check on last 2 trailing payload bytes) */
@@ -205,10 +247,32 @@ void vProducerTask(void *pvParameters) {
 
             if (computedCRC == receivedCRC) {
                 newPacket.length = payloadLength; /* Strip CRC field for Application consumer convenience */
-                xQueueSend(xRxPacketQueueHandle, &newPacket, 0U);
+                newPacket.queuedAtUs = UartDma_PlatformTimeUs();
+                if (xQueueSend(xRxPacketQueueHandle, &newPacket, 0U) == pdTRUE) {
+                    const uint32_t depth =
+                        (uint32_t)uxQueueMessagesWaiting(xRxPacketQueueHandle);
+                    taskENTER_CRITICAL();
+                    pipelineMetrics.producedBytes += payloadLength;
+                    pipelineMetrics.producedPackets++;
+                    pipelineMetrics.queuedBytes += payloadLength;
+                    if (depth > pipelineMetrics.queueHighWater) {
+                        pipelineMetrics.queueHighWater = depth;
+                    }
+                    taskEXIT_CRITICAL();
+                } else {
+                    taskENTER_CRITICAL();
+                    pipelineMetrics.queueDrops++;
+                    taskEXIT_CRITICAL();
+                }
             } else {
-                /* Drop packet due to Frame Corruption */
+                taskENTER_CRITICAL();
+                pipelineMetrics.crcDrops++;
+                taskEXIT_CRITICAL();
             }
+        } else if (dataLength != 0U) {
+            taskENTER_CRITICAL();
+            pipelineMetrics.ringDrops++;
+            taskEXIT_CRITICAL();
         }
     }
 }
@@ -222,6 +286,20 @@ void vConsumerTask(void *pvParameters) {
     while (1) {
         /* Blocks natively with zero CPU overhead until the DMA Producer pushes a data frame */
         if (xQueueReceive(xRxPacketQueueHandle, &receivedPacket, portMAX_DELAY) == pdTRUE) {
+
+            const uint64_t nowUs = UartDma_PlatformTimeUs();
+            const uint64_t latencyUs = nowUs >= receivedPacket.queuedAtUs
+                ? nowUs - receivedPacket.queuedAtUs : 0U;
+            taskENTER_CRITICAL();
+            pipelineMetrics.consumedBytes += receivedPacket.length;
+            pipelineMetrics.consumedPackets++;
+            pipelineMetrics.queuedBytes = pipelineMetrics.queuedBytes >= receivedPacket.length
+                ? pipelineMetrics.queuedBytes - receivedPacket.length : 0U;
+            pipelineMetrics.lastLatencyUs = latencyUs;
+            if (latencyUs > pipelineMetrics.maxLatencyUs) {
+                pipelineMetrics.maxLatencyUs = latencyUs;
+            }
+            taskEXIT_CRITICAL();
 
             /* Iterate cleanly through the thread-isolated local data block array */
             for (uint32_t i = 0; i < receivedPacket.length; i++) {

@@ -160,9 +160,17 @@ static void testUartApiAndInterrupts(void) {
     static const uint8_t arbitraryPayload[] = {0x01U, 0x02U, 0x03U, 0x04U};
     PacketMessage_t message = UartDma_MessageFrom(arbitraryPayload,
                                                   sizeof(arbitraryPayload));
+    assert(message.queuedAtUs == 0U);
 
     rxDmaRegisters.NDTR = UART_DMA_RX_BUFFER_SIZE;
     UartDmaSystem_Init();
+    UartDmaPipelineMetrics_t metrics;
+    UartDma_GetPipelineMetrics(&metrics);
+    assert(metrics.producedBytes == 0U);
+    assert(metrics.consumedBytes == 0U);
+    assert(metrics.queueDepth == 0U);
+    assert(metrics.queueCapacity == 16U);
+    assert(metrics.ringCapacity == UART_DMA_RX_BUFFER_SIZE);
 
     assert(UartDma_GetRxMode() == UART_DMA_RX_MODE_DMA_IDLE);
     assert((rxDmaRegisters.CR & 1UL) != 0U);
@@ -179,6 +187,8 @@ static void testUartApiAndInterrupts(void) {
         uartRegisters.ISR = 1UL << 5;
         USART_IRQHandler();
     }
+    assert(UartDmaRingBuffer_GetUnreadCount(
+               UartDmaRingBuffer_GetWriteIndex()) == sizeof(interruptBytes));
     uint8_t receivedBytes[sizeof(interruptBytes)] = {0U};
     uint32_t receivedLength = 0U;
     assert(UartDmaRingBuffer_ReadTo(UartDmaRingBuffer_GetWriteIndex(),
@@ -186,6 +196,8 @@ static void testUartApiAndInterrupts(void) {
                                     &receivedLength));
     assert(receivedLength == sizeof(interruptBytes));
     assert(memcmp(receivedBytes, interruptBytes, sizeof(interruptBytes)) == 0);
+    assert(UartDmaRingBuffer_GetUnreadCount(
+               UartDmaRingBuffer_GetWriteIndex()) == 0U);
     assert(UartDma_GetRxInterruptCount() == sizeof(interruptBytes));
 
     UartDma_SetRxMode(UART_DMA_RX_MODE_DMA_IDLE);
@@ -196,10 +208,28 @@ static void testUartApiAndInterrupts(void) {
     DMA_RX_Complete_IRQHandler();
     assert(UartDma_GetRxInterruptCount() == sizeof(interruptBytes) + 2U);
 
-    assert(!UartDma_SetRxBufferSize(128U));
+    assert(!UartDma_SetRxBufferSize(16U));
+    assert(UartDma_SetRxBufferSize(32U));
+    for (uint32_t index = 0U; index < 40U; index++) {
+        UartDmaRingBuffer_WriteByte((uint8_t)index);
+    }
+    uint8_t overflow[32U];
+    uint32_t overflowLength = 0U;
+    assert(UartDmaRingBuffer_GetUnreadCount(
+               UartDmaRingBuffer_GetWriteIndex()) == 32U);
+    assert(!UartDmaRingBuffer_ReadTo(UartDmaRingBuffer_GetWriteIndex(),
+                                     overflow, sizeof(overflow), &overflowLength));
+    assert(overflowLength == 32U);
+    UartDmaRingBuffer_CommitDmaWrite(8U, 40U);
+    assert(UartDmaRingBuffer_GetUnreadCount(8U) == 32U);
+    assert(!UartDmaRingBuffer_ReadTo(8U, overflow, sizeof(overflow),
+                                     &overflowLength));
+    assert(overflowLength == 32U);
     assert(UartDma_SetRxBufferSize(4096U));
     assert(UartDma_GetRxBufferSize() == 4096U);
     assert(rxDmaRegisters.NDTR == 4096U);
+    UartDma_GetPipelineMetrics(&metrics);
+    assert(metrics.ringCapacity == 4096U);
     assert(UartDma_SetRxBufferSize(UART_DMA_RX_BUFFER_SIZE));
 
     assert(UartDma_SendPacket(NULL, 0U) == pdFALSE);

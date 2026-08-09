@@ -25,6 +25,42 @@ typedef enum {
     UART_DMA_RX_MODE_BYTE_IRQ = 1
 } UartDmaRxMode_t;
 
+/** Snapshot of measured work crossing the RX producer/consumer boundary. */
+typedef struct {
+    /** CRC-valid bytes successfully enqueued by the producer. */
+    uint64_t producedBytes;
+    /** Bytes removed from the RX queue by the consumer. */
+    uint64_t consumedBytes;
+    /** CRC-valid packets successfully enqueued by the producer. */
+    uint32_t producedPackets;
+    /** Packets removed by the consumer. */
+    uint32_t consumedPackets;
+    /** Frames discarded because their CRC failed. */
+    uint32_t crcDrops;
+    /** Frames discarded because the RX queue was full. */
+    uint32_t queueDrops;
+    /** Ring spans that could not fit in one PacketMessage. */
+    uint32_t ringDrops;
+    /** Exact payload bytes currently retained by the RX queue. */
+    uint32_t queuedBytes;
+    /** Packet slots currently occupied in the RX queue. */
+    uint32_t queueDepth;
+    /** Fixed packet capacity of the RX queue. */
+    uint32_t queueCapacity;
+    /** Largest observed packet depth since the previous metrics snapshot. */
+    uint32_t queueHighWater;
+    /** Bytes currently awaiting the producer. */
+    uint32_t ringBurstBytes;
+    /** Largest producer wake-up span since the previous metrics snapshot. */
+    uint32_t ringHighWaterBytes;
+    /** Active circular DMA capacity. */
+    uint32_t ringCapacity;
+    /** Most recent enqueue-to-consume latency. */
+    uint64_t lastLatencyUs;
+    /** Largest observed enqueue-to-consume latency. */
+    uint64_t maxLatencyUs;
+} UartDmaPipelineMetrics_t;
+
 /** Allocate synchronization objects and create the producer, consumer, and TX tasks. */
 void UartDmaSystem_Init(void);
 /** Queue a typed H4 message for CRC framing and DMA transmission.
@@ -42,6 +78,10 @@ UartDmaRxMode_t UartDma_GetRxMode(void);
 uint32_t UartDma_GetRxInterruptCount(void);
 /** Change the active circular RX ring capacity at a frame boundary. */
 bool UartDma_SetRxBufferSize(uint32_t size);
+/** Copy a current snapshot of measured RX pipeline telemetry. */
+void UartDma_GetPipelineMetrics(UartDmaPipelineMetrics_t *metrics);
+/** Platform-overridable monotonic microsecond clock used by telemetry. */
+uint64_t UartDma_PlatformTimeUs(void);
 /** Store RXNE bytes in IRQ mode and wake the producer on UART IDLE. */
 void USART_IRQHandler(void);
 /** Record one completed RX DMA transaction in DMA receive mode. */

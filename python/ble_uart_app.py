@@ -11,6 +11,7 @@ from __future__ import annotations
 import queue
 import sys
 import threading
+import time
 from typing import Callable
 
 from ble_protocol import (
@@ -20,17 +21,23 @@ from ble_protocol import (
     build_test_transfer_frames,
     parse_hex,
 )
+from client_preferences import (
+    DashboardSettings, load_port, load_settings, save_port, save_settings,
+)
 from serial_ports import available_ports
 from dashboard_config import (
-    COMMAND_PRESETS, DMA_BUFFER_SIZES, RING_BUFFER_SIZES, TEST_TRANSFER_SIZES,
+    BAUD_RATES, COMMAND_PRESETS, DMA_BUFFER_SIZES, RING_BUFFER_SIZES,
+    SYSTEM_CLOCKS, TEST_TRANSFER_SIZES,
 )
 from dashboard_font import application_version, set_font_family
 from dashboard_log import append_log_text
 from dashboard_dropdown import RoundedCombo
+from dashboard_pipeline import PipelineMonitor, PipelineTelemetry
 from dashboard_ui import (
     RoundedActionButton, RoundedEntry, RoundedProgress, RoundedSurface,
     RoundedToggle, configure_styles,
 )
+from lpuart_sim import LpuartSimulator
 
 
 def run_gui() -> None:
@@ -65,8 +72,7 @@ def run_gui() -> None:
             self.reader_thread: threading.Thread | None = None
             self.stop_reader = threading.Event()
             self.rx_queue: queue.Queue[tuple[str, object]] = queue.Queue()
-            self.rx_queue_lock = threading.Lock()
-            self.rx_queued_bytes = 0
+            self.pipeline = PipelineTelemetry()
             self.port_scan_running = False
             self.parser = H4CrcStreamParser()
             self.test_identifier = 0
@@ -79,8 +85,19 @@ def run_gui() -> None:
 
             default_port = "COM3" if sys.platform == "win32" else (
                 "/dev/ttys006" if sys.platform == "darwin" else "/dev/ttyUSB0")
-            self.port_var = tk.StringVar(value=default_port)
-            self.baud_var = tk.StringVar(value="4000000")
+            self.saved_settings = load_settings("client")
+            def selected_label(choices: tuple[tuple[str, int], ...],
+                               value: int, fallback: str) -> str:
+                """Map a persisted numeric setting back to its dropdown label."""
+                return next((label for label, size in choices if size == value), fallback)
+            self.port_var = tk.StringVar(value=load_port(default_port))
+            self.system_clock_var = tk.StringVar(value=selected_label(
+                SYSTEM_CLOCKS, self.saved_settings.clock, "20 MHz"))
+            self.baud_var = tk.StringVar(value=selected_label(
+                BAUD_RATES, self.saved_settings.baud, "4 M"))
+            self.receiver_simulator = LpuartSimulator.configure(
+                dict(SYSTEM_CLOCKS)[self.system_clock_var.get()],
+                dict(BAUD_RATES)[self.baud_var.get()])
             self.status_var = tk.StringVar(value="Disconnected")
             self.preset_var = tk.StringVar(value=next(iter(COMMAND_PRESETS)))
             self.opcode_var = tk.StringVar(value="0C03")
@@ -88,12 +105,17 @@ def run_gui() -> None:
             self.raw_var = tk.StringVar(value="01 03 0C 00")
             self.transfer_progress = tk.DoubleVar(value=0.0)
             self.transfer_status_var = tk.StringVar(value="0 / 0 bytes")
-            self.bulk_size_var = tk.StringVar(value="2 MiB")
-            self.byte_irq_var = tk.BooleanVar(value=False)
-            self.ring_buffer_var = tk.StringVar(value="16 KiB")
-            self.dma_buffer_var = tk.StringVar(value="256 B")
-            self.ring_buffer_size = 16 * 1024
-            self.dma_buffer_size = 256
+            self.bulk_size_var = tk.StringVar(value=selected_label(
+                TEST_TRANSFER_SIZES, self.saved_settings.bulk, "2 MiB"))
+            self.byte_irq_var = tk.BooleanVar(value=self.saved_settings.byte_irq)
+            self.ring_buffer_var = tk.StringVar(value=selected_label(
+                RING_BUFFER_SIZES, self.saved_settings.ring, "16 KiB"))
+            self.dma_buffer_var = tk.StringVar(value=selected_label(
+                DMA_BUFFER_SIZES, self.saved_settings.dma, "256 B"))
+            self.ring_buffer_size = dict(RING_BUFFER_SIZES)[self.ring_buffer_var.get()]
+            self.dma_buffer_size = dict(DMA_BUFFER_SIZES)[self.dma_buffer_var.get()]
+            self.pipeline.ring_capacity = self.ring_buffer_size
+            self.pipeline.dma_capacity = self.dma_buffer_size
             self.irq_count_var = tk.StringVar(value="IRQ calls: 0")
             self.tx_packets = 0
             self.rx_packets = 0
@@ -111,7 +133,7 @@ def run_gui() -> None:
             self.refresh_ports()
             self.select_preset()
             self.log_notice("Ready. Start ble_uart_server and enter its printed port.")
-            self.root.after(40, self.drain_reader_queue)
+            self.root.after(16, self.drain_reader_queue)
             self.root.protocol("WM_DELETE_WINDOW", self.close)
 
 
@@ -200,13 +222,11 @@ def run_gui() -> None:
             self.port_combo = RoundedCombo(connection, self.port_var, editable=True)
             self.port_combo.place(x=52, y=3, width=426, height=38)
             self.port_combo.entry.bind("<FocusIn>", lambda _event: self.refresh_ports(), add="+")
-            ttk.Label(connection, text="Baud", style="App.TLabel").place(
-                x=498, y=3, width=52, height=38)
-            RoundedCombo(
-                connection, self.baud_var,
-                ("9600", "57600", "115200", "460800", "921600",
-                 "1000000", "2000000", "3000000", "4000000"),
-                editable=True).place(x=554, y=3, width=138, height=38)
+            self.port_combo.entry.bind(
+                "<FocusOut>", lambda _event: save_port(self.port_var.get()), add="+")
+            self.port_combo.bind(
+                "<<ComboboxSelected>>",
+                lambda _event: save_port(self.port_var.get()), add="+")
             self.connect_button = RoundedActionButton(
                 connection, "Connect", self.toggle_connection, width=170, height=38)
             self.connect_button.place(x=712, y=3)
@@ -216,23 +236,40 @@ def run_gui() -> None:
             self.rx_mode_toggle.configure(state=tk.DISABLED)
             self.rx_mode_toggle.place(x=914, y=7, width=120, height=30)
             RoundedEntry(connection, self.status_var, readonly=True).place(
-                x=0, y=54, width=414, height=28)
+                x=0, y=51, width=166, height=34)
+            ttk.Label(connection, text="Clock", style="Muted.TLabel").place(
+                x=186, y=51, width=42, height=34)
+            clock_combo = RoundedCombo(
+                connection, self.system_clock_var,
+                tuple(label for label, _value in SYSTEM_CLOCKS))
+            clock_combo.place(x=232, y=51, width=104, height=34)
+            clock_combo.bind("<<ComboboxSelected>>", self._configure_timing)
+            ttk.Label(connection, text="Baud", style="Muted.TLabel").place(
+                x=346, y=51, width=36, height=34)
+            baud_combo = RoundedCombo(
+                connection, self.baud_var,
+                tuple(label for label, _value in BAUD_RATES))
+            baud_combo.place(x=386, y=51, width=104, height=34)
+            baud_combo.bind("<<ComboboxSelected>>", self._configure_timing)
             ttk.Label(connection, text="Ring", style="Muted.TLabel").place(
-                x=436, y=54, width=36, height=28)
+                x=504, y=51, width=36, height=34)
             ring_combo = RoundedCombo(
                 connection, self.ring_buffer_var,
                 tuple(label for label, _size in RING_BUFFER_SIZES))
-            ring_combo.place(x=476, y=54, width=100, height=28)
+            ring_combo.place(x=544, y=51, width=104, height=34)
             ring_combo.bind("<<ComboboxSelected>>", self._configure_receive_buffers)
             ttk.Label(connection, text="DMA", style="Muted.TLabel").place(
-                x=596, y=54, width=36, height=28)
+                x=662, y=51, width=36, height=34)
             dma_combo = RoundedCombo(
                 connection, self.dma_buffer_var,
                 tuple(label for label, _size in DMA_BUFFER_SIZES))
-            dma_combo.place(x=636, y=54, width=100, height=28)
+            dma_combo.place(x=702, y=51, width=104, height=34)
             dma_combo.bind("<<ComboboxSelected>>", self._configure_receive_buffers)
+            RoundedActionButton(
+                connection, "Defaults", self.restore_default_settings,
+                width=206, height=34).place(x=826, y=51)
             ttk.Label(connection, text="Native clipboard shortcuts enabled",
-                      style="Muted.TLabel").place(x=2, y=82, height=16)
+                      style="Muted.TLabel").place(x=2, y=87, height=11)
 
             command = panel("HCI COMMAND BUILDER", (24, 360, 1072, 216))
             ttk.Label(command, text="Preset", style="App.TLabel").place(
@@ -267,10 +304,11 @@ def run_gui() -> None:
             self.send_small_button.place(x=0, y=5)
             ttk.Label(bulk, text="Block size", style="App.TLabel").place(
                 x=248, y=5, width=92, height=38)
-            RoundedCombo(
+            bulk_combo = RoundedCombo(
                 bulk, self.bulk_size_var,
-                tuple(label for label, _size in TEST_TRANSFER_SIZES)).place(
-                    x=348, y=5, width=132, height=42)
+                tuple(label for label, _size in TEST_TRANSFER_SIZES))
+            bulk_combo.place(x=348, y=5, width=132, height=42)
+            bulk_combo.bind("<<ComboboxSelected>>", lambda _event: self._save_settings())
             self.send_large_button = RoundedActionButton(
                 bulk, "Send selected block", self.send_selected_test_transfer,
                 width=218, height=42)
@@ -281,10 +319,11 @@ def run_gui() -> None:
             ttk.Label(bulk, textvariable=self.transfer_status_var, style="Muted.TLabel").place(
                 x=748, y=27, width=284, height=20)
 
-            traffic = panel("LIVE UART TRAFFIC", (24, 740, 1072, 196))
+            traffic = panel("LIVE UART TRAFFIC + PIPELINE HEADROOM",
+                            (24, 740, 1072, 196))
             log_frame = tk.Frame(traffic, background="#141C2E",
                                  borderwidth=0, highlightthickness=0)
-            log_frame.pack(fill=tk.BOTH, expand=True)
+            log_frame.place(x=0, y=0, width=540, height=142)
             log_background = tk.Canvas(log_frame, background="#141C2E",
                                        borderwidth=0, highlightthickness=0)
             log_background.place(x=0, y=0, relwidth=1, relheight=1)
@@ -323,6 +362,60 @@ def run_gui() -> None:
             self.log.tag_configure("RX", foreground="#69E196")
             self.log.tag_configure("ERROR", foreground="#FF7878")
             self.log.tag_configure("TEST", foreground="#BEC6D2")
+            self.pipeline_monitor = PipelineMonitor(traffic, self.pipeline)
+            self.pipeline_monitor.place(x=556, y=0, width=476, height=142)
+            self.root.after(50, self._refresh_pipeline_monitor)
+
+        def _refresh_pipeline_monitor(self) -> None:
+            """Refresh the shared monitor at the native dashboard cadence."""
+            self.pipeline_monitor.draw()
+            self.root.after(50, self._refresh_pipeline_monitor)
+
+        def _configure_timing(self, _event: object = None) -> None:
+            """Apply the selected app-local clock and line-rate parameters."""
+            clock = dict(SYSTEM_CLOCKS)[self.system_clock_var.get()]
+            baud = dict(BAUD_RATES)[self.baud_var.get()]
+            self.receiver_simulator = LpuartSimulator.configure(clock, baud)
+            timing = self.receiver_simulator
+            self.log_notice(
+                f"RX  Timing: clock={clock} baud={baud} OSR={timing.osr} "
+                f"SBR={timing.sbr} actual={timing.actual_baud}", "RX")
+            self._save_settings()
+
+        def _save_settings(self) -> None:
+            """Persist every user-adjustable operating control."""
+            self.saved_settings = DashboardSettings(
+                clock=dict(SYSTEM_CLOCKS)[self.system_clock_var.get()],
+                baud=dict(BAUD_RATES)[self.baud_var.get()],
+                ring=dict(RING_BUFFER_SIZES)[self.ring_buffer_var.get()],
+                dma=dict(DMA_BUFFER_SIZES)[self.dma_buffer_var.get()],
+                bulk=dict(TEST_TRANSFER_SIZES)[self.bulk_size_var.get()],
+                byte_irq=self.byte_irq_var.get())
+            save_settings("client", self.saved_settings)
+
+        def restore_default_settings(self) -> None:
+            """Restore and immediately apply the documented defaults."""
+            defaults = DashboardSettings()
+            self.system_clock_var.set("20 MHz")
+            self.baud_var.set("4 M")
+            self.ring_buffer_var.set("16 KiB")
+            self.dma_buffer_var.set("256 B")
+            self.bulk_size_var.set("2 MiB")
+            self.byte_irq_var.set(False)
+            self.receive_byte_irq_active = False
+            self.ring_buffer_size = defaults.ring
+            self.dma_buffer_size = defaults.dma
+            self.receiver_simulator = LpuartSimulator.configure(
+                defaults.clock, defaults.baud)
+            self.pipeline.reset()
+            with self.pipeline.lock:
+                self.pipeline.queue_capacity = 16
+                self.pipeline.ring_capacity = defaults.ring
+                self.pipeline.dma_capacity = defaults.dma
+            self.transport_var.set(
+                "DMA + IDLE" if self.serial_port is not None else "OFFLINE")
+            self._save_settings()
+            self.log_notice("SETTINGS  Restored application defaults")
 
         def log_line(self, direction: str, data: bytes, detail: str = "") -> None:
             """Append one formatted TX or RX record to the traffic view.
@@ -343,6 +436,11 @@ def run_gui() -> None:
             """Apply the selected local ring capacity and DMA transaction size."""
             self.ring_buffer_size = dict(RING_BUFFER_SIZES)[self.ring_buffer_var.get()]
             self.dma_buffer_size = dict(DMA_BUFFER_SIZES)[self.dma_buffer_var.get()]
+            with self.pipeline.lock:
+                self.pipeline.queue_capacity = 16
+                self.pipeline.ring_capacity = self.ring_buffer_size
+                self.pipeline.dma_capacity = self.dma_buffer_size
+            self._save_settings()
             self.log_notice(
                 f"RX  Buffers: ring={self.ring_buffer_size} bytes, "
                 f"DMA={self.dma_buffer_size} bytes", "RX")
@@ -383,8 +481,9 @@ def run_gui() -> None:
                 self.transport_var.set("OFFLINE")
                 return
             port_name = self.port_var.get()
+            save_port(port_name)
             try:
-                requested_baud = int(self.baud_var.get())
+                requested_baud = dict(BAUD_RATES)[self.baud_var.get()]
             except ValueError:
                 self.status_var.set("Invalid baud rate")
                 self.log_notice("ERROR  Baud rate must be a decimal number", "ERROR")
@@ -440,6 +539,7 @@ def run_gui() -> None:
             """Start verification after the background serial open succeeds."""
             self.connecting = False
             self.serial_port = port
+            self.pipeline.reset()
             self.stop_reader.clear()
             self.parser = H4CrcStreamParser()
             self.reader_thread = threading.Thread(target=self.read_serial, daemon=True)
@@ -471,8 +571,7 @@ def run_gui() -> None:
             self.handshake_pending = False
             port = self.serial_port
             self.serial_port = None
-            with self.rx_queue_lock:
-                self.rx_queued_bytes = 0
+            self.pipeline.reset()
             if port is not None:
                 port_name = port.port
                 port.close()
@@ -519,20 +618,13 @@ def run_gui() -> None:
                 if port is None:
                     return
                 try:
-                    with self.rx_queue_lock:
-                        available = self.ring_buffer_size - self.rx_queued_bytes
-                    if available <= 0:
-                        self.stop_reader.wait(0.002)
-                        continue
-                    capacity = min(self.dma_buffer_size, available)
                     data = port.read(1)
-                    waiting = min(port.in_waiting, capacity - len(data))
+                    waiting = min(port.in_waiting,
+                                  self.dma_buffer_size - len(data))
                     if waiting:
                         data += port.read(waiting)
                     if data:
-                        with self.rx_queue_lock:
-                            self.rx_queued_bytes += len(data)
-                        self.rx_queue.put(("data", data))
+                        self.rx_queue.put(("data", (data, time.monotonic_ns())))
                 except serial.SerialException as error:
                     if not self.stop_reader.is_set():
                         self.rx_queue.put(("error", error))
@@ -577,18 +669,32 @@ def run_gui() -> None:
                         self.port_scan_running = False
                         self.log_notice(f"ERROR  Serial-port discovery failed: {value}", "ERROR")
                     elif kind == "data":
-                        incoming = value if isinstance(value, bytes) else b""
-                        with self.rx_queue_lock:
-                            self.rx_queued_bytes = max(
-                                0, self.rx_queued_bytes - len(incoming))
+                        packet = value if isinstance(value, tuple) else (b"", time.monotonic_ns())
+                        incoming = packet[0] if isinstance(packet[0], bytes) else b""
+                        queued_at_ns = int(packet[1])
                         byte_irq_active = self.receive_byte_irq_active
-                        self.irq_absolute_count += len(incoming) if byte_irq_active else 1
                         completed = self.parser.feed(incoming)
-                        self.irq_count_var.set(f"IRQ calls: {self.irq_absolute_count}")
-                        self.irq_metric_var.set(str(self.irq_absolute_count))
-                        dma_test_irq_accounted = False
                         for frame in completed:
+                            wire_size = len(frame.h4_packet) + 2
+                            frame_irqs = (wire_size if byte_irq_active else
+                                          (wire_size + self.dma_buffer_size - 1)
+                                          // self.dma_buffer_size)
+                            self.irq_absolute_count += frame_irqs
+                            self.pipeline.record_arrival(wire_size)
+                            if wire_size > self.ring_buffer_size:
+                                with self.pipeline.lock:
+                                    self.pipeline.ring_drops += 1
+                                self.log_notice(
+                                    f"ERROR  RX ring overwrite: frame={wire_size} "
+                                    f"capacity={self.ring_buffer_size}", "ERROR")
+                                continue
+                            self.pipeline.record_produced(len(frame.h4_packet), 1)
+                            self.pipeline.record_consumed(
+                                len(frame.h4_packet), 0, queued_at_ns)
                             self.rx_packets += 1
+                            if not frame.crc_valid:
+                                with self.pipeline.lock:
+                                    self.pipeline.crc_drops += 1
                             completion = frame.test_completion if frame.crc_valid else None
                             if self.handshake_pending and completion is not None:
                                 identifier, status, total_size = completion
@@ -609,11 +715,7 @@ def run_gui() -> None:
                                 self.test_irq_calls = 0
                                 self.test_log_next_progress = 256 * 1024
                             if flags is not None and self.test_irq_active:
-                                if byte_irq_active:
-                                    self.test_irq_calls += len(frame.h4_packet) + 2
-                                elif not dma_test_irq_accounted:
-                                    self.test_irq_calls += 1
-                                    dma_test_irq_accounted = True
+                                self.test_irq_calls += frame_irqs
                             if flags is not None and self.test_irq_active and flags & 0x02:
                                 transmission_irqs = self.test_irq_calls
                                 self.test_irq_active = False
@@ -621,8 +723,7 @@ def run_gui() -> None:
                                     f", IRQ complete: {transmission_irqs} calls; "
                                     f"app total={self.irq_absolute_count}")
                             elif flags is None:
-                                transmission_irqs = (len(frame.h4_packet) + 2
-                                                     if byte_irq_active else 1)
+                                transmission_irqs = frame_irqs
                                 irq_detail = (
                                     f", IRQ complete: {transmission_irqs} calls; "
                                     f"app total={self.irq_absolute_count}")
@@ -647,6 +748,8 @@ def run_gui() -> None:
                                     + frame.received_crc.to_bytes(2, "big"),
                                     f"[{crc_status}, {frame.summary}{irq_detail}]")
                         self.rx_packets_var.set(str(self.rx_packets))
+                        self.irq_count_var.set(f"IRQ calls: {self.irq_absolute_count}")
+                        self.irq_metric_var.set(str(self.irq_absolute_count))
                     elif kind == "tx_packets":
                         self.tx_packets += int(value)
                         self.tx_packets_var.set(str(self.tx_packets))
@@ -655,6 +758,10 @@ def run_gui() -> None:
                         self.transfer_progress.set(sent / total if total else 0.0)
                         self.transfer_status_var.set(f"{sent} / {total} bytes")
                         self.log_notice(f"TEST  Sent {sent}/{total} bytes ({sent * 100 // total}%)")
+                    elif kind == "tx_gauge":
+                        sent, total = value if isinstance(value, tuple) else (0, 0)
+                        self.transfer_progress.set(sent / total if total else 0.0)
+                        self.transfer_status_var.set(f"{sent} / {total} bytes")
                     elif kind == "tx_done":
                         total = int(value)
                         self.transfer_progress.set(1.0)
@@ -665,7 +772,7 @@ def run_gui() -> None:
                             self.send_large_button.configure(state=tk.NORMAL)
             except queue.Empty:
                 pass
-            self.root.after(40, self.drain_reader_queue)
+            self.root.after(16, self.drain_reader_queue)
 
         def write_frame(self, frame: bytes, detail: str) -> None:
             """Synchronously write one complete frame and log it.
@@ -729,6 +836,7 @@ def run_gui() -> None:
                 return
             self.test_identifier = (self.test_identifier + 1) & 0xFFFF or 1
             identifier = self.test_identifier
+            transfer_baud = dict(BAUD_RATES)[self.baud_var.get()]
             self.transfer_progress.set(0.0)
             self.transfer_status_var.set(f"0 / {total_size} bytes")
             self.send_small_button.configure(state=tk.DISABLED)
@@ -738,9 +846,13 @@ def run_gui() -> None:
             def send_worker() -> None:
                 """Write generated test frames and post progress to the UI queue."""
                 sent = 0
+                started_at = time.monotonic()
                 next_progress = 256 * 1024
+                gauge_target = transfer_baud // 8 // 60
+                gauge_step = max(230, gauge_target // 230 * 230)
                 batch = bytearray()
                 batch_packets = 0
+                batch_payload = 0
                 try:
                     for frame in build_test_transfer_frames(total_size, identifier):
                         port = self.serial_port
@@ -750,11 +862,19 @@ def run_gui() -> None:
                         batch_packets += 1
                         chunk_size = int.from_bytes(frame[21:23], "little")
                         sent += chunk_size
-                        if len(batch) >= 64 * 1024 or sent == total_size:
+                        batch_payload += chunk_size
+                        if (batch_payload >= gauge_step or
+                                len(batch) >= 64 * 1024 or sent == total_size):
+                            deadline = started_at + sent * 8 / transfer_baud
+                            delay = deadline - time.monotonic()
+                            if delay > 0:
+                                time.sleep(delay)
                             port.write(batch)
                             batch.clear()
                             self.rx_queue.put(("tx_packets", batch_packets))
+                            self.rx_queue.put(("tx_gauge", (sent, total_size)))
                             batch_packets = 0
+                            batch_payload = 0
                         if sent >= next_progress:
                             self.rx_queue.put(("tx_progress", (sent, total_size)))
                             next_progress += 256 * 1024
@@ -783,9 +903,12 @@ def run_gui() -> None:
             self.log_notice(
                 "RX  Local receive mode: "
                 + ("per-byte IRQ" if self.receive_byte_irq_active else "DMA batches"), "RX")
+            self._save_settings()
 
         def close(self) -> None:
             """Release the serial resource and destroy the Tk root window."""
+            save_port(self.port_var.get())
+            self._save_settings()
             self.disconnect()
             self.root.destroy()
 

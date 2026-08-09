@@ -17,6 +17,8 @@ typedef struct {
     uint8_t payload[UART_DMA_MAX_PACKET_SIZE];
     /** Number of valid bytes in `payload`. */
     uint32_t length;
+    /** Monotonic producer timestamp used for queue-latency telemetry. */
+    uint64_t queuedAtUs;
 } PacketMessage_t;
 
 /** Construct a queue message from a typed packet or byte span.
@@ -24,7 +26,7 @@ typedef struct {
  * @param length Number of bytes to copy.
  * @return Populated message, or a zero-length message for invalid arguments. */
 static inline PacketMessage_t UartDma_MessageFrom(const void *payload, size_t length) {
-    PacketMessage_t message = {{0U}, 0U};
+    PacketMessage_t message = {{0U}, 0U, 0U};
     if (payload != NULL && length <= sizeof(message.payload)) {
         memcpy(message.payload, payload, length);
         message.length = (uint32_t)length;

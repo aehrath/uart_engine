@@ -50,6 +50,11 @@ extern const AppDashboardSizeChoice_t APP_DASHBOARD_BAUD_RATES[];
 extern const char *const APP_DASHBOARD_BAUD_RATE_OPTIONS[];
 extern const size_t APP_DASHBOARD_BAUD_RATE_COUNT;
 
+/** Find a persisted numeric choice, falling back to a valid default index. */
+int AppDashboardConfig_FindSize(const AppDashboardSizeChoice_t *choices,
+                                size_t count, uint32_t value,
+                                int defaultIndex);
+
 /** Copy one preset into the dashboard's editable hexadecimal fields. */
 void AppDashboardConfig_PresetToFields(size_t presetIndex,
                                        char *opcode, size_t opcodeSize,

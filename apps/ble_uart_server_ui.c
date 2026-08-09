@@ -1,6 +1,7 @@
 /** @file
  * @brief Portable graphical supervisor for the continuous BLE UART server. */
 #include "raylib.h"
+#include "client_preferences.h"
 #include "dashboard_config.h"
 #include "dashboard_dropdown.h"
 #include "dashboard_log.h"
@@ -15,6 +16,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -26,6 +28,7 @@
 #include <unistd.h>
 
 #define PROCESS_BUFFER_SIZE 2048U
+#define PIPELINE_HISTORY_SIZE 120U
 
 
 /** Retained scrollable server log. */
@@ -89,7 +92,68 @@ typedef struct {
     uint32_t sbr;
     /** Rounded baud produced by the selected divisors. */
     uint32_t actualBaud;
+    /** Measured producer throughput over the latest sampling interval. */
+    uint64_t producerBps;
+    /** Measured consumer throughput over the latest sampling interval. */
+    uint64_t consumerBps;
+    /** Payload bytes currently retained by the packet queue. */
+    uint32_t queuedBytes;
+    /** Current and maximum packet-queue occupancy. */
+    uint32_t queueDepth;
+    uint32_t queueCapacity;
+    uint32_t queueHighWater;
+    /** Latest and maximum observed circular-ring burst. */
+    uint32_t ringBurstBytes;
+    uint32_t ringHighWaterBytes;
+    /** Latest and maximum enqueue-to-consume latency. */
+    uint64_t latencyUs;
+    uint64_t latencyMaxUs;
+    /** Measured time until buffers fill, or UINT64_MAX while stable. */
+    uint64_t headroomUs;
+    /** Cumulative measured corruption and capacity losses. */
+    uint32_t crcDrops;
+    uint32_t queueDrops;
+    uint32_t ringDrops;
+    /** Ten-hertz polls accumulated into each half-second graph sample. */
+    uint32_t pipelinePollCount;
+    uint64_t producerBpsSum;
+    uint64_t consumerBpsSum;
+    uint32_t sampleQueueHighWater;
+    uint32_t sampleRingHighWaterBytes;
+    /** Circular history of timestamped producer/consumer rate samples. */
+    float producerHistory[PIPELINE_HISTORY_SIZE];
+    float consumerHistory[PIPELINE_HISTORY_SIZE];
+    float queueHistory[PIPELINE_HISTORY_SIZE];
+    float ringHistory[PIPELINE_HISTORY_SIZE];
+    float dmaHistory[PIPELINE_HISTORY_SIZE];
+    size_t historyCount;
+    size_t historyHead;
 } ServerState_t;
+
+/** Convert an interval high-water mark to a chart-safe capacity percentage. */
+static float capacityPercent(uint32_t highWater, uint32_t capacity) {
+    if (capacity == 0U) return 0.0f;
+    const float percentage = 100.0f * (float)highWater / (float)capacity;
+    return percentage > 100.0f ? 100.0f : percentage;
+}
+
+/** Retain one producer/consumer sample in chronological circular history. */
+static void appendPipelineSample(ServerState_t *state) {
+    state->producerHistory[state->historyHead] = (float)state->producerBps;
+    state->consumerHistory[state->historyHead] = (float)state->consumerBps;
+    state->queueHistory[state->historyHead] = capacityPercent(
+        state->queueHighWater, state->queueCapacity);
+    state->ringHistory[state->historyHead] = capacityPercent(
+        state->ringHighWaterBytes, state->ringBufferSize);
+    const uint32_t dmaPeak = state->ringHighWaterBytes < state->dmaBufferSize
+        ? state->ringHighWaterBytes : state->dmaBufferSize;
+    state->dmaHistory[state->historyHead] = capacityPercent(
+        dmaPeak, state->dmaBufferSize);
+    state->historyHead = (state->historyHead + 1U) % PIPELINE_HISTORY_SIZE;
+    if (state->historyCount < PIPELINE_HISTORY_SIZE) {
+        state->historyCount++;
+    }
+}
 
 /** Append one server log line. */
 static void appendLog(ServerLog_t *log, const char *line) {
@@ -122,8 +186,69 @@ static void handleServerLine(ServerLog_t *log, ServerState_t *state,
     unsigned int parsed = 0U;
     unsigned int total = 0U;
     unsigned int transmissionIrqs = 0U;
+    unsigned int queueDepth = 0U;
+    unsigned int queueCapacity = 0U;
+    unsigned int queueHighWater = 0U;
+    unsigned int ringBurst = 0U;
+    unsigned int ringCapacity = 0U;
+    unsigned int ringHighWater = 0U;
+    unsigned int crcDrops = 0U;
+    unsigned int queueDrops = 0U;
+    unsigned int ringDrops = 0U;
+    uint64_t producerBps = 0U;
+    uint64_t consumerBps = 0U;
+    uint64_t latencyUs = 0U;
+    uint64_t latencyMaxUs = 0U;
+    uint64_t headroomUs = UINT64_MAX;
     if (sscanf(line, "RX IRQ COUNT -> %u", &parsed) == 1) {
         state->rxInterruptCount = parsed;
+        return;
+    } else if (sscanf(line,
+                      "RX PIPELINE -> producer_bps=%" SCNu64
+                      " consumer_bps=%" SCNu64
+                      " queued=%u queue=%u/%u queue_peak=%u"
+                      " ring=%u/%u ring_peak=%u latency_us=%" SCNu64
+                      " latency_max_us=%" SCNu64 " headroom_us=%" SCNu64
+                      " crc_drop=%u queue_drop=%u ring_drop=%u",
+                      &producerBps, &consumerBps, &total, &queueDepth,
+                      &queueCapacity, &queueHighWater, &ringBurst,
+                      &ringCapacity, &ringHighWater, &latencyUs,
+                      &latencyMaxUs, &headroomUs, &crcDrops, &queueDrops,
+                      &ringDrops) == 15) {
+        state->producerBpsSum += producerBps;
+        state->consumerBpsSum += consumerBps;
+        state->pipelinePollCount++;
+        if (queueHighWater > state->sampleQueueHighWater) {
+            state->sampleQueueHighWater = queueHighWater;
+        }
+        if (ringHighWater > state->sampleRingHighWaterBytes) {
+            state->sampleRingHighWaterBytes = ringHighWater;
+        }
+        state->queuedBytes = total;
+        state->queueDepth = queueDepth != 0U ? queueDepth : queueHighWater;
+        state->queueCapacity = queueCapacity;
+        /* The engine consumes each IDLE-delimited burst before this 2 Hz poll.
+         * Display its interval peak for one poll so the live gauge is visible. */
+        state->ringBurstBytes = ringBurst != 0U ? ringBurst : ringHighWater;
+        state->ringBufferSize = ringCapacity;
+        state->latencyUs = latencyUs;
+        state->latencyMaxUs = latencyMaxUs;
+        state->headroomUs = headroomUs;
+        state->crcDrops = crcDrops;
+        state->queueDrops = queueDrops;
+        state->ringDrops = ringDrops;
+        if (state->pipelinePollCount >= 5U) {
+            state->producerBps = state->producerBpsSum / state->pipelinePollCount;
+            state->consumerBps = state->consumerBpsSum / state->pipelinePollCount;
+            state->queueHighWater = state->sampleQueueHighWater;
+            state->ringHighWaterBytes = state->sampleRingHighWaterBytes;
+            appendPipelineSample(state);
+            state->pipelinePollCount = 0U;
+            state->producerBpsSum = 0U;
+            state->consumerBpsSum = 0U;
+            state->sampleQueueHighWater = 0U;
+            state->sampleRingHighWaterBytes = 0U;
+        }
         return;
     } else if (sscanf(line, "RX BUFFERS -> ring=%u dma=%u",
                       &parsed, &total) == 2) {
@@ -150,6 +275,11 @@ static void handleServerLine(ServerLog_t *log, ServerState_t *state,
         state->testSent = 0U;
         state->testTotal = total;
         state->testActive = true;
+    } else if (sscanf(line, "TX DMA <- TEST gauge %u/%u bytes",
+                      &parsed, &total) == 2) {
+        state->testSent = parsed;
+        state->testTotal = total;
+        return;
     } else if (sscanf(line, "TX DMA <- TEST progress %u/%u bytes", &parsed, &total) == 2) {
         state->testSent = parsed;
         state->testTotal = total;
@@ -256,6 +386,32 @@ static bool startServer(ServerProcess_t *process, ServerLog_t *log,
     state->testSent = 0U;
     state->testTotal = 0U;
     state->testActive = false;
+    state->producerBps = 0U;
+    state->consumerBps = 0U;
+    state->queuedBytes = 0U;
+    state->queueDepth = 0U;
+    state->queueCapacity = 0U;
+    state->queueHighWater = 0U;
+    state->ringBurstBytes = 0U;
+    state->ringHighWaterBytes = 0U;
+    state->latencyUs = 0U;
+    state->latencyMaxUs = 0U;
+    state->headroomUs = UINT64_MAX;
+    state->crcDrops = 0U;
+    state->queueDrops = 0U;
+    state->ringDrops = 0U;
+    state->pipelinePollCount = 0U;
+    state->producerBpsSum = 0U;
+    state->consumerBpsSum = 0U;
+    state->sampleQueueHighWater = 0U;
+    state->sampleRingHighWaterBytes = 0U;
+    memset(state->producerHistory, 0, sizeof(state->producerHistory));
+    memset(state->consumerHistory, 0, sizeof(state->consumerHistory));
+    memset(state->queueHistory, 0, sizeof(state->queueHistory));
+    memset(state->ringHistory, 0, sizeof(state->ringHistory));
+    memset(state->dmaHistory, 0, sizeof(state->dmaHistory));
+    state->historyCount = 0U;
+    state->historyHead = 0U;
     appendLog(log, "Starting continuous FreeRTOS BLE server engine...");
     return true;
 }
@@ -375,6 +531,158 @@ static bool startServerTest(ServerProcess_t *process, ServerLog_t *log,
     return true;
 }
 
+/** Format a byte rate compactly without hiding the measured value's scale. */
+static void formatRate(char *output, size_t capacity, uint64_t bytesPerSecond) {
+    if (bytesPerSecond >= 1000000U) {
+        (void)snprintf(output, capacity, "%.2f MB/s",
+                       (double)bytesPerSecond / 1000000.0);
+    } else if (bytesPerSecond >= 1000U) {
+        (void)snprintf(output, capacity, "%.1f kB/s",
+                       (double)bytesPerSecond / 1000.0);
+    } else {
+        (void)snprintf(output, capacity, "%" PRIu64 " B/s", bytesPerSecond);
+    }
+}
+
+/** Format measured latency or remaining time for the compact chart footer. */
+static void formatDuration(char *output, size_t capacity, uint64_t microseconds,
+                           bool allowStable) {
+    if (allowStable && microseconds == UINT64_MAX) {
+        (void)snprintf(output, capacity, "stable");
+    } else if (microseconds >= 1000000U) {
+        (void)snprintf(output, capacity, "%.2f s",
+                       (double)microseconds / 1000000.0);
+    } else if (microseconds >= 1000U) {
+        (void)snprintf(output, capacity, "%.1f ms",
+                       (double)microseconds / 1000.0);
+    } else {
+        (void)snprintf(output, capacity, "%" PRIu64 " us", microseconds);
+    }
+}
+
+/** Draw one chronological history line using a shared vertical rate scale. */
+static void drawHistoryLine(const ServerState_t *state, const float *history,
+                            Rectangle bounds, float maximum, float thickness,
+                            Color color) {
+    if (state->historyCount == 0U || maximum <= 0.0f) {
+        return;
+    }
+    const size_t oldest = (state->historyHead + PIPELINE_HISTORY_SIZE -
+                           state->historyCount) % PIPELINE_HISTORY_SIZE;
+    for (size_t sample = 1U; sample < state->historyCount; ++sample) {
+        const size_t previous = (oldest + sample - 1U) % PIPELINE_HISTORY_SIZE;
+        const size_t current = (oldest + sample) % PIPELINE_HISTORY_SIZE;
+        const float x0 = bounds.x + bounds.width * (float)(sample - 1U) /
+            (float)(PIPELINE_HISTORY_SIZE - 1U);
+        const float x1 = bounds.x + bounds.width * (float)sample /
+            (float)(PIPELINE_HISTORY_SIZE - 1U);
+        const float y0 = bounds.y + bounds.height -
+            bounds.height * history[previous] / maximum;
+        const float y1 = bounds.y + bounds.height -
+            bounds.height * history[current] / maximum;
+        DrawLineEx((Vector2){x0, y0}, (Vector2){x1, y1}, thickness, color);
+    }
+    const size_t newest = (state->historyHead + PIPELINE_HISTORY_SIZE - 1U) %
+        PIPELINE_HISTORY_SIZE;
+    const float newestX = bounds.x + bounds.width *
+        (float)(state->historyCount - 1U) / (float)(PIPELINE_HISTORY_SIZE - 1U);
+    const float newestY = bounds.y + bounds.height -
+        bounds.height * history[newest] / maximum;
+    DrawCircleV((Vector2){newestX, newestY}, 2.5f, color);
+}
+
+/** Draw a labeled current-capacity gauge. */
+static void drawPipelineGauge(const char *label, uint32_t current,
+                              uint32_t capacity, Rectangle bounds,
+                              Color color) {
+    const float fraction = capacity == 0U ? 0.0f
+        : (float)current / (float)capacity;
+    char value[64];
+    const double percentage = capacity == 0U ? 0.0
+        : current >= capacity ? 100.0 : 100.0 * current / capacity;
+    (void)snprintf(value, sizeof(value), "%s %.1f%%", label, percentage);
+    AppDashboardUi_DrawText(value, (int)bounds.x, (int)bounds.y - 2, 10,
+                            COLOR_MUTED);
+    const Rectangle track = {bounds.x + 94.0f, bounds.y, bounds.width - 94.0f,
+                             bounds.height};
+    DrawRectangleRounded(track, 1.0f, 8, (Color){35, 45, 65, 255});
+    if (fraction > 0.0f) {
+        Rectangle fill = track;
+        fill.width *= fraction > 1.0f ? 1.0f : fraction;
+        DrawRectangleRounded(fill, 1.0f, 8, color);
+    }
+}
+
+/** Draw actual producer/consumer rates, pressure, latency, and headroom. */
+static void drawPipelineVisualization(const ServerState_t *state,
+                                      Rectangle bounds) {
+    DrawRectangleRounded(bounds, 16.0f / bounds.height, 12,
+                         (Color){7, 11, 20, 255});
+    char producer[32];
+    char consumer[32];
+    formatRate(producer, sizeof(producer), state->producerBps);
+    formatRate(consumer, sizeof(consumer), state->consumerBps);
+    char legend[96];
+    (void)snprintf(legend, sizeof(legend), "PRODUCER  %s     CONSUMER  %s",
+                   producer, consumer);
+    AppDashboardUi_DrawDisplayText(legend, (int)bounds.x + 12,
+                                   (int)bounds.y + 8, 10, COLOR_TEXT);
+
+    const Rectangle graph = {bounds.x + 12.0f, bounds.y + 28.0f,
+                             bounds.width - 24.0f, 43.0f};
+    DrawRectangleRounded(graph, 0.15f, 8, (Color){12, 19, 33, 255});
+    AppDashboardUi_DrawText("Q%", (int)(graph.x + graph.width - 66),
+                            (int)graph.y + 2, 9, COLOR_PURPLE);
+    AppDashboardUi_DrawText("R%", (int)(graph.x + graph.width - 44),
+                            (int)graph.y + 2, 9, (Color){255, 196, 92, 255});
+    AppDashboardUi_DrawText("D%", (int)(graph.x + graph.width - 22),
+                            (int)graph.y + 2, 9, (Color){145, 152, 166, 255});
+    DrawLine((int)graph.x, (int)(graph.y + graph.height * 0.5f),
+             (int)(graph.x + graph.width),
+             (int)(graph.y + graph.height * 0.5f), COLOR_BORDER);
+    float maximum = 1.0f;
+    for (size_t sample = 0U; sample < state->historyCount; ++sample) {
+        const size_t index = (state->historyHead + PIPELINE_HISTORY_SIZE -
+                              state->historyCount + sample) % PIPELINE_HISTORY_SIZE;
+        if (state->producerHistory[index] > maximum) maximum = state->producerHistory[index];
+        if (state->consumerHistory[index] > maximum) maximum = state->consumerHistory[index];
+    }
+    drawHistoryLine(state, state->producerHistory, graph, maximum, 2.0f,
+                    COLOR_BLUE);
+    drawHistoryLine(state, state->consumerHistory, graph, maximum, 2.0f,
+                    COLOR_CYAN);
+    drawHistoryLine(state, state->dmaHistory, graph, 100.0f, 4.0f,
+                    (Color){145, 152, 166, 255});
+    drawHistoryLine(state, state->ringHistory, graph, 100.0f, 2.0f,
+                    (Color){255, 196, 92, 255});
+    drawHistoryLine(state, state->queueHistory, graph, 100.0f, 2.0f,
+                    COLOR_PURPLE);
+
+    drawPipelineGauge("Q PEAK", state->queueDepth, state->queueCapacity,
+                      (Rectangle){bounds.x + 12.0f, bounds.y + 78.0f,
+                                  bounds.width - 24.0f, 8.0f}, COLOR_PURPLE);
+    drawPipelineGauge("R PEAK", state->ringBurstBytes, state->ringBufferSize,
+                      (Rectangle){bounds.x + 12.0f, bounds.y + 95.0f,
+                                  bounds.width - 24.0f, 8.0f}, COLOR_BLUE);
+
+    char latency[24];
+    char headroom[24];
+    formatDuration(latency, sizeof(latency), state->latencyUs, false);
+    formatDuration(headroom, sizeof(headroom), state->headroomUs, true);
+    char footer[128];
+    (void)snprintf(footer, sizeof(footer),
+                   "LATENCY %s   HEADROOM %s   DROPS %u/%u/%u",
+                   latency, headroom, (unsigned int)state->crcDrops,
+                   (unsigned int)state->queueDrops,
+                   (unsigned int)state->ringDrops);
+    const Color footerColor = state->headroomUs != UINT64_MAX &&
+        state->headroomUs < 2000000U ? (Color){255, 120, 120, 255}
+        : state->headroomUs != UINT64_MAX && state->headroomUs < 10000000U
+            ? (Color){255, 196, 92, 255} : COLOR_MUTED;
+    AppDashboardUi_DrawText(footer, (int)bounds.x + 12,
+                            (int)bounds.y + 114, 10, footerColor);
+}
+
 /** Run the graphical server dashboard and child-process supervisor. */
 int main(void) {
     char windowTitle[96];
@@ -405,11 +713,33 @@ int main(void) {
     bool baudDropdown = false;
     int presetIndex = 0;
     int previousPreset = 0;
-    int bulkSizeIndex = 5;
-    int ringSizeIndex = 1;
-    int dmaSizeIndex = 3;
-    int clockIndex = 4;
-    int baudIndex = 4;
+    AppDashboardSettings_t savedSettings;
+    (void)AppClientPreferences_LoadSettings(
+        APP_PREFERENCES_SERVER, &savedSettings);
+    int bulkSizeIndex = AppDashboardConfig_FindSize(
+        APP_DASHBOARD_BULK_SIZES, APP_DASHBOARD_BULK_SIZE_COUNT,
+        savedSettings.bulkBytes, 5);
+    int ringSizeIndex = AppDashboardConfig_FindSize(
+        APP_DASHBOARD_RING_SIZES, APP_DASHBOARD_RING_SIZE_COUNT,
+        savedSettings.ringBytes, 6);
+    int dmaSizeIndex = AppDashboardConfig_FindSize(
+        APP_DASHBOARD_DMA_SIZES, APP_DASHBOARD_DMA_SIZE_COUNT,
+        savedSettings.dmaBytes, 3);
+    int clockIndex = AppDashboardConfig_FindSize(
+        APP_DASHBOARD_SYSTEM_CLOCKS, APP_DASHBOARD_SYSTEM_CLOCK_COUNT,
+        savedSettings.systemClockHz, 4);
+    int baudIndex = AppDashboardConfig_FindSize(
+        APP_DASHBOARD_BAUD_RATES, APP_DASHBOARD_BAUD_RATE_COUNT,
+        savedSettings.baud, 4);
+    savedSettings = (AppDashboardSettings_t){
+        .systemClockHz = (uint32_t)APP_DASHBOARD_SYSTEM_CLOCKS[clockIndex].size,
+        .baud = (uint32_t)APP_DASHBOARD_BAUD_RATES[baudIndex].size,
+        .ringBytes = (uint32_t)APP_DASHBOARD_RING_SIZES[ringSizeIndex].size,
+        .dmaBytes = (uint32_t)APP_DASHBOARD_DMA_SIZES[dmaSizeIndex].size,
+        .bulkBytes = (uint32_t)APP_DASHBOARD_BULK_SIZES[bulkSizeIndex].size,
+        .byteIrq = savedSettings.byteIrq,
+    };
+    state.byteIrqMode = savedSettings.byteIrq;
     unsigned int statsFrame = 0U;
     AppDashboardConfig_PresetToFields(0, opcodeText, sizeof(opcodeText),
                    parametersText, sizeof(parametersText));
@@ -417,7 +747,7 @@ int main(void) {
 
     while (!WindowShouldClose()) {
         pollServer(&process, &log, &state);
-        if (process.running && ++statsFrame >= 30U) {
+        if (process.running && ++statsFrame >= 6U) {
             (void)sendServerCommand(&process, "stats\n");
             statsFrame = 0U;
         }
@@ -499,6 +829,8 @@ int main(void) {
                     (void)snprintf(command, sizeof(command), "baud %u\n",
                                    (unsigned int)APP_DASHBOARD_BAUD_RATES[baudIndex].size);
                     (void)sendServerCommand(&process, command);
+                    state.byteIrqMode = savedSettings.byteIrq;
+                    (void)sendServerMode(&process, state.byteIrqMode);
                 }
             }
         }
@@ -506,7 +838,9 @@ int main(void) {
         AppDashboardUi_StatusField((Rectangle){170, 289, 570, 38},
                         state.port[0] != '\0'
                             ? state.port : "Start the server to create a port");
-        if (AppDashboardUi_Button((Rectangle){758, 289, 152, 38}, "Copy port",
+        const bool restoreDefaults = AppDashboardUi_Button(
+            (Rectangle){758, 289, 100, 38}, "Defaults", true);
+        if (AppDashboardUi_Button((Rectangle){866, 289, 100, 38}, "Copy port",
                          state.port[0] != '\0')) {
             if (state.port[0] != '\0') {
                 SetClipboardText(state.port);
@@ -515,7 +849,7 @@ int main(void) {
         }
         const bool previousMode = state.byteIrqMode;
         const bool modeChanged = AppDashboardUi_Toggle(
-            (Rectangle){942, 296, 134, 24}, "Per-byte IRQ",
+            (Rectangle){974, 296, 102, 24}, "Byte IRQ",
             &state.byteIrqMode, process.running);
         if (modeChanged && !sendServerMode(&process, state.byteIrqMode)) {
             state.byteIrqMode = previousMode;
@@ -612,20 +946,22 @@ int main(void) {
                        (unsigned int)state.testTotal);
         AppDashboardUi_DrawText(progressText, 792, 665, 12, COLOR_MUTED);
 
-        AppDashboardUi_DrawPanel((Rectangle){24, 740, 1072, 196}, "LIVE DMA / HCI TRAFFIC");
-        DrawRectangleRounded((Rectangle){44, 777, 1032, 142}, 16.0f / 142.0f, 12,
+        AppDashboardUi_DrawPanel((Rectangle){24, 740, 1072, 196},
+                                 "LIVE DMA / HCI TRAFFIC + PIPELINE HEADROOM");
+        DrawRectangleRounded((Rectangle){44, 777, 540, 142}, 16.0f / 142.0f, 12,
                              (Color){7, 11, 20, 255});
-        AppDashboardLog_Draw(&log, (Rectangle){58, 786, 1004, 135},
+        AppDashboardLog_Draw(&log, (Rectangle){58, 786, 512, 135},
                              AppDashboardUi_RegularFont(12),
                              (float)AppDashboardUi_RenderSize(12),
                              15.0f, serverLogColor);
+        drawPipelineVisualization(&state, (Rectangle){600, 777, 476, 142});
 
         /* Draw dropdowns last so their expanded lists overlay lower panels. */
         (void)AppDashboard_UpwardDropdown(
             (Rectangle){112, 397, 360, 38}, AppDashboardUi_Font(), APP_DASHBOARD_PRESET_OPTIONS,
             APP_DASHBOARD_PRESET_COUNT,
             &presetIndex, &presetDropdown);
-        (void)AppDashboard_UpwardDropdown(
+        const bool bulkSizeChanged = AppDashboard_UpwardDropdown(
             (Rectangle){392, 638, 132, 42}, AppDashboardUi_Font(), APP_DASHBOARD_BULK_SIZE_OPTIONS,
             APP_DASHBOARD_BULK_SIZE_COUNT,
             &bulkSizeIndex, &bulkSizeDropdown);
@@ -669,8 +1005,40 @@ int main(void) {
                            (unsigned int)APP_DASHBOARD_BAUD_RATES[baudIndex].size);
             (void)sendServerCommand(&process, command);
         }
+        if (restoreDefaults) {
+            AppClientPreferences_DefaultSettings(&savedSettings);
+            bulkSizeIndex = 5;
+            ringSizeIndex = 6;
+            dmaSizeIndex = 3;
+            clockIndex = 4;
+            baudIndex = 4;
+            state.byteIrqMode = false;
+            if (process.running) {
+                (void)sendServerCommand(&process, "ring 16384\n");
+                (void)sendServerCommand(&process, "dma-buffer 256\n");
+                (void)sendServerCommand(&process, "clock 20000000\n");
+                (void)sendServerCommand(&process, "baud 4000000\n");
+                (void)sendServerMode(&process, false);
+            }
+            appendLog(&log, "SETTINGS  Restored application defaults");
+        }
+        if (restoreDefaults || bulkSizeChanged || ringSizeChanged ||
+            dmaSizeChanged || clockChanged || baudChanged || modeChanged) {
+            savedSettings = (AppDashboardSettings_t){
+                .systemClockHz = (uint32_t)APP_DASHBOARD_SYSTEM_CLOCKS[clockIndex].size,
+                .baud = (uint32_t)APP_DASHBOARD_BAUD_RATES[baudIndex].size,
+                .ringBytes = (uint32_t)APP_DASHBOARD_RING_SIZES[ringSizeIndex].size,
+                .dmaBytes = (uint32_t)APP_DASHBOARD_DMA_SIZES[dmaSizeIndex].size,
+                .bulkBytes = (uint32_t)APP_DASHBOARD_BULK_SIZES[bulkSizeIndex].size,
+                .byteIrq = state.byteIrqMode,
+            };
+            (void)AppClientPreferences_SaveSettings(
+                APP_PREFERENCES_SERVER, &savedSettings);
+        }
         EndDrawing();
     }
+    (void)AppClientPreferences_SaveSettings(
+        APP_PREFERENCES_SERVER, &savedSettings);
 
     if (process.running) {
         requestServerStop(&process, &log);
