@@ -589,6 +589,10 @@ int main(void) {
         }
         pumpTestTransfer(&testSender, &serial, &log,
                          (uint32_t)APP_DASHBOARD_BAUD_RATES[baudIndex].size);
+        if (!serial.connected) {
+            testSender.active = false;
+            log.testIrqActive = false;
+        }
 
         const double sampleNow = GetTime();
         if (sampleNow - pipelineSampleTime >= 0.5) {
@@ -710,6 +714,8 @@ int main(void) {
         const bool restoreDefaults = AppDashboardUi_Button(
             (Rectangle){858, 292, 90, 34}, "Defaults", true);
         const bool connectionReady = serial.connected && handshake.verified;
+        const bool sendControlsReady = connectionReady && !testSender.active &&
+            !log.testIrqActive;
         const bool rxModeChanged = AppDashboardUi_Toggle(
             (Rectangle){958, 254, 118, 24}, "Per-byte IRQ",
             &log.byteIrqMode, connectionReady);
@@ -733,7 +739,7 @@ int main(void) {
         AppDashboardUi_TextBox((Rectangle){180, 452, 646, 38}, parametersText,
                              sizeof(parametersText), &parametersEdit);
         if (AppDashboardUi_Button((Rectangle){850, 452, 226, 38}, "Send command",
-                         connectionReady)) {
+                         sendControlsReady)) {
             char *end = NULL;
             const unsigned long opcode = strtoul(opcodeText, &end, 16);
             uint8_t parameters[255];
@@ -751,7 +757,7 @@ int main(void) {
         AppDashboardUi_TextBox((Rectangle){180, 512, 646, 38}, rawText,
                              sizeof(rawText), &rawEdit);
         if (AppDashboardUi_Button((Rectangle){850, 512, 226, 38}, "Append CRC + send",
-                         connectionReady)) {
+                         sendControlsReady)) {
             uint8_t raw[APP_H4_MAX_FRAME_SIZE - 2U];
             const size_t rawLength = AppH4_ParseHex(rawText, raw, sizeof(raw));
             if (rawLength == SIZE_MAX || rawLength == 0U) {
@@ -763,12 +769,12 @@ int main(void) {
 
         AppDashboardUi_DrawPanel((Rectangle){24, 596, 1072, 124}, "TEST TRANSMISSIONS");
         if (AppDashboardUi_Button((Rectangle){44, 638, 220, 42}, "Send 128-byte packet",
-                         connectionReady)) {
+                         sendControlsReady)) {
             startTestTransfer(&testSender, &serial, &log, 128U);
         }
         GuiLabel((Rectangle){292, 640, 92, 38}, "Block size");
         if (AppDashboardUi_Button((Rectangle){548, 638, 218, 42}, "Send selected block",
-                         connectionReady && !testSender.active)) {
+                         sendControlsReady)) {
             startTestTransfer(&testSender, &serial, &log,
                               APP_DASHBOARD_BULK_SIZES[bulkSizeIndex].size);
         }

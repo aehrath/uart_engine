@@ -128,7 +128,7 @@ or by the server. This prevents pseudo-UART speed from depending on host task
 and syscall overhead while preserving responsive UIs.
 
 All three graphical senders advance their progress bars from silent,
-baud-derived gauge updates at approximately 60 Hz. Human-readable progress
+baud-derived gauge updates at approximately 30–60 Hz. Human-readable progress
 records remain limited to 256 KiB boundaries, so smooth animation does not
 consume the retained traffic log or reduce transfer throughput.
 
@@ -137,6 +137,13 @@ same deterministic transfer in both directions. It checks CRCs, packet count,
 wire-byte count, completion, and timing parity; by default it fails when the
 slower direction takes more than 1.15 times as long as the faster direction.
 It also accepts `--baud`, `--mode`, `--ring`, and `--dma` for parameter sweeps.
+
+The dashboard send controls are half-duplex. An incoming START frame disables
+the command, raw-H4, 128-byte, and large-block send buttons on the receiving C
+or Python dashboard; its matching END frame enables them again. The same
+buttons remain disabled on the originating app until its own transfer finishes.
+Protocol-generated acknowledgements remain available because they do not pass
+through these user-facing controls.
 
 Both native dashboards display the repository release version and load the
 same platform UI family as the Python client: Avenir Next on macOS, Segoe UI on

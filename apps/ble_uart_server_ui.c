@@ -28,6 +28,7 @@
 #include <unistd.h>
 
 #define PROCESS_BUFFER_SIZE 2048U
+#define PROCESS_DRAIN_BUDGET (64U * 1024U)
 #define PIPELINE_HISTORY_SIZE 120U
 
 
@@ -78,6 +79,8 @@ typedef struct {
     uint32_t testTotal;
     /** Whether the server is currently generating test chunks. */
     bool testActive;
+    /** Whether the connected client is currently sending a test transfer. */
+    bool receiveTestActive;
     /** Active circular ring capacity. */
     uint32_t ringBufferSize;
     /** Active simulated RX DMA transaction size. */
@@ -291,6 +294,11 @@ static void handleServerLine(ServerLog_t *log, ServerState_t *state,
     } else if (strstr(line, "TX DMA <- TEST message failed") != NULL) {
         state->testActive = false;
     }
+    if (strncmp(line, "RX DMA -> TEST message start", 28U) == 0) {
+        state->receiveTestActive = true;
+    } else if (strncmp(line, "RX DMA -> TEST message complete", 31U) == 0) {
+        state->receiveTestActive = false;
+    }
     if (strncmp(line, "RX DMA -> HCI command", 21U) == 0 ||
         strncmp(line, "RX DMA -> TEST message start", 28U) == 0) {
         state->receivedCommands++;
@@ -368,6 +376,7 @@ static bool startServer(ServerProcess_t *process, ServerLog_t *log,
     close(outputPipe[1]);
     close(inputPipe[0]);
     (void)fcntl(outputPipe[0], F_SETFL, fcntl(outputPipe[0], F_GETFL) | O_NONBLOCK);
+    (void)fcntl(inputPipe[1], F_SETFL, fcntl(inputPipe[1], F_GETFL) | O_NONBLOCK);
     process->processId = child;
     process->outputDescriptor = outputPipe[0];
     process->inputDescriptor = inputPipe[1];
@@ -386,6 +395,7 @@ static bool startServer(ServerProcess_t *process, ServerLog_t *log,
     state->testSent = 0U;
     state->testTotal = 0U;
     state->testActive = false;
+    state->receiveTestActive = false;
     state->producerBps = 0U;
     state->consumerBps = 0U;
     state->queuedBytes = 0U;
@@ -433,10 +443,12 @@ static void pollServer(ServerProcess_t *process, ServerLog_t *log,
     }
 
     char data[512];
-    for (;;) {
+    size_t drained = 0U;
+    while (drained < PROCESS_DRAIN_BUDGET) {
         const ssize_t count = read(process->outputDescriptor, data, sizeof(data));
         if (count > 0) {
             consumeProcessOutput(process, log, state, data, (size_t)count);
+            drained += (size_t)count;
         } else {
             break;
         }
@@ -460,7 +472,7 @@ static void pollServer(ServerProcess_t *process, ServerLog_t *log,
     }
 }
 
-/** Write one complete dashboard control line to the server engine. */
+/** Write one complete dashboard control line without blocking the render loop. */
 static bool sendServerCommand(ServerProcess_t *process, const char *command) {
     if (!process->running) {
         return false;
@@ -469,10 +481,13 @@ static bool sendServerCommand(ServerProcess_t *process, const char *command) {
     const size_t length = strlen(command);
     while (offset < length) {
         const ssize_t written = write(process->inputDescriptor, &command[offset], length - offset);
-        if (written <= 0) {
+        if (written > 0) {
+            offset += (size_t)written;
+        } else if (written < 0 && errno == EINTR) {
+            continue;
+        } else {
             return false;
         }
-        offset += (size_t)written;
     }
     return true;
 }
@@ -855,6 +870,8 @@ int main(void) {
             state.byteIrqMode = previousMode;
             appendLog(&log, "ERROR  Unable to send receive-mode request");
         }
+        const bool sendControlsReady = process.running && !state.testActive &&
+            !state.receiveTestActive;
 
         AppDashboardUi_DrawPanel((Rectangle){24, 360, 1072, 216}, "HCI COMMAND BUILDER");
         GuiLabel((Rectangle){44, 397, 64, 38}, "Preset");
@@ -869,12 +886,12 @@ int main(void) {
         GuiLabel((Rectangle){44, 452, 132, 38}, "Parameters");
         AppDashboardUi_TextBox((Rectangle){180, 452, 646, 38}, parametersText,
                              sizeof(parametersText), &parametersEdit);
-        if (!process.running) {
+        if (!sendControlsReady) {
             GuiDisable();
         }
         const bool sendCommandPressed = AppDashboardUi_Button(
-            (Rectangle){850, 452, 226, 38}, "Send command", process.running);
-        if (!process.running) {
+            (Rectangle){850, 452, 226, 38}, "Send command", sendControlsReady);
+        if (!sendControlsReady) {
             GuiEnable();
         }
         if (sendCommandPressed) {
@@ -895,12 +912,12 @@ int main(void) {
         GuiLabel((Rectangle){44, 512, 132, 38}, "Raw H4 bytes");
         AppDashboardUi_TextBox((Rectangle){180, 512, 646, 38}, rawText,
                              sizeof(rawText), &rawEdit);
-        if (!process.running) {
+        if (!sendControlsReady) {
             GuiDisable();
         }
         const bool sendRawPressed = AppDashboardUi_Button(
-            (Rectangle){850, 512, 226, 38}, "Append CRC + send", process.running);
-        if (!process.running) {
+            (Rectangle){850, 512, 226, 38}, "Append CRC + send", sendControlsReady);
+        if (!sendControlsReady) {
             GuiEnable();
         }
         if (sendRawPressed) {
@@ -914,17 +931,17 @@ int main(void) {
         }
 
         AppDashboardUi_DrawPanel((Rectangle){24, 596, 1072, 124}, "TEST TRANSMISSIONS");
-        if (!process.running || state.testActive) {
+        if (!sendControlsReady) {
             GuiDisable();
         }
         const bool sendSmallTest = AppDashboardUi_Button(
             (Rectangle){44, 638, 220, 42}, "Send 128-byte packet",
-            process.running && !state.testActive);
+            sendControlsReady);
         GuiLabel((Rectangle){292, 640, 92, 38}, "Block size");
         const bool sendLargeTest = AppDashboardUi_Button(
             (Rectangle){548, 638, 218, 42}, "Send selected block",
-            process.running && !state.testActive);
-        if (!process.running || state.testActive) {
+            sendControlsReady);
+        if (!sendControlsReady) {
             GuiEnable();
         }
         if (sendSmallTest) {

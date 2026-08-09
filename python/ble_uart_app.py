@@ -76,6 +76,8 @@ def run_gui() -> None:
             self.port_scan_running = False
             self.parser = H4CrcStreamParser()
             self.test_identifier = 0
+            self.test_send_active = False
+            self.receive_test_active = False
             self.handshake_identifier = 0
             self.handshake_pending = False
             self.handshake_status_text = ""
@@ -569,6 +571,8 @@ def run_gui() -> None:
             self.connection_attempt += 1
             self.connecting = False
             self.handshake_pending = False
+            self.test_send_active = False
+            self.receive_test_active = False
             port = self.serial_port
             self.serial_port = None
             self.pipeline.reset()
@@ -607,9 +611,19 @@ def run_gui() -> None:
             self.rx_mode_toggle.configure(state=tk.NORMAL)
             self.send_command_button.configure(state=tk.NORMAL)
             self.send_raw_button.configure(state=tk.NORMAL)
-            self.send_small_button.configure(state=tk.NORMAL)
-            self.send_large_button.configure(state=tk.NORMAL)
+            self._update_send_buttons()
             self.log_notice("VERIFY  BLE UART server acknowledged the 128-byte probe")
+
+        def _update_send_buttons(self) -> None:
+            """Disable every sender while this app sends or receives a transfer."""
+            enabled = (self.serial_port is not None and not self.handshake_pending
+                       and not self.test_send_active
+                       and not self.receive_test_active)
+            state = tk.NORMAL if enabled else tk.DISABLED
+            self.send_command_button.configure(state=state)
+            self.send_raw_button.configure(state=state)
+            self.send_small_button.configure(state=state)
+            self.send_large_button.configure(state=state)
 
         def read_serial(self) -> None:
             """Background worker that forwards serial reads to the Tk-safe queue."""
@@ -712,6 +726,8 @@ def run_gui() -> None:
                             irq_detail = ""
                             if flags is not None and flags & 0x01:
                                 self.test_irq_active = True
+                                self.receive_test_active = True
+                                self._update_send_buttons()
                                 self.test_irq_calls = 0
                                 self.test_log_next_progress = 256 * 1024
                             if flags is not None and self.test_irq_active:
@@ -719,6 +735,8 @@ def run_gui() -> None:
                             if flags is not None and self.test_irq_active and flags & 0x02:
                                 transmission_irqs = self.test_irq_calls
                                 self.test_irq_active = False
+                                self.receive_test_active = False
+                                self._update_send_buttons()
                                 irq_detail = (
                                     f", IRQ complete: {transmission_irqs} calls; "
                                     f"app total={self.irq_absolute_count}")
@@ -764,12 +782,11 @@ def run_gui() -> None:
                         self.transfer_status_var.set(f"{sent} / {total} bytes")
                     elif kind == "tx_done":
                         total = int(value)
+                        self.test_send_active = False
                         self.transfer_progress.set(1.0)
                         self.transfer_status_var.set(f"{total} / {total} bytes")
                         self.log_notice(f"TEST  All {total} bytes sent; waiting for server verification")
-                        if self.serial_port is not None:
-                            self.send_small_button.configure(state=tk.NORMAL)
-                            self.send_large_button.configure(state=tk.NORMAL)
+                        self._update_send_buttons()
             except queue.Empty:
                 pass
             self.root.after(16, self.drain_reader_queue)
@@ -834,13 +851,16 @@ def run_gui() -> None:
             if self.serial_port is None:
                 self.log_notice("ERROR  Connect before sending test data", "ERROR")
                 return
+            if self.receive_test_active or self.test_send_active:
+                self.log_notice("TEST  Wait for the active transfer to finish")
+                return
             self.test_identifier = (self.test_identifier + 1) & 0xFFFF or 1
             identifier = self.test_identifier
             transfer_baud = dict(BAUD_RATES)[self.baud_var.get()]
             self.transfer_progress.set(0.0)
             self.transfer_status_var.set(f"0 / {total_size} bytes")
-            self.send_small_button.configure(state=tk.DISABLED)
-            self.send_large_button.configure(state=tk.DISABLED)
+            self.test_send_active = True
+            self._update_send_buttons()
             self.log_notice(f"TEST  Sending {total_size} bytes (id={identifier})")
 
             def send_worker() -> None:

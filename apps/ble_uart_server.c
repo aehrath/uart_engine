@@ -6,6 +6,7 @@
 #include "serial_ingress.h"
 #include "test_transfer_protocol.h"
 
+#include "semphr.h"
 #include "task.h"
 
 #include <errno.h>
@@ -48,7 +49,7 @@ static volatile bool outboundTestActive;
 static uint32_t inboundTestIrqStart;
 static uint32_t inboundTestIrqNextReport;
 static bool inboundTestIrqActive;
-static pthread_mutex_t ptyTxMutex = PTHREAD_MUTEX_INITIALIZER;
+static SemaphoreHandle_t ptyTxToken;
 static pthread_mutex_t uartTimingMutex = PTHREAD_MUTEX_INITIALIZER;
 static AppLpuartSimulator_t uartReceiver;
 static AppLpuartSimulator_t hostReceiver;
@@ -396,16 +397,28 @@ static void handleSerialFrame(const uint8_t *frame, uint16_t length, void *conte
     }
 }
 
-/** Write an entire byte span while the caller owns the pseudo-UART TX lock. */
-static bool writeAllUnlocked(const uint8_t *data, size_t size) {
+/** Write an entire byte span while the caller owns the pseudo-UART TX lock.
+ *
+ * The pseudo-terminal is nonblocking. Bulk traffic waits for actual descriptor
+ * writability instead of imposing one complete RTOS tick for every partial
+ * write. The FreeRTOS-owned serialization token allows other TX tasks to block
+ * cooperatively while the independent serial-reader task continues draining
+ * simultaneous traffic in the opposite direction.
+ */
+static bool writeAllUnlocked(const uint8_t *data, size_t size,
+                             bool bulkTransfer) {
     size_t written = 0U;
     while (written < size && !stopRequested) {
         const ssize_t result = write(ptyMaster, &data[written], size - written);
         if (result > 0) {
             written += (size_t)result;
         } else if (errno == EAGAIN || errno == EINTR) {
-            struct pollfd output = {ptyMaster, POLLOUT, 0};
-            (void)poll(&output, 1U, 10);
+            if (bulkTransfer) {
+                struct pollfd output = {ptyMaster, POLLOUT, 0};
+                (void)poll(&output, 1U, 1);
+            } else {
+                vTaskDelay(pdMS_TO_TICKS(1U));
+            }
         } else {
             return false;
         }
@@ -413,11 +426,19 @@ static bool writeAllUnlocked(const uint8_t *data, size_t size) {
     return written == size;
 }
 
-/** Write one complete span without interleaving another server transmission. */
-static bool writeAll(const uint8_t *data, size_t size) {
-    (void)pthread_mutex_lock(&ptyTxMutex);
-    const bool written = writeAllUnlocked(data, size);
-    (void)pthread_mutex_unlock(&ptyTxMutex);
+/** Write one complete span without interleaving another server transmission.
+ * @param data Bytes to place on the pseudo-UART.
+ * @param size Number of valid bytes in @p data.
+ * @param bulkTransfer Whether backpressure should yield without a fixed delay.
+ * @return `true` after the complete span has been written.
+ */
+static bool writeAll(const uint8_t *data, size_t size, bool bulkTransfer) {
+    if (ptyTxToken == NULL ||
+        xSemaphoreTake(ptyTxToken, portMAX_DELAY) != pdTRUE) {
+        return false;
+    }
+    const bool written = writeAllUnlocked(data, size, bulkTransfer);
+    (void)xSemaphoreGive(ptyTxToken);
     return written;
 }
 
@@ -455,7 +476,7 @@ void UartDma_PlatformTransmitDma(uint8_t *data, uint16_t size) {
                (unsigned int)requested, (unsigned int)actual);
         fflush(stdout);
     }
-    (void)writeAll(sampled, size);
+    (void)writeAll(sampled, size, false);
     DMA_TX_Complete_IRQHandler();
 }
 
@@ -643,6 +664,10 @@ static void outboundTestTask(void *parameters) {
             ? (gaugeTarget / TEST_TRANSFER_CHUNK_DATA_SIZE) *
                 TEST_TRANSFER_CHUNK_DATA_SIZE
             : TEST_TRANSFER_CHUNK_DATA_SIZE;
+        /* Coalesce two visual intervals. A single interval is smaller than a
+         * typical PTY scheduling window and lets a 60 Hz client observe a
+         * transient empty read between writes, halving effective throughput. */
+        const uint32_t writeStep = gaugeStep * 2U;
         uint32_t nextProgress = TEST_TRANSFER_PROGRESS_STEP;
         size_t batchLength = 0U;
         uint32_t batchPayload = 0U;
@@ -696,7 +721,7 @@ static void outboundTestTask(void *parameters) {
             }
             if (batchLength + wireLength > sizeof(wireBatch)) {
                 paceTestTransfer(startedUs, offset, transferBaud);
-                if (!writeAll(wireBatch, batchLength)) {
+                if (!writeAll(wireBatch, batchLength, true)) {
                     sent = false;
                     break;
                 }
@@ -708,9 +733,9 @@ static void outboundTestTask(void *parameters) {
             batchPayload += chunkSize;
 
             if (batchLength >= sizeof(wireBatch) - MAX_WIRE_FRAME ||
-                batchPayload >= gaugeStep) {
+                batchPayload >= writeStep) {
                 paceTestTransfer(startedUs, offset + chunkSize, transferBaud);
-                if (!writeAll(wireBatch, batchLength)) {
+                if (!writeAll(wireBatch, batchLength, true)) {
                     sent = false;
                     break;
                 }
@@ -732,7 +757,7 @@ static void outboundTestTask(void *parameters) {
         }
         if (sent && batchLength != 0U) {
             paceTestTransfer(startedUs, offset, transferBaud);
-            if (!writeAll(wireBatch, batchLength)) {
+            if (!writeAll(wireBatch, batchLength, true)) {
                 sent = false;
             } else {
                 printf("TX DMA <- TEST gauge %u/%u bytes\n",
@@ -903,6 +928,12 @@ int main(void) {
     BleHci_SetCommandHandler(onHciCommand);
     BleHci_SetAclHandler(onHciAcl);
     UartDmaSystem_Init();
+    ptyTxToken = xSemaphoreCreateBinary();
+    if (ptyTxToken == NULL) {
+        PseudoUart_Close(ptyMaster);
+        return 1;
+    }
+    (void)xSemaphoreGive(ptyTxToken);
     configureUartTiming(DEFAULT_SYSTEM_CLOCK_HZ, DEFAULT_LINE_BAUD);
     setRxMode(UART_DMA_RX_MODE_DMA_IDLE, false);
 

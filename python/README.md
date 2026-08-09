@@ -68,6 +68,10 @@ The background reader continuously drains configured DMA-sized transactions;
 ring capacity validates each completed H4 frame and does not throttle bytes to
 one ring-capacity span per Tk refresh.
 
+All four send buttons are half-duplex controls. They disable while this client
+is sending a test transfer and from each incoming test START through its END,
+matching both native dashboards and preventing competing user-started sends.
+
 The lower monitor applies the same pipeline units as the FreeRTOS server: a
 16-slot completed-packet queue, H4 wire bytes in the circular ring, and bytes in
 one DMA transaction. It retains one minute of half-second rate samples, reports
@@ -90,7 +94,7 @@ log only after the final chunk.
 Transfers larger than 128 bytes use compact start/progress/completion log lines
 instead of formatting every ACL chunk as hexadecimal, avoiding UI logging as a
 throughput bottleneck. Separate gauge-only notifications advance the progress
-bar at approximately 60 Hz, matching the native C client and server without
+bar at approximately 30–60 Hz, matching the native C client and server without
 adding those animation updates to the log.
 
 The receive parser uses the platform-optimized CRC16 primitive and compacts a
