@@ -44,6 +44,7 @@ flowchart TB
         PTY["Pseudo-UART master"]
         Reader["Serial_RX FreeRTOS task"]
         Ingress["H4 serial ingress<br/>frame reassembly"]
+        Timing["KW47 LPUART sampler<br/>OSR/SBR + 8-N-1 timing"]
         Inject["Simulated DMA injection<br/>circular RX buffer + NDTR"]
         IdleIRQ["UART IDLE ISR"]
     end
@@ -51,7 +52,8 @@ flowchart TB
     UART <--> PTY
     PTY --> Reader
     Reader --> Ingress
-    Ingress --> Inject
+    Ingress --> Timing
+    Timing -->|"sampled bytes + packet warnings"| Inject
     Inject --> IdleIRQ
 
     subgraph RxPipeline["FreeRTOS RX pipeline"]
@@ -102,7 +104,8 @@ flowchart TB
     Semaphore --> TxTask
     TxTask --> TxCRC
     TxCRC --> TxHook
-    TxHook --> PTY
+    TxHook --> Timing
+    Timing --> PTY
     TxHook --> TxIRQ
     TxIRQ --> Semaphore
     UART --> CH4
@@ -183,6 +186,7 @@ flowchart TB
     subgraph Common["Native app support — ble_uart_app_common"]
         H4["apps/common/h4_wire.h + .c<br/>commands, CRC, hex, stream parser"]
         Serial["apps/common/serial_port.h + .c<br/>Win32 / POSIX serial"]
+        Lpuart["apps/common/lpuart_sim.h + .c<br/>KW47 divisors + 8-N-1 sampler"]
         TestProto["apps/common/test_transfer_protocol.h<br/>typed deterministic chunks"]
         WireH --> H4
         CrcC --> H4
@@ -216,6 +220,7 @@ flowchart TB
         Pseudo --> Server
         Ingress --> Server
         TestProto --> Server
+        Lpuart --> Server
         Engine --> Server
         ServerUI -->|"process control + logs"| Server
         Raylib --> ServerUI
@@ -229,6 +234,7 @@ flowchart TB
     subgraph PythonApp["Python client"]
         PyProtocol["python/ble_protocol.py<br/>CRC, H4 parser, test generators"]
         PyPorts["python/serial_ports.py"]
+        PyLpuart["python/lpuart_sim.py<br/>mirrored KW47 timing model"]
         PyApp["python/ble_uart_app.py<br/>Tk GUI + worker threads"]
         Requirements["python/requirements.txt"]
         PyProtocol --> PyApp
@@ -253,12 +259,15 @@ flowchart TB
 
     subgraph Tests["Automated verification"]
         CTests["tests/test_uart_dma.c<br/>parser, recovery, API and ISR tests"]
+        TimingTests["tests/test_lpuart_sim.c<br/>divisors + sampled failures"]
         PyTests["python/tests/test_ble_uart_app.py<br/>CRC, parser and transfer tests"]
         CTestRunner["CTest"]
         Core --> CTests
+        Lpuart --> TimingTests
         PyProtocol --> PyTests
         CMake --> CTestRunner
         CTestRunner --> CTests
+        CTestRunner --> TimingTests
         CTestRunner --> DemoCLI
         CTestRunner --> PyTests
     end

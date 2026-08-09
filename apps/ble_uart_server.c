@@ -1,6 +1,7 @@
 /** @file
  * @brief Continuous FreeRTOS BLE-side server connected through a pseudo-UART. */
 #include "uart_dma/uart_dma.h"
+#include "lpuart_sim.h"
 #include "pseudo_uart.h"
 #include "serial_ingress.h"
 #include "test_transfer_protocol.h"
@@ -25,6 +26,8 @@
 #define MAX_WIRE_FRAME       UART_DMA_MAX_PACKET_SIZE
 #define TEST_TX_BATCH_SIZE   (64U * 1024U)
 #define DEFAULT_RX_DMA_SIZE  256U
+#define DEFAULT_SYSTEM_CLOCK_HZ 20000000U
+#define DEFAULT_LINE_BAUD       4000000U
 
 static UART_TypeDef uartRegisters;
 static DMA_Stream_TypeDef rxDmaRegisters;
@@ -44,6 +47,41 @@ static uint32_t inboundTestIrqStart;
 static uint32_t inboundTestIrqNextReport;
 static bool inboundTestIrqActive;
 static pthread_mutex_t ptyTxMutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t uartTimingMutex = PTHREAD_MUTEX_INITIALIZER;
+static AppLpuartSimulator_t uartReceiver;
+static AppLpuartSimulator_t hostReceiver;
+static uint32_t invalidTestPackets;
+static uint32_t invalidTestChangedBytes;
+static uint32_t invalidTestFramingErrors;
+
+/** Print the divisor pair selected for the current simulated KW47 clock. */
+static void reportUartTiming(void) {
+    printf("UART TIMING -> clock=%u requested=%u osr=%u sbr=%u actual=%u error_ppm=%d\n",
+           (unsigned int)uartReceiver.sourceClockHz,
+           (unsigned int)uartReceiver.requestedBaud,
+           (unsigned int)uartReceiver.osr, (unsigned int)uartReceiver.sbr,
+           (unsigned int)uartReceiver.actualBaud, (int)uartReceiver.errorPpm);
+    fflush(stdout);
+}
+
+/** Reconfigure the simulated LPUART at a packet boundary. */
+static void configureUartTiming(uint32_t sourceClockHz, uint32_t baud) {
+    (void)pthread_mutex_lock(&uartTimingMutex);
+    (void)AppLpuartSim_Configure(&uartReceiver, sourceClockHz, baud);
+    /* The host UART remains configured for the requested line rate while the
+     * KW47 transmitter runs at the rounded BAUD[OSR]/BAUD[SBR] result. */
+    hostReceiver = (AppLpuartSimulator_t){
+        .sourceClockHz = baud * 16U,
+        .requestedBaud = uartReceiver.actualBaud,
+        .osr = 16U,
+        .sbr = 1U,
+        .actualBaud = baud,
+        .errorPpm = -uartReceiver.errorPpm,
+        .phase = 0U,
+    };
+    reportUartTiming();
+    (void)pthread_mutex_unlock(&uartTimingMutex);
+}
 
 /** Running verification state for the chunked deterministic transfer protocol. */
 typedef struct {
@@ -238,11 +276,44 @@ static void handleSerialFrame(const uint8_t *frame, uint16_t length, void *conte
         inboundTestIrqStart = before;
         inboundTestIrqNextReport = TEST_TRANSFER_PROGRESS_STEP;
         inboundTestIrqActive = true;
+        invalidTestPackets = 0U;
+        invalidTestChangedBytes = 0U;
+        invalidTestFramingErrors = 0U;
     }
-    injectDmaFrame(frame, length);
+    static uint8_t sampledFrame[MAX_WIRE_FRAME];
+    (void)pthread_mutex_lock(&uartTimingMutex);
+    const AppLpuartSimulationResult_t simulation = AppLpuartSim_Receive(
+        &uartReceiver, frame, sampledFrame, length);
+    const uint32_t clock = uartReceiver.sourceClockHz;
+    const uint32_t requested = uartReceiver.requestedBaud;
+    const uint32_t actual = uartReceiver.actualBaud;
+    (void)pthread_mutex_unlock(&uartTimingMutex);
+    if (!simulation.valid) {
+        if (isTestTransfer) {
+            invalidTestPackets++;
+            invalidTestChangedBytes += (uint32_t)simulation.changedBytes;
+            invalidTestFramingErrors += (uint32_t)simulation.framingErrors;
+        } else {
+            printf("WARNING UART SIM RX packet invalid: bytes=%u changed=%u framing=%u clock=%u requested=%u actual=%u\n",
+                   (unsigned int)length, (unsigned int)simulation.changedBytes,
+                   (unsigned int)simulation.framingErrors, (unsigned int)clock,
+                   (unsigned int)requested, (unsigned int)actual);
+            fflush(stdout);
+        }
+    }
+    injectDmaFrame(sampledFrame, length);
     const uint32_t after = UartDma_GetRxInterruptCount();
     if (isTestTransfer && inboundTestIrqActive) {
         if ((testFlags & TEST_TRANSFER_FLAG_END) != 0U) {
+            if (invalidTestPackets != 0U) {
+                printf("WARNING UART SIM RX transfer invalid: failed_packets=%u changed_bytes=%u framing_errors=%u clock=%u requested=%u actual=%u\n",
+                       (unsigned int)invalidTestPackets,
+                       (unsigned int)invalidTestChangedBytes,
+                       (unsigned int)invalidTestFramingErrors,
+                       (unsigned int)clock, (unsigned int)requested,
+                       (unsigned int)actual);
+                fflush(stdout);
+            }
             reportRxIrqStats(after - inboundTestIrqStart);
             inboundTestIrqActive = false;
         } else if (testReceivedSize >= inboundTestIrqNextReport) {
@@ -283,7 +354,22 @@ static bool writeAll(const uint8_t *data, size_t size) {
 
 /** Host implementation of the platform TX DMA hook. */
 void UartDma_PlatformTransmitDma(uint8_t *data, uint16_t size) {
-    (void)writeAll(data, size);
+    static uint8_t sampled[MAX_WIRE_FRAME];
+    (void)pthread_mutex_lock(&uartTimingMutex);
+    const AppLpuartSimulationResult_t simulation = AppLpuartSim_Receive(
+        &hostReceiver, data, sampled, size);
+    const uint32_t clock = uartReceiver.sourceClockHz;
+    const uint32_t requested = uartReceiver.requestedBaud;
+    const uint32_t actual = uartReceiver.actualBaud;
+    (void)pthread_mutex_unlock(&uartTimingMutex);
+    if (!simulation.valid) {
+        printf("WARNING UART SIM TX packet invalid: bytes=%u changed=%u framing=%u clock=%u requested=%u actual=%u\n",
+               (unsigned int)size, (unsigned int)simulation.changedBytes,
+               (unsigned int)simulation.framingErrors, (unsigned int)clock,
+               (unsigned int)requested, (unsigned int)actual);
+        fflush(stdout);
+    }
+    (void)writeAll(sampled, size);
     DMA_TX_Complete_IRQHandler();
 }
 
@@ -360,6 +446,29 @@ static void controlReaderTask(void *parameters) {
                            (unsigned int)UartDma_GetRxBufferSize(),
                            (unsigned int)rxDmaTransferSize);
                     fflush(stdout);
+                } else if (strcmp(command, "timing") == 0) {
+                    (void)pthread_mutex_lock(&uartTimingMutex);
+                    reportUartTiming();
+                    (void)pthread_mutex_unlock(&uartTimingMutex);
+                } else if (strncmp(command, "clock ", 6U) == 0 ||
+                           strncmp(command, "baud ", 5U) == 0) {
+                    const bool changingClock = command[0] == 'c';
+                    const char *value = &command[changingClock ? 6U : 5U];
+                    char *end = NULL;
+                    const unsigned long requested = strtoul(value, &end, 10);
+                    const unsigned long maximum = changingClock
+                        ? APP_LPUART_MAX_SOURCE_CLOCK_HZ
+                        : APP_LPUART_MAX_REQUESTED_BAUD;
+                    if (*end != '\0' || requested == 0UL || requested > maximum) {
+                        puts("ERROR  UART clock or baud is outside the simulator range");
+                    } else {
+                        const uint32_t clock = changingClock
+                            ? (uint32_t)requested : uartReceiver.sourceClockHz;
+                        const uint32_t baud = changingClock
+                            ? uartReceiver.requestedBaud : (uint32_t)requested;
+                        configureUartTiming(clock, baud);
+                    }
+                    fflush(stdout);
                 } else if (strncmp(command, "ring ", 5U) == 0) {
                     char *end = NULL;
                     const unsigned long requested = strtoul(&command[5], &end, 10);
@@ -419,6 +528,8 @@ static void outboundTestTask(void *parameters) {
     (void)parameters;
     static TestTransferPacket_t acl;
     static uint8_t wireBatch[TEST_TX_BATCH_SIZE];
+    static uint8_t sampledWire[MAX_WIRE_FRAME];
+    static uint8_t originalWire[MAX_WIRE_FRAME];
     uint16_t identifier = 0U;
     while (!stopRequested) {
         const uint32_t totalSize = outboundTestRequest;
@@ -440,6 +551,9 @@ static void outboundTestTask(void *parameters) {
         uint32_t nextProgress = TEST_TRANSFER_PROGRESS_STEP;
         size_t batchLength = 0U;
         bool sent = true;
+        uint32_t invalidPackets = 0U;
+        uint32_t changedBytes = 0U;
+        uint32_t framingErrors = 0U;
         while (offset < totalSize && !stopRequested) {
             const uint32_t remaining = totalSize - offset;
             const uint16_t chunkSize = (uint16_t)(remaining < TEST_TRANSFER_CHUNK_DATA_SIZE
@@ -473,6 +587,17 @@ static void outboundTestTask(void *parameters) {
                 BleHciWire_ToBe16(UartDma_ComputeCrc16((const uint8_t *)&acl, h4Length))
             };
             const size_t wireLength = h4Length + sizeof(trailer);
+            memcpy(originalWire, &acl, h4Length);
+            memcpy(&originalWire[h4Length], &trailer, sizeof(trailer));
+            (void)pthread_mutex_lock(&uartTimingMutex);
+            const AppLpuartSimulationResult_t simulation = AppLpuartSim_Receive(
+                &hostReceiver, originalWire, sampledWire, wireLength);
+            (void)pthread_mutex_unlock(&uartTimingMutex);
+            if (!simulation.valid) {
+                invalidPackets++;
+                changedBytes += (uint32_t)simulation.changedBytes;
+                framingErrors += (uint32_t)simulation.framingErrors;
+            }
             if (batchLength + wireLength > sizeof(wireBatch)) {
                 if (!writeAll(wireBatch, batchLength)) {
                     sent = false;
@@ -480,10 +605,8 @@ static void outboundTestTask(void *parameters) {
                 }
                 batchLength = 0U;
             }
-            memcpy(&wireBatch[batchLength], &acl, h4Length);
-            batchLength += h4Length;
-            memcpy(&wireBatch[batchLength], &trailer, sizeof(trailer));
-            batchLength += sizeof(trailer);
+            memcpy(&wireBatch[batchLength], sampledWire, wireLength);
+            batchLength += wireLength;
 
             if (batchLength >= sizeof(wireBatch) - MAX_WIRE_FRAME &&
                 !writeAll(wireBatch, batchLength)) {
@@ -504,6 +627,11 @@ static void outboundTestTask(void *parameters) {
         }
         if (sent && batchLength != 0U && !writeAll(wireBatch, batchLength)) {
             sent = false;
+        }
+        if (invalidPackets != 0U) {
+            printf("WARNING UART SIM TX transfer invalid: failed_packets=%u changed_bytes=%u framing_errors=%u\n",
+                   (unsigned int)invalidPackets, (unsigned int)changedBytes,
+                   (unsigned int)framingErrors);
         }
         printf("TX DMA <- TEST message %s id=%u size=%u bytes\n",
                sent && offset == totalSize ? "complete" : "failed",
@@ -663,6 +791,7 @@ int main(void) {
     BleHci_SetCommandHandler(onHciCommand);
     BleHci_SetAclHandler(onHciAcl);
     UartDmaSystem_Init();
+    configureUartTiming(DEFAULT_SYSTEM_CLOCK_HZ, DEFAULT_LINE_BAUD);
     setRxMode(UART_DMA_RX_MODE_DMA_IDLE, false);
 
     if (xTaskCreate(serialReaderTask, "Serial_RX", configMINIMAL_STACK_SIZE + 256U,
@@ -683,7 +812,8 @@ int main(void) {
 
     puts("Continuous BLE C UART server is running.");
     printf("In the Python app, type this port manually: %s\n", slaveName);
-    puts("Baud rate is ignored for the pseudo-UART. Press Ctrl-C to stop.");
+    puts("Pseudo-UART bytes are passed through the configured KW47 LPUART sampler.");
+    puts("Use 'clock HZ' and 'baud RATE' to change simulated timing. Press Ctrl-C to stop.");
     vTaskStartScheduler();
 
     PseudoUart_Close(ptyMaster);

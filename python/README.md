@@ -20,7 +20,8 @@ The repository's local `.venv` is excluded from version control.
 The application uses the same component boundaries as the C dashboards.
 `dashboard_config.py`, `dashboard_font.py`, `dashboard_dropdown.py`,
 `dashboard_log.py`, and `dashboard_ui.py` mirror the corresponding files in
-`apps/common`. `ble_protocol.py` contains H4/CRC framing and test-message
+`apps/common`. `lpuart_sim.py` mirrors the native KW47 OSR/SBR divisor search
+and deterministic 8-N-1 sampler. `ble_protocol.py` contains H4/CRC framing and test-message
 generation, `serial_ports.py` handles port discovery, and `ble_uart_app.py`
 contains only the application controller and concrete client layout.
 

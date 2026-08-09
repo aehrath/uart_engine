@@ -20,6 +20,7 @@ from ble_protocol import (  # noqa: E402
     parse_hex,
 )
 from dashboard_config import DMA_BUFFER_SIZES, RING_BUFFER_SIZES  # noqa: E402
+from lpuart_sim import LpuartSimulator  # noqa: E402
 
 
 class ProtocolTests(unittest.TestCase):
@@ -66,6 +67,24 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(dict(RING_BUFFER_SIZES)["64 KiB"], 64 * 1024)
         self.assertEqual(dict(DMA_BUFFER_SIZES)["256 B"], 256)
         self.assertEqual(dict(DMA_BUFFER_SIZES)["4 KiB"], 4 * 1024)
+
+    def test_kw47_lpuart_clock_sampling(self):
+        """Match native OSR/SBR selection and sampled packet failures."""
+        packet = bytes.fromhex("01 03 0C 00 3E A5 5A FF")
+        exact = LpuartSimulator.configure(20_000_000, 4_000_000)
+        self.assertEqual((exact.osr, exact.sbr, exact.actual_baud),
+                         (5, 1, 4_000_000))
+        self.assertTrue(exact.receive(packet).valid)
+        maximum = LpuartSimulator.configure(20_000_000, 5_000_000)
+        self.assertEqual((maximum.osr, maximum.sbr, maximum.actual_baud),
+                         (4, 1, 5_000_000))
+        below_ceiling = LpuartSimulator.configure(15_900_000, 4_000_000)
+        self.assertTrue(below_ceiling.receive(packet).valid)
+        starved = LpuartSimulator.configure(12_000_000, 4_000_000)
+        result = starved.receive(packet)
+        self.assertEqual((starved.osr, starved.sbr, starved.actual_baud),
+                         (4, 1, 3_000_000))
+        self.assertFalse(result.valid)
 
     def test_rx_mode_command_and_event(self):
         """Verify typed mode requests and synchronized RXMD event decoding."""

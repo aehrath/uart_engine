@@ -55,6 +55,28 @@ const char *const APP_DASHBOARD_DMA_SIZE_OPTIONS[] = {
 const size_t APP_DASHBOARD_DMA_SIZE_COUNT =
     sizeof(APP_DASHBOARD_DMA_SIZES) / sizeof(APP_DASHBOARD_DMA_SIZES[0]);
 
+const AppDashboardSizeChoice_t APP_DASHBOARD_SYSTEM_CLOCKS[] = {
+    {"4 MHz", 4000000U}, {"8 MHz", 8000000U}, {"12 MHz", 12000000U},
+    {"16 MHz", 16000000U}, {"20 MHz", 20000000U}, {"24 MHz", 24000000U},
+    {"32 MHz", 32000000U}, {"40 MHz", 40000000U}, {"48 MHz", 48000000U},
+};
+const char *const APP_DASHBOARD_SYSTEM_CLOCK_OPTIONS[] = {
+    "4 MHz", "8 MHz", "12 MHz", "16 MHz", "20 MHz", "24 MHz",
+    "32 MHz", "40 MHz", "48 MHz",
+};
+const size_t APP_DASHBOARD_SYSTEM_CLOCK_COUNT = sizeof(APP_DASHBOARD_SYSTEM_CLOCKS) /
+    sizeof(APP_DASHBOARD_SYSTEM_CLOCKS[0]);
+
+const AppDashboardSizeChoice_t APP_DASHBOARD_BAUD_RATES[] = {
+    {"115200", 115200U}, {"1 M", 1000000U}, {"2 M", 2000000U},
+    {"3 M", 3000000U}, {"4 M", 4000000U},
+};
+const char *const APP_DASHBOARD_BAUD_RATE_OPTIONS[] = {
+    "115200", "1 M", "2 M", "3 M", "4 M",
+};
+const size_t APP_DASHBOARD_BAUD_RATE_COUNT = sizeof(APP_DASHBOARD_BAUD_RATES) /
+    sizeof(APP_DASHBOARD_BAUD_RATES[0]);
+
 void AppDashboardConfig_PresetToFields(size_t presetIndex,
                                        char *opcode, size_t opcodeSize,
                                        char *parameters,

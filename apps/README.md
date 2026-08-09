@@ -114,6 +114,36 @@ components. The Python client mirrors those same responsibilities in
 `python/dashboard_*` modules so visual and behavioral changes have an obvious
 counterpart instead of accumulating in one application file.
 
+## KW47 LPUART clock simulation
+
+The server dashboard's **Clock** and **Baud** selectors configure a bit-level
+KW47 LPUART simulation. The divisor search covers every legal effective
+oversampling ratio from 4 through 32 and every SBR from 1 through 8191, then
+selects the pair with the smallest actual baud error. At a 20 MHz peripheral
+clock, 4 Mbaud is represented exactly by OSR=5 and SBR=1. The theoretical
+5 Mbaud ceiling is represented by OSR=4 and SBR=1, following NXP's documented
+`baud = clock / (OSR * SBR)` relationship. The application continues to expose
+only the previously established rates through 4 Mbaud.
+
+Pseudo-UART traffic is not rejected merely because `clock / 4` is below the
+requested rate. Every packet is instead passed through a continuous 8-N-1
+receiver sampler using the selected divisor, asynchronous sampling phase, data
+bit centers, and stop-bit sample. The resulting bytes—including corrupt bytes—
+continue through DMA, HCI framing, and CRC handling. A yellow `WARNING UART SIM`
+line appears only when that sampled packet actually has changed data bits or a
+framing error. Large test transfers aggregate failing packet, changed-byte, and
+framing-error counts into one completion warning to preserve throughput.
+
+The same simulation is applied in both directions: client-to-server traffic is
+sampled by the configured KW47 receiver, while server-to-client traffic uses the
+KW47's generated baud against a host receiver configured for the requested
+line rate. The selected clock, requested rate, OSR, SBR, actual rate, and signed
+ppm error are written to the live server log whenever timing changes. Terminal
+users can issue `clock HZ`, `baud RATE`, and `timing` on the server's standard
+input. The model follows the baud generator and 4-to-32-sample acquisition range
+described in NXP's [KW47 Reference Manual](https://www.nxp.com/docs/en/reference-manual/KW47RM.pdf)
+and [LPUART baud-rate application note](https://www.nxp.com/docs/en/application-note/AN14458.pdf).
+
 The **Ring** selector changes the active circular receive capacity from 256 B
 through 64 KiB. The independent **DMA** selector changes a receive transaction
 from 32 B through 4 KiB. Native logs retain 256 lines; use the mouse wheel over

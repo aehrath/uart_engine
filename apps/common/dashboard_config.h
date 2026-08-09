@@ -42,6 +42,14 @@ extern const AppDashboardSizeChoice_t APP_DASHBOARD_DMA_SIZES[];
 extern const char *const APP_DASHBOARD_DMA_SIZE_OPTIONS[];
 extern const size_t APP_DASHBOARD_DMA_SIZE_COUNT;
 
+extern const AppDashboardSizeChoice_t APP_DASHBOARD_SYSTEM_CLOCKS[];
+extern const char *const APP_DASHBOARD_SYSTEM_CLOCK_OPTIONS[];
+extern const size_t APP_DASHBOARD_SYSTEM_CLOCK_COUNT;
+
+extern const AppDashboardSizeChoice_t APP_DASHBOARD_BAUD_RATES[];
+extern const char *const APP_DASHBOARD_BAUD_RATE_OPTIONS[];
+extern const size_t APP_DASHBOARD_BAUD_RATE_COUNT;
+
 /** Copy one preset into the dashboard's editable hexadecimal fields. */
 void AppDashboardConfig_PresetToFields(size_t presetIndex,
                                        char *opcode, size_t opcodeSize,

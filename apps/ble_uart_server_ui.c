@@ -79,6 +79,16 @@ typedef struct {
     uint32_t ringBufferSize;
     /** Active simulated RX DMA transaction size. */
     uint32_t dmaBufferSize;
+    /** Configured KW47 LPUART source clock. */
+    uint32_t systemClockHz;
+    /** Requested UART line rate. */
+    uint32_t requestedBaud;
+    /** Selected effective oversampling ratio. */
+    uint32_t osr;
+    /** Selected baud-rate modulo divisor. */
+    uint32_t sbr;
+    /** Rounded baud produced by the selected divisors. */
+    uint32_t actualBaud;
 } ServerState_t;
 
 /** Append one server log line. */
@@ -89,6 +99,7 @@ static void appendLog(ServerLog_t *log, const char *line) {
 /** Select the established traffic color for one retained server log line. */
 static Color serverLogColor(const char *line) {
     return strncmp(line, "ERROR", 5U) == 0 ? (Color){255, 120, 120, 255}
+        : strncmp(line, "WARNING", 7U) == 0 ? (Color){255, 196, 92, 255}
         : strncmp(line, "RX DMA", 6U) == 0 ? (Color){100, 190, 255, 255}
         : strncmp(line, "TX DMA", 6U) == 0 ? (Color){105, 225, 150, 255}
         : (Color){190, 198, 210, 255};
@@ -118,6 +129,12 @@ static void handleServerLine(ServerLog_t *log, ServerState_t *state,
                       &parsed, &total) == 2) {
         state->ringBufferSize = parsed;
         state->dmaBufferSize = total;
+        return;
+    } else if (sscanf(line,
+                      "UART TIMING -> clock=%u requested=%u osr=%u sbr=%u actual=%u",
+                      &state->systemClockHz, &state->requestedBaud, &state->osr,
+                      &state->sbr, &state->actualBaud) == 5) {
+        appendLog(log, line);
         return;
     } else if (sscanf(line,
                       "RX IRQ PROGRESS -> absolute=%u transmission=%u",
@@ -384,11 +401,15 @@ int main(void) {
     bool bulkSizeDropdown = false;
     bool ringSizeDropdown = false;
     bool dmaSizeDropdown = false;
+    bool clockDropdown = false;
+    bool baudDropdown = false;
     int presetIndex = 0;
     int previousPreset = 0;
     int bulkSizeIndex = 5;
     int ringSizeIndex = 1;
     int dmaSizeIndex = 3;
+    int clockIndex = 4;
+    int baudIndex = 4;
     unsigned int statsFrame = 0U;
     AppDashboardConfig_PresetToFields(0, opcodeText, sizeof(opcodeText),
                    parametersText, sizeof(parametersText));
@@ -455,9 +476,11 @@ int main(void) {
         AppDashboardUi_DrawText(process.running ? (process.stopping ? "Stopping engine" : "Server running")
                                    : "Server stopped",
                    68, 244, 18, COLOR_TEXT);
-        AppDashboardUi_DrawText("Ring", 430, 247, 12, COLOR_MUTED);
-        AppDashboardUi_DrawText("DMA", 620, 247, 12, COLOR_MUTED);
-        if (AppDashboardUi_Button((Rectangle){876, 232, 200, 40},
+        AppDashboardUi_DrawText("Clock", 230, 247, 12, COLOR_MUTED);
+        AppDashboardUi_DrawText("Baud", 390, 247, 12, COLOR_MUTED);
+        AppDashboardUi_DrawText("Ring", 548, 247, 12, COLOR_MUTED);
+        AppDashboardUi_DrawText("DMA", 706, 247, 12, COLOR_MUTED);
+        if (AppDashboardUi_Button((Rectangle){900, 232, 176, 40},
                          process.running ? "Stop server" : "Start server", true)) {
             if (process.running) {
                 requestServerStop(&process, &log);
@@ -469,6 +492,12 @@ int main(void) {
                     (void)sendServerCommand(&process, command);
                     (void)snprintf(command, sizeof(command), "dma-buffer %u\n",
                                    (unsigned int)APP_DASHBOARD_DMA_SIZES[dmaSizeIndex].size);
+                    (void)sendServerCommand(&process, command);
+                    (void)snprintf(command, sizeof(command), "clock %u\n",
+                                   (unsigned int)APP_DASHBOARD_SYSTEM_CLOCKS[clockIndex].size);
+                    (void)sendServerCommand(&process, command);
+                    (void)snprintf(command, sizeof(command), "baud %u\n",
+                                   (unsigned int)APP_DASHBOARD_BAUD_RATES[baudIndex].size);
                     (void)sendServerCommand(&process, command);
                 }
             }
@@ -601,13 +630,21 @@ int main(void) {
             APP_DASHBOARD_BULK_SIZE_COUNT,
             &bulkSizeIndex, &bulkSizeDropdown);
         const bool ringSizeChanged = AppDashboard_UpwardDropdown(
-            (Rectangle){470, 238, 120, 34}, AppDashboardUi_Font(), APP_DASHBOARD_RING_SIZE_OPTIONS,
+            (Rectangle){582, 238, 104, 34}, AppDashboardUi_Font(), APP_DASHBOARD_RING_SIZE_OPTIONS,
             APP_DASHBOARD_RING_SIZE_COUNT,
             &ringSizeIndex, &ringSizeDropdown);
         const bool dmaSizeChanged = AppDashboard_UpwardDropdown(
-            (Rectangle){660, 238, 120, 34}, AppDashboardUi_Font(), APP_DASHBOARD_DMA_SIZE_OPTIONS,
+            (Rectangle){742, 238, 104, 34}, AppDashboardUi_Font(), APP_DASHBOARD_DMA_SIZE_OPTIONS,
             APP_DASHBOARD_DMA_SIZE_COUNT,
             &dmaSizeIndex, &dmaSizeDropdown);
+        const bool clockChanged = AppDashboard_UpwardDropdown(
+            (Rectangle){276, 238, 104, 34}, AppDashboardUi_Font(),
+            APP_DASHBOARD_SYSTEM_CLOCK_OPTIONS, APP_DASHBOARD_SYSTEM_CLOCK_COUNT,
+            &clockIndex, &clockDropdown);
+        const bool baudChanged = AppDashboard_UpwardDropdown(
+            (Rectangle){430, 238, 104, 34}, AppDashboardUi_Font(),
+            APP_DASHBOARD_BAUD_RATE_OPTIONS, APP_DASHBOARD_BAUD_RATE_COUNT,
+            &baudIndex, &baudDropdown);
         if (process.running && ringSizeChanged) {
             char command[48];
             (void)snprintf(command, sizeof(command), "ring %u\n",
@@ -618,6 +655,18 @@ int main(void) {
             char command[48];
             (void)snprintf(command, sizeof(command), "dma-buffer %u\n",
                            (unsigned int)APP_DASHBOARD_DMA_SIZES[dmaSizeIndex].size);
+            (void)sendServerCommand(&process, command);
+        }
+        if (process.running && clockChanged) {
+            char command[48];
+            (void)snprintf(command, sizeof(command), "clock %u\n",
+                           (unsigned int)APP_DASHBOARD_SYSTEM_CLOCKS[clockIndex].size);
+            (void)sendServerCommand(&process, command);
+        }
+        if (process.running && baudChanged) {
+            char command[48];
+            (void)snprintf(command, sizeof(command), "baud %u\n",
+                           (unsigned int)APP_DASHBOARD_BAUD_RATES[baudIndex].size);
             (void)sendServerCommand(&process, command);
         }
         EndDrawing();

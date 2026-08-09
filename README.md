@@ -8,7 +8,7 @@ CMake.
 ```text
 include/uart_dma/       Public embedded-library headers
 src/                    FreeRTOS UART/DMA, ring buffer, CRC, and HCI parser
-apps/common/            Shared protocol, serial, logging, font, config, and UI code
+apps/common/            Shared protocol, serial, LPUART timing, logging, and UI code
 apps/server/            Pseudo-UART and server-side serial ingress
 apps/ble_uart_*.c       C command-line and graphical app entry points
 python/dashboard_*.py   Python mirrors of the native dashboard components

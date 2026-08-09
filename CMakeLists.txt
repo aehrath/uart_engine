@@ -103,6 +103,7 @@ option(UART_DMA_BUILD_SERVER "Build the continuous BLE-side UART server" ON)
 if(UNIX AND UART_DMA_BUILD_SERVER)
     add_executable(ble_uart_server
         apps/ble_uart_server.c
+        apps/common/lpuart_sim.c
         apps/server/pseudo_uart.c
         apps/server/serial_ingress.c
     )
@@ -123,6 +124,7 @@ option(UART_DMA_BUILD_CLIENT "Build the C UART HCI client" ON)
 
 add_library(ble_uart_app_common STATIC
     apps/common/h4_wire.c
+    apps/common/lpuart_sim.c
     apps/common/serial_port.c
 )
 target_include_directories(ble_uart_app_common PUBLIC
@@ -136,6 +138,21 @@ if(MSVC)
 else()
     target_compile_definitions(ble_uart_app_common PRIVATE _DEFAULT_SOURCE)
     target_compile_options(ble_uart_app_common PRIVATE -Wall -Wextra -Werror)
+endif()
+
+if(BUILD_TESTING)
+    add_executable(lpuart_sim_tests
+        tests/test_lpuart_sim.c
+        apps/common/lpuart_sim.c)
+    target_include_directories(lpuart_sim_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/apps/common")
+    target_compile_features(lpuart_sim_tests PRIVATE c_std_11)
+    if(MSVC)
+        target_compile_options(lpuart_sim_tests PRIVATE /W4 /WX)
+    else()
+        target_compile_options(lpuart_sim_tests PRIVATE -Wall -Wextra -Werror)
+    endif()
+    add_test(NAME lpuart_sim_tests COMMAND lpuart_sim_tests)
 endif()
 
 if(UNIX AND UART_DMA_BUILD_CLIENT)
