@@ -47,6 +47,7 @@ A printable version of this guide is available as
 11. [Troubleshooting](#troubleshooting)
 12. [Wire protocol and implementation notes](#wire-protocol-and-implementation-notes)
 13. [Port the engine to target hardware](#port-the-engine-to-target-hardware)
+14. [License](#license)
 
 ## Repository layout
 
@@ -1047,6 +1048,12 @@ Recommended steps:
 
 The desktop pseudo-UART is a development adapter, not an embedded requirement.
 The reusable libraries do not depend on the graphical dashboards.
+
+## License
+
+This project is available under the [MIT License](LICENSE). You may use,
+modify, merge, publish, distribute, sublicense, and sell copies under the
+conditions stated in the license.
 
 ## Additional documentation
 
