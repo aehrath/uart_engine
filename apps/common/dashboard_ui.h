@@ -7,6 +7,15 @@
 
 #include <stdbool.h>
 #include <stddef.h>
+#include <stdint.h>
+
+/** Pointer-drag state retained by one numeric field. */
+typedef struct {
+    float startY;
+    uint32_t startValue;
+    bool active;
+    bool moved;
+} AppDashboardNumberDrag_t;
 
 extern const Color COLOR_CANVAS;
 extern const Color COLOR_PANEL;
@@ -62,5 +71,14 @@ bool AppDashboardUi_Toggle(Rectangle bounds, const char *label,
 /** Draw one editable rounded field with whole-field clipboard shortcuts. */
 void AppDashboardUi_TextBox(Rectangle bounds, char *text, size_t capacity,
                             bool *editing);
+
+/** Draw an editable numeric field that also changes when dragged vertically. */
+bool AppDashboardUi_NumberField(Rectangle bounds, char *text, size_t capacity,
+                                bool *editing,
+                                AppDashboardNumberDrag_t *drag,
+                                uint32_t step, uint32_t maximum);
+
+/** Move keyboard focus through a group of editable fields on Tab/Shift-Tab. */
+void AppDashboardUi_TabFocus(bool **editingFields, size_t fieldCount);
 
 #endif

@@ -111,10 +111,20 @@ class ProtocolTests(unittest.TestCase):
                 self.assertFalse(save_port("bad\nport"))
                 settings = DashboardSettings(
                     clock=16_000_000, baud=3_000_000, ring=4096,
-                    dma=128, bulk=512 * 1024, byte_irq=True)
+                    dma=128, bulk=512 * 1024, byte_irq=True,
+                    load_weight=37, load_min_cycles=12_345,
+                    load_max_cycles=98_765)
                 self.assertTrue(save_settings("client", settings))
                 self.assertEqual(load_settings("client"), settings)
                 self.assertEqual(load_settings("server"), DashboardSettings())
+
+                path.parent.joinpath("client-settings.txt").write_text(
+                    "load_weight=101\nload_min_cycles=9\nload_max_cycles=2\n",
+                    encoding="utf-8")
+                invalid = load_settings("client")
+                self.assertEqual(invalid.load_weight, 0)
+                self.assertEqual(invalid.load_min_cycles, 0)
+                self.assertEqual(invalid.load_max_cycles, 0)
 
     def test_pipeline_percentages_are_clamped_to_chart_capacity(self):
         """Keep transient over-capacity samples inside the percentage graph."""

@@ -4,6 +4,7 @@
 #define APP_DASHBOARD_CONFIG_H
 
 #include <stddef.h>
+#include <stdbool.h>
 #include <stdint.h>
 
 /** One editable HCI command preset. */
@@ -60,5 +61,10 @@ void AppDashboardConfig_PresetToFields(size_t presetIndex,
                                        char *opcode, size_t opcodeSize,
                                        char *parameters,
                                        size_t parameterSize);
+
+/** Parse min/max busy-cycle fields and a 0..100 workload weight. */
+bool AppDashboardConfig_ParseThreadLoad(
+    const char *minimumText, const char *maximumText, const char *weightText,
+    uint32_t *minimum, uint32_t *maximum, uint32_t *weight);
 
 #endif

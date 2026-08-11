@@ -133,6 +133,41 @@ static void reportUartTiming(void) {
     fflush(stdout);
 }
 
+/** Print the current randomized competing-task configuration and counters. */
+static void reportThreadLoad(void) {
+    UartDmaThreadLoadMetrics_t metrics;
+    UartDmaThreadLoad_GetMetrics(&metrics);
+    printf("THREAD LOAD -> weight=%u min_cycles=%u max_cycles=%u"
+           " active=%u decisions=%" PRIu64
+           " activations=%" PRIu64 " total_cycles=%" PRIu64
+           " busy_us=%" PRIu64 " last_cycles=%u\n",
+           (unsigned int)metrics.config.weightPercent,
+           (unsigned int)metrics.config.minimumCycles,
+           (unsigned int)metrics.config.maximumCycles,
+           metrics.active ? 1U : 0U,
+           metrics.decisions, metrics.activations, metrics.totalCycles,
+           metrics.totalBusyUs, (unsigned int)metrics.lastCycles);
+    fflush(stdout);
+}
+
+/** Apply one complete randomized-load configuration from the control pipe. */
+static bool configureThreadLoad(uint32_t minimumCycles,
+                                uint32_t maximumCycles, uint32_t weight) {
+    const UartDmaThreadLoadConfig_t config = {
+        .weightPercent = weight,
+        .minimumCycles = minimumCycles,
+        .maximumCycles = maximumCycles,
+        .systemClockHz = uartReceiver.sourceClockHz,
+    };
+    if (!UartDmaThreadLoad_Configure(&config)) {
+        puts("ERROR  Thread load requires weight 0..100 and min<=max unless max is zero");
+        fflush(stdout);
+        return false;
+    }
+    reportThreadLoad();
+    return true;
+}
+
 /** Reconfigure the simulated LPUART at a packet boundary. */
 static void configureUartTiming(uint32_t sourceClockHz, uint32_t baud) {
     (void)pthread_mutex_lock(&uartTimingMutex);
@@ -150,6 +185,10 @@ static void configureUartTiming(uint32_t sourceClockHz, uint32_t baud) {
     };
     reportUartTiming();
     (void)pthread_mutex_unlock(&uartTimingMutex);
+    UartDmaThreadLoadMetrics_t load;
+    UartDmaThreadLoad_GetMetrics(&load);
+    load.config.systemClockHz = sourceClockHz;
+    (void)UartDmaThreadLoad_Configure(&load.config);
 }
 
 /** Running verification state for the chunked deterministic transfer protocol. */
@@ -433,10 +472,12 @@ static bool writeAllUnlocked(const uint8_t *data, size_t size,
  * @return `true` after the complete span has been written.
  */
 static bool writeAll(const uint8_t *data, size_t size, bool bulkTransfer) {
-    if (ptyTxToken == NULL ||
-        xSemaphoreTake(ptyTxToken, portMAX_DELAY) != pdTRUE) {
+    if (ptyTxToken == NULL) {
         return false;
     }
+    while (!stopRequested &&
+           xSemaphoreTake(ptyTxToken, pdMS_TO_TICKS(10U)) != pdTRUE) {}
+    if (stopRequested) return false;
     const bool written = writeAllUnlocked(data, size, bulkTransfer);
     (void)xSemaphoreGive(ptyTxToken);
     return written;
@@ -496,6 +537,22 @@ static void onHciCommand(uint16_t opcode, uint8_t parameterLength,
         }
         return;
     }
+    uint8_t completionStatus = 0U;
+    if (opcode == BLE_HCI_THREAD_LOAD_OPCODE) {
+        if (parameterLength != sizeof(BleHciThreadLoadCommandParameters_t)) {
+            completionStatus = 0x12U;
+        } else {
+            BleHciThreadLoadCommandParameters_t request;
+            memcpy(&request, parameters, sizeof(request));
+            if (memcmp(request.signature, "LOAD", sizeof(request.signature)) != 0 ||
+                !configureThreadLoad(
+                    BleHciWire_FromLe32(request.minimum_cycles_le),
+                    BleHciWire_FromLe32(request.maximum_cycles_le),
+                    request.weight_percent)) {
+                completionStatus = 0x12U;
+            }
+        }
+    }
     const BleHciCommandCompleteEvent_t event = {
         .header = {
             .indicator = {.value = BLE_HCI_H4_EVENT},
@@ -507,7 +564,7 @@ static void onHciCommand(uint16_t opcode, uint8_t parameterLength,
         .parameters = {
             .command_packets = 1U,
             .opcode_le = BleHciWire_ToLe16(opcode),
-            .status = 0U,
+            .status = completionStatus,
         },
     };
     PacketMessage_t response = UartDma_MessageFrom(&event, sizeof(event));
@@ -548,6 +605,7 @@ static void controlReaderTask(void *parameters) {
                     printf("RX IRQ COUNT -> %u\n",
                            (unsigned int)UartDma_GetRxInterruptCount());
                     reportPipelineStats();
+                    reportThreadLoad();
                 } else if (strcmp(command, "buffers") == 0) {
                     printf("RX BUFFERS -> ring=%u dma=%u\n",
                            (unsigned int)UartDma_GetRxBufferSize(),
@@ -557,6 +615,21 @@ static void controlReaderTask(void *parameters) {
                     (void)pthread_mutex_lock(&uartTimingMutex);
                     reportUartTiming();
                     (void)pthread_mutex_unlock(&uartTimingMutex);
+                } else if (strcmp(command, "load status") == 0) {
+                    reportThreadLoad();
+                } else if (strncmp(command, "load ", 5U) == 0) {
+                    unsigned int minimumCycles = 0U;
+                    unsigned int maximumCycles = 0U;
+                    unsigned int weight = 0U;
+                    char trailing = '\0';
+                    if (sscanf(&command[5], "%u %u %u %c", &minimumCycles,
+                               &maximumCycles, &weight, &trailing) != 3) {
+                        puts("ERROR  Use: load MIN_CYCLES MAX_CYCLES PERCENT");
+                        fflush(stdout);
+                    } else {
+                        (void)configureThreadLoad(minimumCycles, maximumCycles,
+                                                  weight);
+                    }
                 } else if (strncmp(command, "clock ", 6U) == 0 ||
                            strncmp(command, "baud ", 5U) == 0) {
                     const bool changingClock = command[0] == 'c';
@@ -956,7 +1029,8 @@ int main(void) {
     puts("Continuous BLE C UART server is running.");
     printf("In the Python app, type this port manually: %s\n", slaveName);
     puts("Pseudo-UART bytes are passed through the configured KW47 LPUART sampler.");
-    puts("Use 'clock HZ' and 'baud RATE' to change simulated timing. Press Ctrl-C to stop.");
+    puts("Use 'clock HZ', 'baud RATE', and 'load MIN MAX PERCENT' (0% disables).");
+    puts("Press Ctrl-C to stop.");
     vTaskStartScheduler();
 
     PseudoUart_Close(ptyMaster);

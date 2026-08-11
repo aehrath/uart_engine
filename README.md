@@ -375,7 +375,7 @@ after the exact acknowledgement arrives.
 The values shown in a screenshot can reflect saved settings from the previous
 run. Click **Defaults** before following a baseline example; this selects a
 20 MHz clock, 4 Mbaud, 16 KiB ring, 256-byte DMA transaction, 2 MiB block, and
-DMA plus IDLE receive mode.
+DMA plus IDLE receive mode, with randomized thread load disabled.
 
 ### Example 1: connect and verify the correct UART
 
@@ -480,6 +480,9 @@ Client controls:
 - **Clock**, **Ring**, and **DMA** configure the local receive simulation.
 - **Per-byte IRQ** selects byte-interrupt receive accounting instead of the
   default DMA/IDLE accounting.
+- **Busy min**, **Busy max**, and **R%** are the three inline competing-thread
+  controls. A zero maximum disables the workload. Client changes are sent to
+  the verified server as a typed HCI vendor command.
 - **Defaults** restores and saves the baseline settings listed below.
 
 Server controls:
@@ -492,6 +495,14 @@ Server controls:
 
 Text fields support native clipboard shortcuts: Cmd+C, Cmd+X, and Cmd+V on
 macOS; Ctrl+C, Ctrl+X, and Ctrl+V on Windows and Linux.
+If any of the three numeric busy-work fields is left empty, it becomes `0` when
+focus leaves the field. Older saved load formats are migrated to the disabled
+`0 / 0 / 0%` state instead of accidentally enabling background work.
+Within the busy-work group, Tab and Shift+Tab move forward and backward through
+the three fields. Drag upward or downward inside a field to increase or decrease
+it; min/max move in 1,000-cycle steps and R% moves in one-percent steps. Raising
+the minimum above the current maximum raises the maximum to match. You can still
+set maximum to `0` explicitly to disable the workload.
 
 ### HCI command builder
 
@@ -596,6 +607,8 @@ The server reads the following newline-terminated commands from standard input:
 | `dma-buffer BYTES` | Change DMA transaction size from 32 through 4096 bytes. |
 | `tx HEX_BYTES` | Queue one H4 packet represented as hexadecimal bytes. |
 | `test BYTES` | Start a deterministic server-to-client test transfer. |
+| `load status` | Print the current randomized task configuration and measured activity. |
+| `load MIN MAX PERCENT` | Set the minimum and maximum busy cycles and the random-range weight. A zero maximum disables the task. |
 
 Do not resize the ring or DMA transaction while an inbound test transfer is
 active. The engine rejects that reconfiguration because buffer geometry must
@@ -649,6 +662,39 @@ response, prints its CRC result, and exits with a nonzero status on failure.
 | DMA | 32 B, 64 B, 128 B, 256 B, 512 B, 1 KiB, 4 KiB | 256 B |
 | Block | 16 KiB, 64 KiB, 128 KiB, 512 KiB, 1, 2, 4, 8, 16 MiB | 2 MiB |
 | IRQ mode | DMA + IDLE or Per-byte IRQ | DMA + IDLE |
+| Random load | Minimum busy cycles, maximum busy cycles, random weight 0–100% | 0, 0, 0% (disabled) |
+
+### Randomized full-system thread load
+
+The three values are displayed directly in each app's main control panel. There
+is no enable switch, modal, seed, or period setting. **Maximum busy = 0**
+disables the workload. Otherwise a deterministic generator selects a value from
+the minimum-to-maximum span and **R%** controls how much of that random span is
+applied:
+
+```text
+random offset = random(0, maximum - minimum) * R% / 100
+busy cycles   = minimum + random offset
+busy time     = busy cycles / selected system clock
+```
+
+The task runs at `tskIDLE_PRIORITY + 2`: above the application consumer and
+ordinary server helper tasks, but below the UART producer and TX tasks. This
+models unrelated work in a complete embedded system that delays packet
+consumption without unrealistically blocking the critical receive producer.
+Queue pressure, measured latency, headroom, and genuine queue/ring drops are
+therefore allowed to emerge from scheduling.
+
+At `0%`, every burst stays at the minimum. At `100%`, the complete minimum-to-
+maximum range is available. Intermediate percentages progressively widen the
+random range toward the maximum; they are not an activation probability or CPU
+duty-cycle target. Equal nonzero minimum and maximum values create fixed-length
+busy bursts. The selected system clock converts cycles to elapsed time.
+
+For example, `load 50000 250000 35` uses a minimum of 50,000 cycles and allows
+35 percent of the 200,000-cycle random span. `load 0 0 0` disables the task.
+`load status` reports the configured values, burst count, total cycles, measured
+busy microseconds, most recent burst, and current busy state.
 
 ### KW47 LPUART model
 
@@ -754,6 +800,7 @@ independent server profile. Each profile saves:
 - DMA transaction size.
 - Large-transfer block size.
 - Per-byte IRQ mode.
+- Randomized thread-load minimum, maximum, and percentage weight.
 
 The clients also share the last selected port. Typed, dropdown-selected, and
 attempted client port names are saved.
@@ -781,6 +828,7 @@ Ring:        16 KiB
 DMA:         256 B
 Block:       2 MiB
 Receive:     DMA + IDLE
+Thread load: Disabled (minimum 0, maximum 0, R% 0)
 ```
 
 Defaults also resets stale pipeline telemetry so historical percentages from

@@ -46,6 +46,8 @@ void UartDma_PlatformTransmitDma(uint8_t *data, uint16_t size) {
 /* --- System Architecture Constants --- */
 #define MAX_PACKET_SIZE      UART_DMA_MAX_PACKET_SIZE
 #define QUEUE_STORAGE_SIZE   16UL
+#define THREAD_LOAD_PERIOD_MS 10U
+#define THREAD_LOAD_RANDOM_SEED 0x00C0FFEEU
 
 /* --- Cache Line Aligned Variables --- */
 /* Formatted to match 32-byte Cortex-M7 L1 cache footprints to avoid corruption */
@@ -55,6 +57,7 @@ __attribute__((aligned(SCB_D_CACHE_LINE_SIZE))) static uint8_t txActiveBuffer[MA
 static TaskHandle_t       xProducerTaskHandle = NULL;
 static TaskHandle_t       xConsumerTaskHandle = NULL;
 static TaskHandle_t       xTxEngineTaskHandle = NULL;
+static TaskHandle_t       xThreadLoadTaskHandle = NULL;
 
 static QueueHandle_t      xRxPacketQueueHandle = NULL;
 static QueueHandle_t      xTxPacketQueueHandle = NULL;
@@ -62,6 +65,8 @@ static SemaphoreHandle_t  xTxDmaSemaphore      = NULL;
 static volatile UartDmaRxMode_t rxMode = UART_DMA_RX_MODE_DMA_IDLE;
 static volatile uint32_t rxInterruptCount;
 static UartDmaPipelineMetrics_t pipelineMetrics;
+static UartDmaThreadLoadMetrics_t threadLoadMetrics;
+static uint32_t threadLoadRandomState;
 
 #if defined(__GNUC__) || defined(__clang__)
 __attribute__((weak))
@@ -74,6 +79,7 @@ uint64_t UartDma_PlatformTimeUs(void) {
 #define PRIORITY_PRODUCER_TASK  (configMAX_PRIORITIES - 1) /* Critical Hardware Layer */
 #define PRIORITY_TX_ENGINE_TASK (configMAX_PRIORITIES - 2) /* High Priority Outbound Pipeline */
 #define PRIORITY_CONSUMER_TASK  (tskIDLE_PRIORITY + 1)     /* Standard Application Processing */
+#define PRIORITY_THREAD_LOAD_TASK (tskIDLE_PRIORITY + 2)   /* Competing full-system work */
 
 /* --- Task Prototypes --- */
 /** Convert unread circular DMA bytes into validated queue messages. */
@@ -82,11 +88,63 @@ void vProducerTask(void *pvParameters);
 void vConsumerTask(void *pvParameters);
 /** Append CRC trailers and serialize queued DMA transmissions. */
 void vTxEngineTask(void *pvParameters);
+/** Execute randomized busy bursts that preempt application-level work. */
+void vThreadLoadTask(void *pvParameters);
+
+void UartDmaThreadLoad_DefaultConfig(UartDmaThreadLoadConfig_t *config) {
+    if (config == NULL) {
+        return;
+    }
+    *config = (UartDmaThreadLoadConfig_t){
+        .weightPercent = 0U,
+        .minimumCycles = 0U,
+        .maximumCycles = 0U,
+        .systemClockHz = 20000000U,
+    };
+}
+
+bool UartDmaThreadLoad_Configure(const UartDmaThreadLoadConfig_t *config) {
+    if (config == NULL || config->weightPercent > 100U ||
+        (config->maximumCycles != 0U &&
+         config->minimumCycles > config->maximumCycles) ||
+        config->systemClockHz == 0U || config->systemClockHz > 1000000000U) {
+        return false;
+    }
+    taskENTER_CRITICAL();
+    threadLoadMetrics.config = *config;
+    threadLoadRandomState = THREAD_LOAD_RANDOM_SEED;
+    taskEXIT_CRITICAL();
+    return true;
+}
+
+void UartDmaThreadLoad_GetMetrics(UartDmaThreadLoadMetrics_t *metrics) {
+    if (metrics == NULL) {
+        return;
+    }
+    taskENTER_CRITICAL();
+    *metrics = threadLoadMetrics;
+    taskEXIT_CRITICAL();
+}
+
+/** Advance the deterministic xorshift32 generator. */
+static uint32_t nextThreadLoadRandom(void) {
+    uint32_t value = threadLoadRandomState;
+    value ^= value << 13U;
+    value ^= value >> 17U;
+    value ^= value << 5U;
+    threadLoadRandomState = value;
+    return value;
+}
 
 void UartDmaSystem_Init(void) {
     UartDmaRingBuffer_Reset();
     rxInterruptCount = 0U;
     memset(&pipelineMetrics, 0, sizeof(pipelineMetrics));
+    memset(&threadLoadMetrics, 0, sizeof(threadLoadMetrics));
+    UartDmaThreadLoadConfig_t defaultLoad;
+    UartDmaThreadLoad_DefaultConfig(&defaultLoad);
+    threadLoadMetrics.config = defaultLoad;
+    threadLoadRandomState = THREAD_LOAD_RANDOM_SEED;
     pipelineMetrics.queueCapacity = QUEUE_STORAGE_SIZE;
     pipelineMetrics.ringCapacity = UartDma_GetRxBufferSize();
     UartDma_SetRxMode(UART_DMA_RX_MODE_DMA_IDLE);
@@ -108,6 +166,62 @@ void UartDmaSystem_Init(void) {
     xTaskCreate(vProducerTask, "Prod_RX_Task", configMINIMAL_STACK_SIZE + 256, NULL, PRIORITY_PRODUCER_TASK, &xProducerTaskHandle);
     xTaskCreate(vTxEngineTask, "Tx_Eng_Task",  configMINIMAL_STACK_SIZE + 256, NULL, PRIORITY_TX_ENGINE_TASK, &xTxEngineTaskHandle);
     xTaskCreate(vConsumerTask, "Cons_App_Task", configMINIMAL_STACK_SIZE + 512, NULL, PRIORITY_CONSUMER_TASK, &xConsumerTaskHandle);
+    xTaskCreate(vThreadLoadTask, "Random_Load", configMINIMAL_STACK_SIZE + 128,
+                NULL, PRIORITY_THREAD_LOAD_TASK, &xThreadLoadTaskHandle);
+}
+
+/** Randomly consume target-clock time at a priority above the application
+ * consumer, reproducing unrelated real-system thread contention. */
+void vThreadLoadTask(void *pvParameters) {
+    (void)pvParameters;
+    volatile uint32_t busyValue = 0x9E3779B9U;
+    TickType_t lastDecisionTick = xTaskGetTickCount();
+    while (1) {
+        UartDmaThreadLoadConfig_t config;
+        taskENTER_CRITICAL();
+        config = threadLoadMetrics.config;
+        taskEXIT_CRITICAL();
+
+        if (config.maximumCycles == 0U) {
+            vTaskDelay(pdMS_TO_TICKS(50U));
+            lastDecisionTick = xTaskGetTickCount();
+            continue;
+        }
+        (void)xTaskDelayUntil(&lastDecisionTick,
+                              pdMS_TO_TICKS(THREAD_LOAD_PERIOD_MS));
+        taskENTER_CRITICAL();
+        threadLoadMetrics.decisions++;
+        const uint64_t span =
+            (uint64_t)config.maximumCycles - config.minimumCycles;
+        const uint64_t randomOffset = span == 0U ? 0U
+            : (uint64_t)nextThreadLoadRandom() % (span + 1ULL);
+        const uint32_t cycles = config.minimumCycles +
+            (uint32_t)(randomOffset * config.weightPercent / 100U);
+        threadLoadMetrics.active = true;
+        threadLoadMetrics.activations++;
+        threadLoadMetrics.lastCycles = cycles;
+        threadLoadMetrics.totalCycles += cycles;
+        taskEXIT_CRITICAL();
+
+        const uint64_t durationUs =
+            ((uint64_t)cycles * 1000000ULL + config.systemClockHz - 1ULL) /
+            config.systemClockHz;
+        const uint64_t startedUs = UartDma_PlatformTimeUs();
+        while (UartDma_PlatformTimeUs() - startedUs < durationUs) {
+            /* Volatile arithmetic prevents the host compiler from deleting
+             * the deliberately busy interval. Elapsed time, not host loop
+             * iterations, defines the configured target-cycle duration. */
+            busyValue ^= busyValue << 13U;
+            busyValue ^= busyValue >> 17U;
+            busyValue ^= busyValue << 5U;
+        }
+        const uint64_t elapsedUs = UartDma_PlatformTimeUs() - startedUs;
+        taskENTER_CRITICAL();
+        threadLoadMetrics.totalBusyUs += elapsedUs;
+        threadLoadMetrics.active = false;
+        taskEXIT_CRITICAL();
+
+    }
 }
 
 void UartDma_SetRxMode(UartDmaRxMode_t mode) {

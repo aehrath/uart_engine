@@ -18,6 +18,9 @@ class DashboardSettings:
     dma: int = 256
     bulk: int = 2 * 1024 * 1024
     byte_irq: bool = False
+    load_weight: int = 0
+    load_min_cycles: int = 0
+    load_max_cycles: int = 0
 
 
 def preference_path() -> Path:
@@ -68,6 +71,20 @@ def load_settings(scope: str) -> DashboardSettings:
         settings.dma = int(values.get("dma", settings.dma))
         settings.bulk = int(values.get("bulk", settings.bulk))
         settings.byte_irq = int(values.get("byte_irq", "0")) != 0
+        settings.load_weight = int(values.get("load_weight", settings.load_weight))
+        settings.load_min_cycles = int(values.get(
+            "load_min_cycles", settings.load_min_cycles))
+        settings.load_max_cycles = int(values.get(
+            "load_max_cycles", settings.load_max_cycles))
+        if not (values.get("load_model") == "2"
+                and 0 <= settings.load_weight <= 100
+                and (settings.load_max_cycles == 0 or
+                     0 <= settings.load_min_cycles <= settings.load_max_cycles)
+                and settings.load_max_cycles <= 0xFFFFFFFF):
+            defaults = DashboardSettings()
+            settings.load_weight = defaults.load_weight
+            settings.load_min_cycles = defaults.load_min_cycles
+            settings.load_max_cycles = defaults.load_max_cycles
     except (OSError, UnicodeError, ValueError):
         return DashboardSettings()
     return settings
@@ -81,7 +98,10 @@ def save_settings(scope: str, settings: DashboardSettings) -> bool:
         path.write_text(
             f"clock={settings.clock}\nbaud={settings.baud}\n"
             f"ring={settings.ring}\ndma={settings.dma}\n"
-            f"bulk={settings.bulk}\nbyte_irq={int(settings.byte_irq)}\n",
+            f"bulk={settings.bulk}\nbyte_irq={int(settings.byte_irq)}\n"
+            f"load_model=2\nload_weight={settings.load_weight}\n"
+            f"load_min_cycles={settings.load_min_cycles}\n"
+            f"load_max_cycles={settings.load_max_cycles}\n",
             encoding="utf-8")
         return True
     except (OSError, UnicodeError):

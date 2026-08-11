@@ -25,6 +25,36 @@ typedef enum {
     UART_DMA_RX_MODE_BYTE_IRQ = 1
 } UartDmaRxMode_t;
 
+/** Randomized competing-task configuration for full-system load simulation. */
+typedef struct {
+    /** Random-range weight from 0 through 100. */
+    uint32_t weightPercent;
+    /** Minimum simulated target CPU cycles in one busy burst. */
+    uint32_t minimumCycles;
+    /** Maximum simulated target CPU cycles; zero disables competing work. */
+    uint32_t maximumCycles;
+    /** Target CPU clock used to convert cycles into elapsed time. */
+    uint32_t systemClockHz;
+} UartDmaThreadLoadConfig_t;
+
+/** Cumulative measurements from the randomized competing task. */
+typedef struct {
+    /** Most recently accepted configuration. */
+    UartDmaThreadLoadConfig_t config;
+    /** Random scheduling decisions evaluated since initialization. */
+    uint64_t decisions;
+    /** Decisions that produced a busy burst. */
+    uint64_t activations;
+    /** Sum of configured target cycles across all bursts. */
+    uint64_t totalCycles;
+    /** Measured wall time spent executing busy bursts. */
+    uint64_t totalBusyUs;
+    /** Target cycles selected for the most recent burst. */
+    uint32_t lastCycles;
+    /** Whether the competing task is currently inside a busy burst. */
+    bool active;
+} UartDmaThreadLoadMetrics_t;
+
 /** Snapshot of measured work crossing the RX producer/consumer boundary. */
 typedef struct {
     /** CRC-valid bytes successfully enqueued by the producer. */
@@ -80,6 +110,13 @@ uint32_t UartDma_GetRxInterruptCount(void);
 bool UartDma_SetRxBufferSize(uint32_t size);
 /** Copy a current snapshot of measured RX pipeline telemetry. */
 void UartDma_GetPipelineMetrics(UartDmaPipelineMetrics_t *metrics);
+/** Restore the disabled randomized-load configuration. */
+void UartDmaThreadLoad_DefaultConfig(UartDmaThreadLoadConfig_t *config);
+/** Validate and atomically apply randomized competing-task settings.
+ * @return `true` when every field is within the supported range. */
+bool UartDmaThreadLoad_Configure(const UartDmaThreadLoadConfig_t *config);
+/** Copy the current load configuration and cumulative measurements. */
+void UartDmaThreadLoad_GetMetrics(UartDmaThreadLoadMetrics_t *metrics);
 /** Platform-overridable monotonic microsecond clock used by telemetry. */
 uint64_t UartDma_PlatformTimeUs(void);
 /** Store RXNE bytes in IRQ mode and wake the producer on UART IDLE. */

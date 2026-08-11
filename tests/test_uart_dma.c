@@ -164,6 +164,30 @@ static void testUartApiAndInterrupts(void) {
 
     rxDmaRegisters.NDTR = UART_DMA_RX_BUFFER_SIZE;
     UartDmaSystem_Init();
+    UartDmaThreadLoadMetrics_t loadMetrics;
+    UartDmaThreadLoad_GetMetrics(&loadMetrics);
+    assert(loadMetrics.config.weightPercent == 0U);
+    assert(loadMetrics.config.minimumCycles == 0U);
+    assert(loadMetrics.config.maximumCycles == 0U);
+    assert(loadMetrics.config.systemClockHz == 20000000U);
+
+    UartDmaThreadLoadConfig_t loadConfig = loadMetrics.config;
+    loadConfig.weightPercent = 60U;
+    loadConfig.minimumCycles = 25000U;
+    loadConfig.maximumCycles = 75000U;
+    assert(UartDmaThreadLoad_Configure(&loadConfig));
+    UartDmaThreadLoad_GetMetrics(&loadMetrics);
+    assert(loadMetrics.config.weightPercent == 60U);
+    assert(loadMetrics.config.minimumCycles == 25000U);
+    assert(loadMetrics.config.maximumCycles == 75000U);
+    loadConfig.weightPercent = 101U;
+    assert(!UartDmaThreadLoad_Configure(&loadConfig));
+    loadConfig.weightPercent = 50U;
+    loadConfig.minimumCycles = 75001U;
+    assert(!UartDmaThreadLoad_Configure(&loadConfig));
+    loadConfig.minimumCycles = 1U;
+    loadConfig.maximumCycles = 0U;
+    assert(UartDmaThreadLoad_Configure(&loadConfig));
     UartDmaPipelineMetrics_t metrics;
     UartDma_GetPipelineMetrics(&metrics);
     assert(metrics.producedBytes == 0U);

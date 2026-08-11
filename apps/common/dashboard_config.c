@@ -5,6 +5,7 @@
 #include "h4_wire.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 
 const AppDashboardPreset_t APP_DASHBOARD_PRESETS[] = {
     {"HCI Reset",           0x0C03U, {0U},             0U},
@@ -98,4 +99,23 @@ void AppDashboardConfig_PresetToFields(size_t presetIndex,
     (void)snprintf(opcode, opcodeSize, "%04X", preset->opcode);
     AppH4_FormatHex(parameters, parameterSize,
                     preset->parameters, preset->parameterLength);
+}
+
+bool AppDashboardConfig_ParseThreadLoad(
+    const char *minimumText, const char *maximumText, const char *weightText,
+    uint32_t *minimum, uint32_t *maximum, uint32_t *weight) {
+    if (minimumText == NULL || maximumText == NULL || weightText == NULL ||
+        minimum == NULL || maximum == NULL || weight == NULL) return false;
+    char *end = NULL;
+    const unsigned long minValue = strtoul(minimumText, &end, 10);
+    if (end == minimumText || *end != '\0' || minValue > UINT32_MAX) return false;
+    const unsigned long maxValue = strtoul(maximumText, &end, 10);
+    if (end == maximumText || *end != '\0' || maxValue > UINT32_MAX) return false;
+    const unsigned long weightValue = strtoul(weightText, &end, 10);
+    if (end == weightText || *end != '\0' || weightValue > 100UL ||
+        (maxValue != 0UL && minValue > maxValue)) return false;
+    *minimum = (uint32_t)minValue;
+    *maximum = (uint32_t)maxValue;
+    *weight = (uint32_t)weightValue;
+    return true;
 }

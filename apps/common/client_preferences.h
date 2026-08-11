@@ -28,6 +28,11 @@ typedef struct {
     uint32_t bulkBytes;
     /** Whether the local receiver uses one IRQ per byte. */
     bool byteIrq;
+    /** Percentage weight applied to the random min/max range. */
+    uint32_t threadLoadWeightPercent;
+    /** Busy-cycle range; a zero maximum disables the workload. */
+    uint32_t threadLoadMinimumCycles;
+    uint32_t threadLoadMaximumCycles;
 } AppDashboardSettings_t;
 
 /** Populate the documented application defaults. */

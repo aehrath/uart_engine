@@ -25,6 +25,7 @@
 #include <string.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PROCESS_BUFFER_SIZE 2048U
@@ -47,6 +48,10 @@ typedef struct {
     bool running;
     /** Whether termination has already been requested. */
     bool stopping;
+    /** Monotonic UI time after which a stuck child is force-stopped. */
+    double stopDeadline;
+    /** Whether SIGKILL has already been sent for a timed-out shutdown. */
+    bool forceStopSent;
     /** Incomplete trailing output line. */
     char partialLine[PROCESS_BUFFER_SIZE];
     /** Valid bytes in `partialLine`. */
@@ -117,6 +122,15 @@ typedef struct {
     uint32_t crcDrops;
     uint32_t queueDrops;
     uint32_t ringDrops;
+    /** Configured and measured randomized competing-task load. */
+    bool threadLoadActive;
+    uint32_t threadLoadWeight;
+    uint32_t threadLoadMinimumCycles;
+    uint32_t threadLoadMaximumCycles;
+    uint64_t threadLoadDecisions;
+    uint64_t threadLoadActivations;
+    uint64_t threadLoadBusyUs;
+    uint32_t threadLoadLastCycles;
     /** Ten-hertz polls accumulated into each half-second graph sample. */
     uint32_t pipelinePollCount;
     uint64_t producerBpsSum;
@@ -203,6 +217,15 @@ static void handleServerLine(ServerLog_t *log, ServerState_t *state,
     uint64_t latencyUs = 0U;
     uint64_t latencyMaxUs = 0U;
     uint64_t headroomUs = UINT64_MAX;
+    unsigned int loadActive = 0U;
+    unsigned int loadWeight = 0U;
+    unsigned int loadMinimum = 0U;
+    unsigned int loadMaximum = 0U;
+    unsigned int loadLastCycles = 0U;
+    uint64_t loadDecisions = 0U;
+    uint64_t loadActivations = 0U;
+    uint64_t loadTotalCycles = 0U;
+    uint64_t loadBusyUs = 0U;
     if (sscanf(line, "RX IRQ COUNT -> %u", &parsed) == 1) {
         state->rxInterruptCount = parsed;
         return;
@@ -263,6 +286,26 @@ static void handleServerLine(ServerLog_t *log, ServerState_t *state,
                       &state->systemClockHz, &state->requestedBaud, &state->osr,
                       &state->sbr, &state->actualBaud) == 5) {
         appendLog(log, line);
+        return;
+    } else if (sscanf(line,
+                      "THREAD LOAD -> weight=%u min_cycles=%u"
+                      " max_cycles=%u active=%u"
+                      " decisions=%" SCNu64 " activations=%" SCNu64
+                      " total_cycles=%" SCNu64 " busy_us=%" SCNu64
+                      " last_cycles=%u",
+                      &loadWeight, &loadMinimum, &loadMaximum, &loadActive,
+                      &loadDecisions,
+                      &loadActivations, &loadTotalCycles, &loadBusyUs,
+                      &loadLastCycles) == 9) {
+        state->threadLoadActive = loadActive != 0U;
+        state->threadLoadWeight = loadWeight;
+        state->threadLoadMinimumCycles = loadMinimum;
+        state->threadLoadMaximumCycles = loadMaximum;
+        state->threadLoadDecisions = loadDecisions;
+        state->threadLoadActivations = loadActivations;
+        state->threadLoadBusyUs = loadBusyUs;
+        state->threadLoadLastCycles = loadLastCycles;
+        (void)loadTotalCycles;
         return;
     } else if (sscanf(line,
                       "RX IRQ PROGRESS -> absolute=%u transmission=%u",
@@ -382,6 +425,8 @@ static bool startServer(ServerProcess_t *process, ServerLog_t *log,
     process->inputDescriptor = inputPipe[1];
     process->running = true;
     process->stopping = false;
+    process->stopDeadline = 0.0;
+    process->forceStopSent = false;
     process->partialLength = 0U;
     state->port[0] = '\0';
     state->receivedCommands = 0U;
@@ -410,6 +455,11 @@ static bool startServer(ServerProcess_t *process, ServerLog_t *log,
     state->crcDrops = 0U;
     state->queueDrops = 0U;
     state->ringDrops = 0U;
+    state->threadLoadActive = false;
+    state->threadLoadDecisions = 0U;
+    state->threadLoadActivations = 0U;
+    state->threadLoadBusyUs = 0U;
+    state->threadLoadLastCycles = 0U;
     state->pipelinePollCount = 0U;
     state->producerBpsSum = 0U;
     state->consumerBpsSum = 0U;
@@ -430,6 +480,7 @@ static bool startServer(ServerProcess_t *process, ServerLog_t *log,
 static void requestServerStop(ServerProcess_t *process, ServerLog_t *log) {
     if (process->running && !process->stopping) {
         process->stopping = true;
+        process->stopDeadline = GetTime() + 2.0;
         (void)kill(process->processId, SIGTERM);
         appendLog(log, "Stopping BLE server engine...");
     }
@@ -465,10 +516,37 @@ static void pollServer(ServerProcess_t *process, ServerLog_t *log,
         close(process->inputDescriptor);
         process->running = false;
         process->stopping = false;
+        process->forceStopSent = false;
         state->exitStatus = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
         appendLog(log, state->exitStatus == 0
             ? "BLE server stopped cleanly"
             : "ERROR  BLE server engine exited unexpectedly");
+    } else if (result == 0 && process->stopping && !process->forceStopSent &&
+               GetTime() >= process->stopDeadline) {
+        process->forceStopSent = true;
+        (void)kill(process->processId, SIGKILL);
+        appendLog(log, "WARNING  Server shutdown timed out; forcing exit");
+    }
+}
+
+/** Stop, drain, and reap the child without ever indefinitely blocking the UI. */
+static void shutdownServer(ServerProcess_t *process, ServerLog_t *log,
+                           ServerState_t *state) {
+    requestServerStop(process, log);
+    for (unsigned int attempt = 0U; process->running && attempt < 300U;
+         attempt++) {
+        pollServer(process, log, state);
+        if (process->running) {
+            const struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000L};
+            (void)nanosleep(&pause, NULL);
+        }
+    }
+    if (process->running) {
+        (void)kill(process->processId, SIGKILL);
+        while (waitpid(process->processId, NULL, 0) < 0 && errno == EINTR) {}
+        close(process->outputDescriptor);
+        close(process->inputDescriptor);
+        process->running = false;
     }
 }
 
@@ -696,6 +774,21 @@ static void drawPipelineVisualization(const ServerState_t *state,
             ? (Color){255, 196, 92, 255} : COLOR_MUTED;
     AppDashboardUi_DrawText(footer, (int)bounds.x + 12,
                             (int)bounds.y + 114, 10, footerColor);
+    char loadFooter[128];
+    if (state->threadLoadMaximumCycles != 0U) {
+        (void)snprintf(loadFooter, sizeof(loadFooter),
+                       "LOAD %u%%  randomized %u..%u cycles  bursts=%" PRIu64 "%s",
+                       (unsigned int)state->threadLoadWeight,
+                       (unsigned int)state->threadLoadMinimumCycles,
+                       (unsigned int)state->threadLoadMaximumCycles,
+                       state->threadLoadActivations,
+                       state->threadLoadActive ? "  BUSY" : "");
+    } else {
+        (void)snprintf(loadFooter, sizeof(loadFooter), "LOAD OFF");
+    }
+    AppDashboardUi_DrawText(loadFooter, (int)bounds.x + 12,
+                            (int)bounds.y + 128, 9,
+                            state->threadLoadActive ? COLOR_CYAN : COLOR_MUTED);
 }
 
 /** Run the graphical server dashboard and child-process supervisor. */
@@ -710,7 +803,9 @@ int main(void) {
     AppDashboardUi_Init(UART_DMA_UI_FONT_FILE,
                         UART_DMA_UI_DISPLAY_FONT_FILE);
 
-    ServerProcess_t process = {0, -1, -1, false, false, {0}, 0U};
+    ServerProcess_t process = {
+        .processId = 0, .outputDescriptor = -1, .inputDescriptor = -1,
+    };
     ServerState_t state = {0};
     ServerLog_t log;
     AppDashboardLog_Init(&log);
@@ -753,7 +848,25 @@ int main(void) {
         .dmaBytes = (uint32_t)APP_DASHBOARD_DMA_SIZES[dmaSizeIndex].size,
         .bulkBytes = (uint32_t)APP_DASHBOARD_BULK_SIZES[bulkSizeIndex].size,
         .byteIrq = savedSettings.byteIrq,
+        .threadLoadWeightPercent = savedSettings.threadLoadWeightPercent,
+        .threadLoadMinimumCycles = savedSettings.threadLoadMinimumCycles,
+        .threadLoadMaximumCycles = savedSettings.threadLoadMaximumCycles,
     };
+    char loadMinimumText[16];
+    char loadMaximumText[16];
+    char loadWeightText[4];
+    (void)snprintf(loadMinimumText, sizeof(loadMinimumText), "%u",
+                   savedSettings.threadLoadMinimumCycles);
+    (void)snprintf(loadMaximumText, sizeof(loadMaximumText), "%u",
+                   savedSettings.threadLoadMaximumCycles);
+    (void)snprintf(loadWeightText, sizeof(loadWeightText), "%u",
+                   savedSettings.threadLoadWeightPercent);
+    bool loadMinimumEdit = false;
+    bool loadMaximumEdit = false;
+    bool loadWeightEdit = false;
+    AppDashboardNumberDrag_t loadMinimumDrag = {0};
+    AppDashboardNumberDrag_t loadMaximumDrag = {0};
+    AppDashboardNumberDrag_t loadWeightDrag = {0};
     state.byteIrqMode = savedSettings.byteIrq;
     unsigned int statsFrame = 0U;
     AppDashboardConfig_PresetToFields(0, opcodeText, sizeof(opcodeText),
@@ -771,7 +884,15 @@ int main(void) {
             opcodeEdit = false;
             parametersEdit = false;
             rawEdit = false;
+            loadMinimumEdit = false;
+            loadMaximumEdit = false;
+            loadWeightEdit = false;
         }
+        bool *editableFields[] = {
+            &loadMinimumEdit, &loadMaximumEdit, &loadWeightEdit,
+            &opcodeEdit, &parametersEdit, &rawEdit,
+        };
+        AppDashboardUi_TabFocus(editableFields, 6U);
 
         BeginDrawing();
         ClearBackground(COLOR_CANVAS);
@@ -831,7 +952,7 @@ int main(void) {
                 requestServerStop(&process, &log);
             } else {
                 if (startServer(&process, &log, &state)) {
-                    char command[48];
+                    char command[128];
                     (void)snprintf(command, sizeof(command), "ring %u\n",
                                    (unsigned int)APP_DASHBOARD_RING_SIZES[ringSizeIndex].size);
                     (void)sendServerCommand(&process, command);
@@ -844,18 +965,45 @@ int main(void) {
                     (void)snprintf(command, sizeof(command), "baud %u\n",
                                    (unsigned int)APP_DASHBOARD_BAUD_RATES[baudIndex].size);
                     (void)sendServerCommand(&process, command);
+                    (void)snprintf(command, sizeof(command),
+                                   "load %u %u %u\n",
+                                   savedSettings.threadLoadMinimumCycles,
+                                   savedSettings.threadLoadMaximumCycles,
+                                   savedSettings.threadLoadWeightPercent);
+                    (void)sendServerCommand(&process, command);
                     state.byteIrqMode = savedSettings.byteIrq;
                     (void)sendServerMode(&process, state.byteIrqMode);
                 }
             }
         }
         GuiLabel((Rectangle){44, 289, 122, 38}, "Pseudo-UART");
-        AppDashboardUi_StatusField((Rectangle){170, 289, 570, 38},
+        AppDashboardUi_StatusField((Rectangle){170, 289, 220, 38},
                         state.port[0] != '\0'
-                            ? state.port : "Start the server to create a port");
+                            ? state.port : "Start server to create port");
+        AppDashboardUi_DrawText("Busy", 398, 300, 11, COLOR_MUTED);
+        AppDashboardUi_NumberField((Rectangle){438, 289, 110, 38}, loadMinimumText,
+                                   sizeof(loadMinimumText), &loadMinimumEdit,
+                                   &loadMinimumDrag, 1000U, UINT32_MAX);
+        AppDashboardUi_DrawText("..", 554, 300, 12, COLOR_MUTED);
+        AppDashboardUi_NumberField((Rectangle){570, 289, 110, 38}, loadMaximumText,
+                                   sizeof(loadMaximumText), &loadMaximumEdit,
+                                   &loadMaximumDrag, 1000U, UINT32_MAX);
+        AppDashboardUi_DrawText("R%", 686, 300, 11, COLOR_MUTED);
+        AppDashboardUi_NumberField((Rectangle){712, 289, 54, 38}, loadWeightText,
+                                   sizeof(loadWeightText), &loadWeightEdit,
+                                   &loadWeightDrag, 1U, 100U);
+        if (!loadMinimumEdit && loadMinimumText[0] == '\0') {
+            (void)snprintf(loadMinimumText, sizeof(loadMinimumText), "0");
+        }
+        if (!loadMaximumEdit && loadMaximumText[0] == '\0') {
+            (void)snprintf(loadMaximumText, sizeof(loadMaximumText), "0");
+        }
+        if (!loadWeightEdit && loadWeightText[0] == '\0') {
+            (void)snprintf(loadWeightText, sizeof(loadWeightText), "0");
+        }
         const bool restoreDefaults = AppDashboardUi_Button(
-            (Rectangle){758, 289, 100, 38}, "Defaults", true);
-        if (AppDashboardUi_Button((Rectangle){866, 289, 100, 38}, "Copy port",
+            (Rectangle){778, 289, 86, 38}, "Defaults", true);
+        if (AppDashboardUi_Button((Rectangle){874, 289, 86, 38}, "Copy port",
                          state.port[0] != '\0')) {
             if (state.port[0] != '\0') {
                 SetClipboardText(state.port);
@@ -864,7 +1012,7 @@ int main(void) {
         }
         const bool previousMode = state.byteIrqMode;
         const bool modeChanged = AppDashboardUi_Toggle(
-            (Rectangle){974, 296, 102, 24}, "Byte IRQ",
+            (Rectangle){970, 296, 106, 24}, "Byte IRQ",
             &state.byteIrqMode, process.running);
         if (modeChanged && !sendServerMode(&process, state.byteIrqMode)) {
             state.byteIrqMode = previousMode;
@@ -1022,6 +1170,47 @@ int main(void) {
                            (unsigned int)APP_DASHBOARD_BAUD_RATES[baudIndex].size);
             (void)sendServerCommand(&process, command);
         }
+        uint32_t loadMinimum = 0U;
+        uint32_t loadMaximum = 0U;
+        uint32_t loadWeight = 0U;
+        char *minimumEnd = NULL;
+        char *maximumEnd = NULL;
+        const unsigned long minimumCandidate = strtoul(
+            loadMinimumText, &minimumEnd, 10);
+        const unsigned long maximumCandidate = strtoul(
+            loadMaximumText, &maximumEnd, 10);
+        if (!loadMinimumEdit && minimumEnd != loadMinimumText &&
+            *minimumEnd == '\0' && minimumCandidate <= UINT32_MAX &&
+            maximumEnd != loadMaximumText && *maximumEnd == '\0' &&
+            maximumCandidate <= UINT32_MAX &&
+            minimumCandidate != savedSettings.threadLoadMinimumCycles &&
+            minimumCandidate > maximumCandidate) {
+            (void)snprintf(loadMaximumText, sizeof(loadMaximumText), "%u",
+                           (uint32_t)minimumCandidate);
+        }
+        const bool validLoad = AppDashboardConfig_ParseThreadLoad(
+            loadMinimumText, loadMaximumText, loadWeightText,
+            &loadMinimum, &loadMaximum, &loadWeight);
+        const bool threadLoadChanged = validLoad && !loadMinimumEdit &&
+            !loadMaximumEdit && !loadWeightEdit && !loadMinimumDrag.active &&
+            !loadMaximumDrag.active && !loadWeightDrag.active &&
+            (loadMinimum != savedSettings.threadLoadMinimumCycles ||
+             loadMaximum != savedSettings.threadLoadMaximumCycles ||
+             loadWeight != savedSettings.threadLoadWeightPercent);
+        if (threadLoadChanged) {
+            savedSettings.threadLoadMinimumCycles = loadMinimum;
+            savedSettings.threadLoadMaximumCycles = loadMaximum;
+            savedSettings.threadLoadWeightPercent = loadWeight;
+            if (process.running) {
+                char command[96];
+                (void)snprintf(command, sizeof(command), "load %u %u %u\n",
+                               loadMinimum, loadMaximum, loadWeight);
+                (void)sendServerCommand(&process, command);
+            }
+            appendLog(&log, loadMaximum == 0U
+                ? "SETTINGS  Randomized thread work disabled"
+                : "SETTINGS  Randomized thread work updated");
+        }
         if (restoreDefaults) {
             AppClientPreferences_DefaultSettings(&savedSettings);
             bulkSizeIndex = 5;
@@ -1030,17 +1219,26 @@ int main(void) {
             clockIndex = 4;
             baudIndex = 4;
             state.byteIrqMode = false;
+            state.threadLoadWeight = 0U;
             if (process.running) {
                 (void)sendServerCommand(&process, "ring 16384\n");
                 (void)sendServerCommand(&process, "dma-buffer 256\n");
                 (void)sendServerCommand(&process, "clock 20000000\n");
                 (void)sendServerCommand(&process, "baud 4000000\n");
                 (void)sendServerMode(&process, false);
+                (void)sendServerCommand(&process, "load 0 0 0\n");
             }
+            (void)snprintf(loadMinimumText, sizeof(loadMinimumText), "%u",
+                           savedSettings.threadLoadMinimumCycles);
+            (void)snprintf(loadMaximumText, sizeof(loadMaximumText), "%u",
+                           savedSettings.threadLoadMaximumCycles);
+            (void)snprintf(loadWeightText, sizeof(loadWeightText), "%u",
+                           savedSettings.threadLoadWeightPercent);
             appendLog(&log, "SETTINGS  Restored application defaults");
         }
         if (restoreDefaults || bulkSizeChanged || ringSizeChanged ||
-            dmaSizeChanged || clockChanged || baudChanged || modeChanged) {
+            dmaSizeChanged || clockChanged || baudChanged || modeChanged ||
+            threadLoadChanged) {
             savedSettings = (AppDashboardSettings_t){
                 .systemClockHz = (uint32_t)APP_DASHBOARD_SYSTEM_CLOCKS[clockIndex].size,
                 .baud = (uint32_t)APP_DASHBOARD_BAUD_RATES[baudIndex].size,
@@ -1048,6 +1246,9 @@ int main(void) {
                 .dmaBytes = (uint32_t)APP_DASHBOARD_DMA_SIZES[dmaSizeIndex].size,
                 .bulkBytes = (uint32_t)APP_DASHBOARD_BULK_SIZES[bulkSizeIndex].size,
                 .byteIrq = state.byteIrqMode,
+                .threadLoadWeightPercent = savedSettings.threadLoadWeightPercent,
+                .threadLoadMinimumCycles = savedSettings.threadLoadMinimumCycles,
+                .threadLoadMaximumCycles = savedSettings.threadLoadMaximumCycles,
             };
             (void)AppClientPreferences_SaveSettings(
                 APP_PREFERENCES_SERVER, &savedSettings);
@@ -1057,12 +1258,7 @@ int main(void) {
     (void)AppClientPreferences_SaveSettings(
         APP_PREFERENCES_SERVER, &savedSettings);
 
-    if (process.running) {
-        requestServerStop(&process, &log);
-        (void)waitpid(process.processId, NULL, 0);
-        close(process.outputDescriptor);
-        close(process.inputDescriptor);
-    }
+    if (process.running) shutdownServer(&process, &log, &state);
     AppDashboardUi_Shutdown();
     CloseWindow();
     return 0;

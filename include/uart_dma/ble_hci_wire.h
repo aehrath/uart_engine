@@ -19,6 +19,8 @@
 
 /** Vendor command used to set or query the UART receive mode. */
 #define BLE_HCI_RX_MODE_OPCODE       0xFC01U
+/** Vendor command configuring randomized competing-task load. */
+#define BLE_HCI_THREAD_LOAD_OPCODE   0xFC02U
 /** Vendor event code carrying synchronized application state. */
 #define BLE_HCI_VENDOR_EVENT_CODE    0xFFU
 /** DMA circular receive mode value used on the control wire. */
@@ -245,6 +247,18 @@ typedef struct BLE_HCI_WIRE_PACKED {
     uint8_t mode;
 } BleHciRxModeCommandParameters_t;
 
+/** Parameters carried by the randomized competing-task command. */
+typedef struct BLE_HCI_WIRE_PACKED {
+    /** ASCII `LOAD` discriminator. */
+    char signature[4];
+    /** Random-range weight from 0 through 100. */
+    uint8_t weight_percent;
+    /** Inclusive minimum target CPU cycles in little-endian order. */
+    uint32_t minimum_cycles_le;
+    /** Inclusive maximum cycles; zero disables competing work. */
+    uint32_t maximum_cycles_le;
+} BleHciThreadLoadCommandParameters_t;
+
 /** Parameters carried by a synchronized RX-mode vendor event. */
 typedef struct BLE_HCI_WIRE_PACKED {
     /** ASCII `RXMD` discriminator. */
@@ -286,6 +300,8 @@ _Static_assert(sizeof(BleHciTestCompleteParameters_t) == 11U,
                "Test Complete parameters layout changed");
 _Static_assert(sizeof(BleHciRxModeCommandParameters_t) == 1U,
                "RX mode command parameters layout changed");
+_Static_assert(sizeof(BleHciThreadLoadCommandParameters_t) == 13U,
+               "Thread-load command parameters layout changed");
 _Static_assert(sizeof(BleHciRxModeEventParameters_t) == 5U,
                "RX mode event parameters layout changed");
 _Static_assert(sizeof(BleHciAclHeader_t) == 5U, "H4 ACL header layout changed");

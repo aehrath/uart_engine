@@ -51,7 +51,7 @@ The selected UART port is restored on the next launch. The Python and C clients
 use the same `client-port.txt` location in the platform user configuration
 directory, and save typed, dropdown-selected, and attempted port names.
 They also share `client-settings.txt`, which restores clock, baud, ring, DMA,
-large-block size, and per-byte IRQ mode. The **Defaults** button applies and
+large-block size, per-byte IRQ mode, and randomized thread load. The **Defaults** button applies and
 saves the common 20 MHz, 4 Mbaud, 16 KiB ring, 256 B DMA, 2 MiB block, and
 DMA + IDLE defaults. The C server keeps its equivalent controls independently
 in `server-settings.txt`.
@@ -62,6 +62,16 @@ Byte mode counts one receiver IRQ per received wire byte. DMA mode counts
 `ceil(frame bytes / DMA size)` transaction completions. The adjacent **Ring**
 and **DMA** selectors set the IDLE-delimited frame capacity and maximum DMA
 transaction size, respectively.
+The matching inline **Busy min**, **Busy max**, and **R%** fields configure the
+competing task. Maximum zero disables it; otherwise R% weights the random offset
+from minimum toward maximum. After server identity verification, the Python
+client sends these three values in a typed vendor HCI command. Defaults set all
+three values to zero. Empty numeric fields also become zero when they lose
+focus, and legacy saved load formats migrate to the disabled all-zero state.
+Tab and Shift+Tab move through these and the other editable fields, while dragging vertically changes
+their values (1,000 cycles per step for min/max and one percent for R%). Raising
+minimum past maximum automatically brings maximum up to the same value; maximum
+can still be set back to zero to disable the workload.
 The ring menu includes 32 B, 64 B, 128 B, and 256 B alongside its larger sizes,
 matching the small DMA choices.
 The background reader continuously drains configured DMA-sized transactions;

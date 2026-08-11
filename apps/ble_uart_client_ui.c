@@ -166,6 +166,28 @@ static bool sendCommand(AppSerialPort_t *port, TrafficLog_t *log,
     return sendFramed(port, log, &command, commandLength);
 }
 
+/** Configure the connected server's simulated full-system thread load. */
+static bool sendThreadLoadConfig(AppSerialPort_t *port, TrafficLog_t *log,
+                                 const AppDashboardSettings_t *settings) {
+    const BleHciThreadLoadCommandParameters_t parameters = {
+        .signature = {'L', 'O', 'A', 'D'},
+        .weight_percent = (uint8_t)settings->threadLoadWeightPercent,
+        .minimum_cycles_le = BleHciWire_ToLe32(
+            settings->threadLoadMinimumCycles),
+        .maximum_cycles_le = BleHciWire_ToLe32(
+            settings->threadLoadMaximumCycles),
+    };
+    if (!sendCommand(port, log, BLE_HCI_THREAD_LOAD_OPCODE,
+                     (const uint8_t *)&parameters, sizeof(parameters))) {
+        return false;
+    }
+    appendLog(log, "LOAD  Server busy weight %u%%, randomized %u..%u cycles",
+              settings->threadLoadWeightPercent,
+              settings->threadLoadMinimumCycles,
+              settings->threadLoadMaximumCycles);
+    return true;
+}
+
 /** Send the single deterministic transfer used to identify the server UART. */
 static bool sendConnectionProbe(AppSerialPort_t *port, TrafficLog_t *log,
                                 ConnectionHandshake_t *handshake) {
@@ -490,6 +512,7 @@ int main(void) {
     bool dmaSizeDropdown = false;
     bool clockDropdown = false;
     bool baudDropdown = false;
+    bool threadLoadApplied = false;
     int presetIndex = 0;
     int previousPreset = 0;
     AppDashboardSettings_t savedSettings;
@@ -517,7 +540,25 @@ int main(void) {
         .dmaBytes = (uint32_t)APP_DASHBOARD_DMA_SIZES[dmaSizeIndex].size,
         .bulkBytes = (uint32_t)APP_DASHBOARD_BULK_SIZES[bulkSizeIndex].size,
         .byteIrq = savedSettings.byteIrq,
+        .threadLoadWeightPercent = savedSettings.threadLoadWeightPercent,
+        .threadLoadMinimumCycles = savedSettings.threadLoadMinimumCycles,
+        .threadLoadMaximumCycles = savedSettings.threadLoadMaximumCycles,
     };
+    char loadMinimumText[16];
+    char loadMaximumText[16];
+    char loadWeightText[4];
+    (void)snprintf(loadMinimumText, sizeof(loadMinimumText), "%u",
+                   savedSettings.threadLoadMinimumCycles);
+    (void)snprintf(loadMaximumText, sizeof(loadMaximumText), "%u",
+                   savedSettings.threadLoadMaximumCycles);
+    (void)snprintf(loadWeightText, sizeof(loadWeightText), "%u",
+                   savedSettings.threadLoadWeightPercent);
+    bool loadMinimumEdit = false;
+    bool loadMaximumEdit = false;
+    bool loadWeightEdit = false;
+    AppDashboardNumberDrag_t loadMinimumDrag = {0};
+    AppDashboardNumberDrag_t loadMaximumDrag = {0};
+    AppDashboardNumberDrag_t loadWeightDrag = {0};
     log.byteIrqMode = savedSettings.byteIrq;
     log.receiveByteIrqActive = savedSettings.byteIrq;
     pipeline.queueCapacity = 16U;
@@ -564,6 +605,7 @@ int main(void) {
                 (void)snprintf(statusText, sizeof(statusText), "Disconnected after read error");
                 handshake.pending = false;
                 handshake.verified = false;
+                threadLoadApplied = false;
             }
         }
         if (serial.connected && handshake.failed) {
@@ -578,6 +620,7 @@ int main(void) {
             AppSerialPort_Close(&serial);
             handshake.pending = false;
             handshake.verified = false;
+            threadLoadApplied = false;
             (void)snprintf(statusText, sizeof(statusText),
                            "Wrong UART: BLE UART server did not acknowledge probe");
             appendLog(&log, "ERROR  Selected UART is not a BLE UART server (timeout)");
@@ -586,6 +629,10 @@ int main(void) {
             handshake.readyAnnounced = true;
             (void)snprintf(statusText, sizeof(statusText), "Connected to %s", portText);
             appendLog(&log, "Connected to %s; server identity verified", portText);
+        }
+        if (serial.connected && handshake.verified && !threadLoadApplied) {
+            threadLoadApplied = sendThreadLoadConfig(&serial, &log,
+                                                     &savedSettings);
         }
         pumpTestTransfer(&testSender, &serial, &log,
                          (uint32_t)APP_DASHBOARD_BAUD_RATES[baudIndex].size);
@@ -626,7 +673,15 @@ int main(void) {
             opcodeEdit = false;
             parametersEdit = false;
             rawEdit = false;
+            loadMinimumEdit = false;
+            loadMaximumEdit = false;
+            loadWeightEdit = false;
         }
+        bool *editableFields[] = {
+            &portEdit, &loadMinimumEdit, &loadMaximumEdit, &loadWeightEdit,
+            &opcodeEdit, &parametersEdit, &rawEdit,
+        };
+        AppDashboardUi_TabFocus(editableFields, 7U);
 
         BeginDrawing();
         ClearBackground(COLOR_CANVAS);
@@ -666,9 +721,30 @@ int main(void) {
 
         AppDashboardUi_DrawPanel((Rectangle){24, 204, 1072, 136}, "CONNECTION");
         GuiLabel((Rectangle){44, 247, 50, 38}, "Port");
-        AppDashboardUi_TextBox((Rectangle){96, 247, 426, 38}, portText,
+        AppDashboardUi_TextBox((Rectangle){96, 247, 310, 38}, portText,
                              sizeof(portText), &portEdit);
-        if (AppDashboardUi_Button((Rectangle){756, 247, 170, 38},
+        AppDashboardUi_DrawText("Busy", 414, 258, 11, COLOR_MUTED);
+        AppDashboardUi_NumberField((Rectangle){452, 247, 110, 38}, loadMinimumText,
+                                   sizeof(loadMinimumText), &loadMinimumEdit,
+                                   &loadMinimumDrag, 1000U, UINT32_MAX);
+        AppDashboardUi_DrawText("..", 568, 258, 12, COLOR_MUTED);
+        AppDashboardUi_NumberField((Rectangle){584, 247, 110, 38}, loadMaximumText,
+                                   sizeof(loadMaximumText), &loadMaximumEdit,
+                                   &loadMaximumDrag, 1000U, UINT32_MAX);
+        AppDashboardUi_DrawText("R%", 700, 258, 11, COLOR_MUTED);
+        AppDashboardUi_NumberField((Rectangle){726, 247, 54, 38}, loadWeightText,
+                                   sizeof(loadWeightText), &loadWeightEdit,
+                                   &loadWeightDrag, 1U, 100U);
+        if (!loadMinimumEdit && loadMinimumText[0] == '\0') {
+            (void)snprintf(loadMinimumText, sizeof(loadMinimumText), "0");
+        }
+        if (!loadMaximumEdit && loadMaximumText[0] == '\0') {
+            (void)snprintf(loadMaximumText, sizeof(loadMaximumText), "0");
+        }
+        if (!loadWeightEdit && loadWeightText[0] == '\0') {
+            (void)snprintf(loadWeightText, sizeof(loadWeightText), "0");
+        }
+        if (AppDashboardUi_Button((Rectangle){796, 247, 144, 38},
                          serial.connected ? "Disconnect" : "Connect", true)) {
             if (serial.connected) {
                 AppSerialPort_Close(&serial);
@@ -700,6 +776,7 @@ int main(void) {
                         (void)snprintf(statusText, sizeof(statusText),
                                        "Could not send BLE UART verification probe");
                     }
+                    threadLoadApplied = false;
                 } else {
                     (void)snprintf(statusText, sizeof(statusText), "%s", error);
                     appendLog(&log, "ERROR  %s", error);
@@ -717,7 +794,7 @@ int main(void) {
         const bool sendControlsReady = connectionReady && !testSender.active &&
             !log.testIrqActive;
         const bool rxModeChanged = AppDashboardUi_Toggle(
-            (Rectangle){958, 254, 118, 24}, "Per-byte IRQ",
+            (Rectangle){952, 254, 124, 24}, "Per-byte IRQ",
             &log.byteIrqMode, connectionReady);
         if (rxModeChanged) {
             log.receiveByteIrqActive = log.byteIrqMode;
@@ -826,6 +903,40 @@ int main(void) {
             (Rectangle){430, 292, 104, 34}, AppDashboardUi_Font(),
             APP_DASHBOARD_BAUD_RATE_OPTIONS, APP_DASHBOARD_BAUD_RATE_COUNT,
             &baudIndex, &baudDropdown);
+        uint32_t loadMinimum = 0U;
+        uint32_t loadMaximum = 0U;
+        uint32_t loadWeight = 0U;
+        char *minimumEnd = NULL;
+        char *maximumEnd = NULL;
+        const unsigned long minimumCandidate = strtoul(
+            loadMinimumText, &minimumEnd, 10);
+        const unsigned long maximumCandidate = strtoul(
+            loadMaximumText, &maximumEnd, 10);
+        if (!loadMinimumEdit && minimumEnd != loadMinimumText &&
+            *minimumEnd == '\0' && minimumCandidate <= UINT32_MAX &&
+            maximumEnd != loadMaximumText && *maximumEnd == '\0' &&
+            maximumCandidate <= UINT32_MAX &&
+            minimumCandidate != savedSettings.threadLoadMinimumCycles &&
+            minimumCandidate > maximumCandidate) {
+            (void)snprintf(loadMaximumText, sizeof(loadMaximumText), "%u",
+                           (uint32_t)minimumCandidate);
+        }
+        const bool validLoad = AppDashboardConfig_ParseThreadLoad(
+            loadMinimumText, loadMaximumText, loadWeightText,
+            &loadMinimum, &loadMaximum, &loadWeight);
+        const bool threadLoadChanged = validLoad && !loadMinimumEdit &&
+            !loadMaximumEdit && !loadWeightEdit && !loadMinimumDrag.active &&
+            !loadMaximumDrag.active && !loadWeightDrag.active &&
+            (loadMinimum != savedSettings.threadLoadMinimumCycles ||
+             loadMaximum != savedSettings.threadLoadMaximumCycles ||
+             loadWeight != savedSettings.threadLoadWeightPercent);
+        if (threadLoadChanged) {
+            savedSettings.threadLoadMinimumCycles = loadMinimum;
+            savedSettings.threadLoadMaximumCycles = loadMaximum;
+            savedSettings.threadLoadWeightPercent = loadWeight;
+            threadLoadApplied = !connectionReady || sendThreadLoadConfig(
+                &serial, &log, &savedSettings);
+        }
         if (clockChanged || baudChanged) {
             (void)AppLpuartSim_Configure(
                 &receiverSimulator,
@@ -869,9 +980,18 @@ int main(void) {
                 &receiverSimulator, savedSettings.systemClockHz,
                 savedSettings.baud);
             appendLog(&log, "SETTINGS  Restored application defaults");
+            (void)snprintf(loadMinimumText, sizeof(loadMinimumText), "%u",
+                           savedSettings.threadLoadMinimumCycles);
+            (void)snprintf(loadMaximumText, sizeof(loadMaximumText), "%u",
+                           savedSettings.threadLoadMaximumCycles);
+            (void)snprintf(loadWeightText, sizeof(loadWeightText), "%u",
+                           savedSettings.threadLoadWeightPercent);
+            threadLoadApplied = !connectionReady || sendThreadLoadConfig(
+                &serial, &log, &savedSettings);
         }
         if (restoreDefaults || bulkSizeChanged || ringSizeChanged ||
-            dmaSizeChanged || clockChanged || baudChanged || rxModeChanged) {
+            dmaSizeChanged || clockChanged || baudChanged || rxModeChanged ||
+            threadLoadChanged) {
             savedSettings = (AppDashboardSettings_t){
                 .systemClockHz = (uint32_t)APP_DASHBOARD_SYSTEM_CLOCKS[clockIndex].size,
                 .baud = (uint32_t)APP_DASHBOARD_BAUD_RATES[baudIndex].size,
@@ -879,6 +999,9 @@ int main(void) {
                 .dmaBytes = (uint32_t)APP_DASHBOARD_DMA_SIZES[dmaSizeIndex].size,
                 .bulkBytes = (uint32_t)APP_DASHBOARD_BULK_SIZES[bulkSizeIndex].size,
                 .byteIrq = log.byteIrqMode,
+                .threadLoadWeightPercent = savedSettings.threadLoadWeightPercent,
+                .threadLoadMinimumCycles = savedSettings.threadLoadMinimumCycles,
+                .threadLoadMaximumCycles = savedSettings.threadLoadMaximumCycles,
             };
             (void)AppClientPreferences_SaveSettings(
                 APP_PREFERENCES_CLIENT, &savedSettings);

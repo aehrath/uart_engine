@@ -5,6 +5,10 @@
 #include "dashboard_font.h"
 #include "raygui.h"
 
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+
 const Color COLOR_CANVAS = {10, 15, 28, 255};
 const Color COLOR_PANEL = {20, 28, 46, 255};
 const Color COLOR_PANEL_RAISED = {27, 37, 59, 255};
@@ -196,5 +200,60 @@ void AppDashboardUi_TextBox(Rectangle bounds, char *text, size_t capacity,
                                bounds.width - 2.0f, bounds.height - 2.0f};
     if (GuiTextBox(content, text, (int)capacity, shortcut ? false : *editing)) {
         *editing = !*editing;
+    }
+}
+
+bool AppDashboardUi_NumberField(Rectangle bounds, char *text, size_t capacity,
+                                bool *editing,
+                                AppDashboardNumberDrag_t *drag,
+                                uint32_t step, uint32_t maximum) {
+    AppDashboardUi_TextBox(bounds, text, capacity, editing);
+    const Vector2 mouse = GetMousePosition();
+    if (IsMouseButtonPressed(MOUSE_BUTTON_LEFT) &&
+        CheckCollisionPointRec(mouse, bounds)) {
+        char *end = NULL;
+        const unsigned long parsed = strtoul(text, &end, 10);
+        drag->startY = mouse.y;
+        drag->startValue = end != text && *end == '\0' && parsed <= maximum
+            ? (uint32_t)parsed : 0U;
+        drag->active = true;
+        drag->moved = false;
+    }
+    if (drag->active && IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+        const int pixels = (int)(drag->startY - mouse.y);
+        if (pixels >= 3 || pixels <= -3) {
+            const int64_t increments = pixels / 3;
+            int64_t value = (int64_t)drag->startValue +
+                increments * (int64_t)step;
+            if (value < 0) value = 0;
+            if ((uint64_t)value > maximum) value = maximum;
+            (void)snprintf(text, capacity, "%u", (uint32_t)value);
+            *editing = false;
+            drag->moved = true;
+        }
+    }
+    if (drag->active && IsMouseButtonReleased(MOUSE_BUTTON_LEFT)) {
+        drag->active = false;
+        if (drag->moved) *editing = false;
+    }
+    return drag->moved;
+}
+
+void AppDashboardUi_TabFocus(bool **editingFields, size_t fieldCount) {
+    if (fieldCount == 0U || !IsKeyPressed(KEY_TAB)) return;
+    size_t current = fieldCount;
+    for (size_t index = 0U; index < fieldCount; index++) {
+        if (*editingFields[index]) {
+            current = index;
+            break;
+        }
+    }
+    const bool reverse = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+    const size_t target = current == fieldCount
+        ? (reverse ? fieldCount - 1U : 0U)
+        : reverse ? (current + fieldCount - 1U) % fieldCount
+                  : (current + 1U) % fieldCount;
+    for (size_t index = 0U; index < fieldCount; index++) {
+        *editingFields[index] = index == target;
     }
 }

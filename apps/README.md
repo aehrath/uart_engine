@@ -110,7 +110,7 @@ idle links and successfully drained high-rate links do not produce false
 warnings.
 
 The native C client and Python client now carry the same **Clock**, **Baud**,
-**Ring**, **DMA**, and **Per-byte IRQ** controls as the server. The C client
+**Ring**, **DMA**, **Per-byte IRQ**, and **Load** controls as the server. The C client
 measures its serial-read-to-parser path; the Python client measures its actual
 background-reader-to-Tk-consumer queue. Consequently, their traces and headroom
 remain local and can legitimately differ from the server during the same
@@ -248,10 +248,27 @@ open "build/BLE UART Server.app"
 
 The graphical C and Python clients remember their last selected UART port
 between launches. They also share saved client settings for clock, baud, ring
-capacity, DMA size, large-transfer size, and per-byte IRQ mode. The graphical
+capacity, DMA size, large-transfer size, per-byte IRQ mode, and randomized
+thread load. Client load changes cross the verified UART as a typed vendor HCI
+command and configure the server's real competing FreeRTOS task. The graphical
 server saves the same controls independently, so server receive settings do
 not overwrite the clients. **Defaults** immediately restores 20 MHz, 4 Mbaud,
-16 KiB ring, 256 B DMA, 2 MiB transfer, and DMA + IDLE receive mode.
+16 KiB ring, 256 B DMA, 2 MiB transfer, DMA + IDLE receive mode, and disables
+random thread load.
+
+The three load fields are always visible in the main panel: minimum busy cycles,
+maximum busy cycles, and random-range weight. A zero maximum disables the task.
+An empty field normalizes to zero when it loses focus, and legacy saved load
+formats migrate to all-zero disabled values.
+Tab and Shift+Tab move keyboard focus forward and backward through the fields. Vertical mouse
+dragging adjusts min/max in 1,000-cycle steps and R% in one-percent steps. If a
+new minimum exceeds the maximum, the maximum follows it automatically; setting
+maximum to zero afterward remains the explicit disable operation.
+The percentage scales the random offset between minimum and maximum; it is not
+an activation probability. The workload
+runs above the application consumer but below critical RX producer and TX tasks,
+so its measured queue pressure and latency reflect actual FreeRTOS scheduling.
+The CLI equivalents are `load status` and `load MIN MAX PERCENT`.
 
 Preferences are stored in the platform user configuration directory:
 `~/Library/Application Support/BLE UART/client-port.txt` on macOS,

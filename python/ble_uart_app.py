@@ -114,6 +114,12 @@ def run_gui() -> None:
                 RING_BUFFER_SIZES, self.saved_settings.ring, "16 KiB"))
             self.dma_buffer_var = tk.StringVar(value=selected_label(
                 DMA_BUFFER_SIZES, self.saved_settings.dma, "256 B"))
+            self.load_min_var = tk.StringVar(
+                value=str(self.saved_settings.load_min_cycles))
+            self.load_max_var = tk.StringVar(
+                value=str(self.saved_settings.load_max_cycles))
+            self.load_weight_var = tk.StringVar(
+                value=str(self.saved_settings.load_weight))
             self.ring_buffer_size = dict(RING_BUFFER_SIZES)[self.ring_buffer_var.get()]
             self.dma_buffer_size = dict(DMA_BUFFER_SIZES)[self.dma_buffer_var.get()]
             self.pipeline.ring_capacity = self.ring_buffer_size
@@ -222,7 +228,7 @@ def run_gui() -> None:
             ttk.Label(connection, text="Port", style="App.TLabel").place(
                 x=0, y=3, width=50, height=38)
             self.port_combo = RoundedCombo(connection, self.port_var, editable=True)
-            self.port_combo.place(x=52, y=3, width=426, height=38)
+            self.port_combo.place(x=52, y=3, width=310, height=38)
             self.port_combo.entry.bind("<FocusIn>", lambda _event: self.refresh_ports(), add="+")
             self.port_combo.entry.bind(
                 "<FocusOut>", lambda _event: save_port(self.port_var.get()), add="+")
@@ -230,13 +236,38 @@ def run_gui() -> None:
                 "<<ComboboxSelected>>",
                 lambda _event: save_port(self.port_var.get()), add="+")
             self.connect_button = RoundedActionButton(
-                connection, "Connect", self.toggle_connection, width=170, height=38)
-            self.connect_button.place(x=712, y=3)
+                connection, "Connect", self.toggle_connection, width=144, height=38)
+            self.connect_button.place(x=752, y=3)
+            ttk.Label(connection, text="Busy", style="Muted.TLabel").place(
+                x=370, y=3, width=34, height=38)
+            load_min = RoundedEntry(connection, self.load_min_var)
+            load_min.place(x=408, y=3, width=110, height=38)
+            ttk.Label(connection, text="..", style="Muted.TLabel").place(
+                x=524, y=3, width=12, height=38)
+            load_max = RoundedEntry(connection, self.load_max_var)
+            load_max.place(x=540, y=3, width=110, height=38)
+            ttk.Label(connection, text="R%", style="Muted.TLabel").place(
+                x=656, y=3, width=22, height=38)
+            load_weight = RoundedEntry(connection, self.load_weight_var)
+            load_weight.place(x=682, y=3, width=54, height=38)
+            load_fields = (
+                (load_min.entry, self.load_min_var, 1000, 0xFFFFFFFF, "minimum"),
+                (load_max.entry, self.load_max_var, 1000, 0xFFFFFFFF, "maximum"),
+                (load_weight.entry, self.load_weight_var, 1, 100, "weight"),
+            )
+            for entry, variable, step, limit, source in load_fields:
+                entry.bind(
+                    "<Return>",
+                    lambda event, name=source: self._configure_thread_load(event, name))
+                entry.bind(
+                    "<FocusOut>",
+                    lambda event, name=source: self._configure_thread_load(event, name))
+                self._bind_numeric_drag(entry, variable, step, limit, source)
             self.rx_mode_toggle = RoundedToggle(
                 connection, "Per-byte IRQ", self.byte_irq_var,
                 self.send_rx_mode_request)
             self.rx_mode_toggle.configure(state=tk.DISABLED)
-            self.rx_mode_toggle.place(x=914, y=7, width=120, height=30)
+            self.rx_mode_toggle.place(x=908, y=7, width=124, height=30)
             RoundedEntry(connection, self.status_var, readonly=True).place(
                 x=0, y=51, width=166, height=34)
             ttk.Label(connection, text="Clock", style="Muted.TLabel").place(
@@ -392,8 +423,100 @@ def run_gui() -> None:
                 ring=dict(RING_BUFFER_SIZES)[self.ring_buffer_var.get()],
                 dma=dict(DMA_BUFFER_SIZES)[self.dma_buffer_var.get()],
                 bulk=dict(TEST_TRANSFER_SIZES)[self.bulk_size_var.get()],
-                byte_irq=self.byte_irq_var.get())
+                byte_irq=self.byte_irq_var.get(),
+                load_weight=self.saved_settings.load_weight,
+                load_min_cycles=self.saved_settings.load_min_cycles,
+                load_max_cycles=self.saved_settings.load_max_cycles)
             save_settings("client", self.saved_settings)
+
+        def _bind_numeric_drag(self, entry: tk.Entry, variable: tk.StringVar,
+                               step: int, limit: int, source: str) -> None:
+            """Add vertical mouse dragging to a numeric entry field."""
+            drag: dict[str, int | bool] = {
+                "start_y": 0, "start_value": 0, "moved": False,
+            }
+
+            def press(event: tk.Event) -> None:
+                try:
+                    value = int(variable.get() or "0", 10)
+                except ValueError:
+                    value = 0
+                drag.update(start_y=event.y_root,
+                            start_value=max(0, min(limit, value)), moved=False)
+
+            def motion(event: tk.Event) -> str | None:
+                pixels = int(drag["start_y"]) - event.y_root
+                if abs(pixels) < 3:
+                    return None
+                increments = int(pixels / 3)
+                value = max(0, min(limit,
+                                   int(drag["start_value"]) + increments * step))
+                variable.set(str(value))
+                drag["moved"] = True
+                if source == "minimum":
+                    try:
+                        maximum = int(self.load_max_var.get() or "0", 10)
+                    except ValueError:
+                        maximum = 0
+                    if value > maximum:
+                        self.load_max_var.set(str(value))
+                return "break"
+
+            def release(event: tk.Event) -> str | None:
+                if not drag["moved"]:
+                    return None
+                self._configure_thread_load(event, source)
+                entry.selection_range(0, tk.END)
+                return "break"
+
+            entry.bind("<ButtonPress-1>", press, add="+")
+            entry.bind("<B1-Motion>", motion, add="+")
+            entry.bind("<ButtonRelease-1>", release, add="+")
+
+        def _configure_thread_load(self, _event: object = None,
+                                   source: str | None = None) -> None:
+            """Validate and apply the three always-visible busy-work values."""
+            for variable in (self.load_min_var, self.load_max_var,
+                             self.load_weight_var):
+                if not variable.get().strip():
+                    variable.set("0")
+            try:
+                minimum = int(self.load_min_var.get(), 10)
+                maximum = int(self.load_max_var.get(), 10)
+                weight = int(self.load_weight_var.get(), 10)
+            except ValueError:
+                self.log_notice("ERROR  Busy values must be decimal integers", "ERROR")
+                return
+            if source == "minimum" and minimum > maximum:
+                maximum = minimum
+                self.load_max_var.set(str(maximum))
+            if not (0 <= weight <= 100 and 0 <= minimum <= 0xFFFFFFFF
+                    and 0 <= maximum <= 0xFFFFFFFF
+                    and (maximum == 0 or minimum <= maximum)):
+                self.log_notice(
+                    "ERROR  Use max=0 to disable, otherwise min<=max and R%=0..100",
+                    "ERROR")
+                return
+            self.saved_settings.load_min_cycles = minimum
+            self.saved_settings.load_max_cycles = maximum
+            self.saved_settings.load_weight = weight
+            self._save_settings()
+            if self.serial_port is not None and not self.handshake_pending:
+                self.send_thread_load_config()
+
+        def send_thread_load_config(self) -> None:
+            """Configure the server's typed randomized-load vendor command."""
+            settings = self.saved_settings
+            parameters = (b"LOAD"
+                          + bytes((settings.load_weight,))
+                          + settings.load_min_cycles.to_bytes(4, "little")
+                          + settings.load_max_cycles.to_bytes(4, "little"))
+            frame = build_hci_command(0xFC02, parameters)
+            self.write_frame(
+                frame,
+                f"server busy work: {settings.load_min_cycles}.."
+                f"{settings.load_max_cycles} cycles, R%={settings.load_weight}"
+                + (" (disabled)" if settings.load_max_cycles == 0 else ""))
 
         def restore_default_settings(self) -> None:
             """Restore and immediately apply the documented defaults."""
@@ -416,7 +539,13 @@ def run_gui() -> None:
                 self.pipeline.dma_capacity = defaults.dma
             self.transport_var.set(
                 "DMA + IDLE" if self.serial_port is not None else "OFFLINE")
+            self.saved_settings = defaults
+            self.load_min_var.set(str(defaults.load_min_cycles))
+            self.load_max_var.set(str(defaults.load_max_cycles))
+            self.load_weight_var.set(str(defaults.load_weight))
             self._save_settings()
+            if self.serial_port is not None and not self.handshake_pending:
+                self.send_thread_load_config()
             self.log_notice("SETTINGS  Restored application defaults")
 
         def log_line(self, direction: str, data: bytes, detail: str = "") -> None:
@@ -613,6 +742,7 @@ def run_gui() -> None:
             self.send_raw_button.configure(state=tk.NORMAL)
             self._update_send_buttons()
             self.log_notice("VERIFY  BLE UART server acknowledged the 128-byte probe")
+            self.send_thread_load_config()
 
         def _update_send_buttons(self) -> None:
             """Disable every sender while this app sends or receives a transfer."""
