@@ -29,12 +29,10 @@ typedef enum {
 typedef struct {
     /** Random-range weight from 0 through 100. */
     uint32_t weightPercent;
-    /** Minimum simulated target CPU cycles in one busy burst. */
-    uint32_t minimumCycles;
-    /** Maximum simulated target CPU cycles; zero disables competing work. */
-    uint32_t maximumCycles;
-    /** Target CPU clock used to convert cycles into elapsed time. */
-    uint32_t systemClockHz;
+    /** Minimum busy duration in milliseconds. */
+    uint32_t minimumBusyMs;
+    /** Maximum busy duration in milliseconds; zero disables competing work. */
+    uint32_t maximumBusyMs;
 } UartDmaThreadLoadConfig_t;
 
 /** Cumulative measurements from the randomized competing task. */
@@ -45,12 +43,12 @@ typedef struct {
     uint64_t decisions;
     /** Decisions that produced a busy burst. */
     uint64_t activations;
-    /** Sum of configured target cycles across all bursts. */
-    uint64_t totalCycles;
+    /** Sum of configured target milliseconds across all bursts. */
+    uint64_t totalBusyTargetMs;
     /** Measured wall time spent executing busy bursts. */
     uint64_t totalBusyUs;
-    /** Target cycles selected for the most recent burst. */
-    uint32_t lastCycles;
+    /** Target milliseconds selected for the most recent burst. */
+    uint32_t lastBusyTargetMs;
     /** Whether the competing task is currently inside a busy burst. */
     bool active;
 } UartDmaThreadLoadMetrics_t;

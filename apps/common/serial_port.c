@@ -58,14 +58,26 @@ bool AppSerialPort_Open(AppSerialPort_t *port, const char *name,
         (void)snprintf(error, error_size, "Baud must be between 1 and 4000000");
         return false;
     }
+    const bool localSimulator = strcmp(name, "Local Simulator") == 0 ||
+                                strcmp(name, "local://simulator") == 0;
     char device[128];
-    (void)snprintf(device, sizeof(device), "\\\\.\\%s", name);
+    if (localSimulator) {
+        (void)snprintf(device, sizeof(device),
+                       "\\\\.\\pipe\\ble-uart-local-simulator");
+    } else {
+        (void)snprintf(device, sizeof(device), "\\\\.\\%s", name);
+    }
     port->handle = CreateFileA(device, GENERIC_READ | GENERIC_WRITE, 0, NULL,
                                OPEN_EXISTING, 0, NULL);
     if (port->handle == INVALID_HANDLE_VALUE) {
         (void)snprintf(error, error_size, "Cannot open %s (Windows error %lu)",
                        name, (unsigned long)GetLastError());
         return false;
+    }
+    port->localSimulator = localSimulator;
+    if (localSimulator) {
+        port->connected = true;
+        return true;
     }
 
     DCB settings = {0};
@@ -96,6 +108,14 @@ bool AppSerialPort_Open(AppSerialPort_t *port, const char *name,
 }
 
 int AppSerialPort_Read(AppSerialPort_t *port, uint8_t *data, size_t capacity) {
+    if (port->localSimulator) {
+        DWORD available = 0U;
+        if (!PeekNamedPipe(port->handle, NULL, 0U, NULL, &available, NULL)) {
+            return -1;
+        }
+        if (available == 0U) return 0;
+        if (capacity > available) capacity = available;
+    }
     DWORD received = 0U;
     return ReadFile(port->handle, data, (DWORD)capacity, &received, NULL)
         ? (int)received : -1;

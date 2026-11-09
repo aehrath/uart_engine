@@ -30,9 +30,9 @@ typedef struct {
     bool byteIrq;
     /** Percentage weight applied to the random min/max range. */
     uint32_t threadLoadWeightPercent;
-    /** Busy-cycle range; a zero maximum disables the workload. */
-    uint32_t threadLoadMinimumCycles;
-    uint32_t threadLoadMaximumCycles;
+    /** Busy-time range in milliseconds; a zero maximum disables the workload. */
+    uint32_t threadLoadMinimumMs;
+    uint32_t threadLoadMaximumMs;
 } AppDashboardSettings_t;
 
 /** Populate the documented application defaults. */

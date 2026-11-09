@@ -15,18 +15,25 @@
 #include "raygui.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <inttypes.h>
-#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOGDI
+#define NOUSER
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#endif
 
 #define PROCESS_BUFFER_SIZE 2048U
 #define PROCESS_DRAIN_BUDGET (64U * 1024U)
@@ -38,12 +45,23 @@ typedef AppDashboardLog_t ServerLog_t;
 
 /** Child-process and partial-line state for the server engine. */
 typedef struct {
+#ifdef _WIN32
+    /** Native child-process handle. */
+    HANDLE processHandle;
+    /** Read end of the child's combined stdout/stderr pipe. */
+    HANDLE outputHandle;
+    /** Write end of the child's stdin control pipe. */
+    HANDLE inputHandle;
+    /** Native child process identifier. */
+    DWORD processId;
+#else
     /** Server child PID. */
     pid_t processId;
     /** Nonblocking descriptor receiving combined stdout and stderr. */
     int outputDescriptor;
     /** Descriptor sending mode-control lines to the child process. */
     int inputDescriptor;
+#endif
     /** Whether the child has not yet been reaped. */
     bool running;
     /** Whether termination has already been requested. */
@@ -60,7 +78,7 @@ typedef struct {
 
 /** Metrics extracted from textual server output. */
 typedef struct {
-    /** Current client-facing pseudo-UART device path. */
+    /** Current client-facing local endpoint. */
     char port[128];
     /** Count of command or test-message starts. */
     unsigned int receivedCommands;
@@ -125,12 +143,12 @@ typedef struct {
     /** Configured and measured randomized competing-task load. */
     bool threadLoadActive;
     uint32_t threadLoadWeight;
-    uint32_t threadLoadMinimumCycles;
-    uint32_t threadLoadMaximumCycles;
+    uint32_t threadLoadMinimumMs;
+    uint32_t threadLoadMaximumMs;
     uint64_t threadLoadDecisions;
     uint64_t threadLoadActivations;
     uint64_t threadLoadBusyUs;
-    uint32_t threadLoadLastCycles;
+    uint32_t threadLoadLastMs;
     /** Ten-hertz polls accumulated into each half-second graph sample. */
     uint32_t pipelinePollCount;
     uint64_t producerBpsSum;
@@ -189,7 +207,7 @@ static Color serverLogColor(const char *line) {
 /** Update metrics and connection state from one complete engine log line. */
 static void handleServerLine(ServerLog_t *log, ServerState_t *state,
                              const char *line) {
-    static const char portMarker[] = "type this port manually: ";
+    static const char portMarker[] = "Local simulator endpoint: ";
     const char *port = strstr(line, portMarker);
     if (port != NULL) {
         port += sizeof(portMarker) - 1U;
@@ -221,10 +239,10 @@ static void handleServerLine(ServerLog_t *log, ServerState_t *state,
     unsigned int loadWeight = 0U;
     unsigned int loadMinimum = 0U;
     unsigned int loadMaximum = 0U;
-    unsigned int loadLastCycles = 0U;
+    unsigned int loadLastMs = 0U;
     uint64_t loadDecisions = 0U;
     uint64_t loadActivations = 0U;
-    uint64_t loadTotalCycles = 0U;
+    uint64_t loadTargetMs = 0U;
     uint64_t loadBusyUs = 0U;
     if (sscanf(line, "RX IRQ COUNT -> %u", &parsed) == 1) {
         state->rxInterruptCount = parsed;
@@ -288,24 +306,24 @@ static void handleServerLine(ServerLog_t *log, ServerState_t *state,
         appendLog(log, line);
         return;
     } else if (sscanf(line,
-                      "THREAD LOAD -> weight=%u min_cycles=%u"
-                      " max_cycles=%u active=%u"
+                      "THREAD LOAD -> weight=%u min_ms=%u"
+                      " max_ms=%u active=%u"
                       " decisions=%" SCNu64 " activations=%" SCNu64
-                      " total_cycles=%" SCNu64 " busy_us=%" SCNu64
-                      " last_cycles=%u",
+                      " target_ms=%" SCNu64 " busy_us=%" SCNu64
+                      " last_ms=%u",
                       &loadWeight, &loadMinimum, &loadMaximum, &loadActive,
                       &loadDecisions,
-                      &loadActivations, &loadTotalCycles, &loadBusyUs,
-                      &loadLastCycles) == 9) {
+                      &loadActivations, &loadTargetMs, &loadBusyUs,
+                      &loadLastMs) == 9) {
         state->threadLoadActive = loadActive != 0U;
         state->threadLoadWeight = loadWeight;
-        state->threadLoadMinimumCycles = loadMinimum;
-        state->threadLoadMaximumCycles = loadMaximum;
+        state->threadLoadMinimumMs = loadMinimum;
+        state->threadLoadMaximumMs = loadMaximum;
         state->threadLoadDecisions = loadDecisions;
         state->threadLoadActivations = loadActivations;
         state->threadLoadBusyUs = loadBusyUs;
-        state->threadLoadLastCycles = loadLastCycles;
-        (void)loadTotalCycles;
+        state->threadLoadLastMs = loadLastMs;
+        (void)loadTargetMs;
         return;
     } else if (sscanf(line,
                       "RX IRQ PROGRESS -> absolute=%u transmission=%u",
@@ -371,9 +389,56 @@ static void consumeProcessOutput(ServerProcess_t *process, ServerLog_t *log,
     }
 }
 
-/** Fork and connect the bundled continuous server engine. */
+/** Launch and connect the bundled continuous server engine. */
 static bool startServer(ServerProcess_t *process, ServerLog_t *log,
                         ServerState_t *state) {
+#ifdef _WIN32
+    SECURITY_ATTRIBUTES security = {
+        .nLength = sizeof(SECURITY_ATTRIBUTES),
+        .lpSecurityDescriptor = NULL,
+        .bInheritHandle = TRUE,
+    };
+    HANDLE outputRead = NULL;
+    HANDLE outputWrite = NULL;
+    HANDLE inputRead = NULL;
+    HANDLE inputWrite = NULL;
+    if (!CreatePipe(&outputRead, &outputWrite, &security, 0U) ||
+        !CreatePipe(&inputRead, &inputWrite, &security, 0U)) {
+        if (outputRead != NULL) CloseHandle(outputRead);
+        if (outputWrite != NULL) CloseHandle(outputWrite);
+        if (inputRead != NULL) CloseHandle(inputRead);
+        if (inputWrite != NULL) CloseHandle(inputWrite);
+        appendLog(log, "ERROR  Unable to create server process pipes");
+        return false;
+    }
+    (void)SetHandleInformation(outputRead, HANDLE_FLAG_INHERIT, 0U);
+    (void)SetHandleInformation(inputWrite, HANDLE_FLAG_INHERIT, 0U);
+    char helperPath[1024];
+    (void)snprintf(helperPath, sizeof(helperPath), "%s/ble_uart_server_engine.exe",
+                   GetApplicationDirectory());
+    STARTUPINFOA startup = {.cb = sizeof(STARTUPINFOA)};
+    startup.dwFlags = STARTF_USESTDHANDLES;
+    startup.hStdInput = inputRead;
+    startup.hStdOutput = outputWrite;
+    startup.hStdError = outputWrite;
+    PROCESS_INFORMATION child = {0};
+    if (!CreateProcessA(helperPath, NULL, NULL, NULL, TRUE, CREATE_NO_WINDOW,
+                        NULL, NULL, &startup, &child)) {
+        CloseHandle(outputRead);
+        CloseHandle(outputWrite);
+        CloseHandle(inputRead);
+        CloseHandle(inputWrite);
+        appendLog(log, "ERROR  Unable to start BLE server process");
+        return false;
+    }
+    CloseHandle(child.hThread);
+    CloseHandle(outputWrite);
+    CloseHandle(inputRead);
+    process->processHandle = child.hProcess;
+    process->processId = child.dwProcessId;
+    process->outputHandle = outputRead;
+    process->inputHandle = inputWrite;
+#else
     int outputPipe[2] = {-1, -1};
     int inputPipe[2] = {-1, -1};
     if (pipe(outputPipe) != 0 || pipe(inputPipe) != 0) {
@@ -423,6 +488,7 @@ static bool startServer(ServerProcess_t *process, ServerLog_t *log,
     process->processId = child;
     process->outputDescriptor = outputPipe[0];
     process->inputDescriptor = inputPipe[1];
+#endif
     process->running = true;
     process->stopping = false;
     process->stopDeadline = 0.0;
@@ -459,7 +525,7 @@ static bool startServer(ServerProcess_t *process, ServerLog_t *log,
     state->threadLoadDecisions = 0U;
     state->threadLoadActivations = 0U;
     state->threadLoadBusyUs = 0U;
-    state->threadLoadLastCycles = 0U;
+    state->threadLoadLastMs = 0U;
     state->pipelinePollCount = 0U;
     state->producerBpsSum = 0U;
     state->consumerBpsSum = 0U;
@@ -476,12 +542,20 @@ static bool startServer(ServerProcess_t *process, ServerLog_t *log,
     return true;
 }
 
+static bool sendServerCommand(ServerProcess_t *process, const char *command);
+
 /** Request graceful termination of a running server engine. */
 static void requestServerStop(ServerProcess_t *process, ServerLog_t *log) {
     if (process->running && !process->stopping) {
         process->stopping = true;
         process->stopDeadline = GetTime() + 2.0;
+#ifdef _WIN32
+        if (!sendServerCommand(process, "quit\n")) {
+            (void)TerminateProcess(process->processHandle, 1U);
+        }
+#else
         (void)kill(process->processId, SIGTERM);
+#endif
         appendLog(log, "Stopping BLE server engine...");
     }
 }
@@ -496,7 +570,17 @@ static void pollServer(ServerProcess_t *process, ServerLog_t *log,
     char data[512];
     size_t drained = 0U;
     while (drained < PROCESS_DRAIN_BUDGET) {
+#ifdef _WIN32
+        DWORD available = 0U;
+        if (!PeekNamedPipe(process->outputHandle, NULL, 0U, NULL,
+                           &available, NULL) || available == 0U) break;
+        DWORD received = 0U;
+        const DWORD requested = available < sizeof(data) ? available : sizeof(data);
+        const int count = ReadFile(process->outputHandle, data, requested,
+                                   &received, NULL) ? (int)received : -1;
+#else
         const ssize_t count = read(process->outputDescriptor, data, sizeof(data));
+#endif
         if (count > 0) {
             consumeProcessOutput(process, log, state, data, (size_t)count);
             drained += (size_t)count;
@@ -505,26 +589,48 @@ static void pollServer(ServerProcess_t *process, ServerLog_t *log,
         }
     }
 
+#ifdef _WIN32
+    const DWORD waitResult = WaitForSingleObject(process->processHandle, 0U);
+    const bool exited = waitResult == WAIT_OBJECT_0;
+    DWORD status = 1U;
+    if (exited) (void)GetExitCodeProcess(process->processHandle, &status);
+#else
     int status = 0;
     const pid_t result = waitpid(process->processId, &status, WNOHANG);
-    if (result == process->processId) {
+    const bool exited = result == process->processId;
+#endif
+    if (exited) {
         if (process->partialLength != 0U) {
             process->partialLine[process->partialLength] = '\0';
             handleServerLine(log, state, process->partialLine);
         }
+#ifdef _WIN32
+        CloseHandle(process->outputHandle);
+        CloseHandle(process->inputHandle);
+        CloseHandle(process->processHandle);
+#else
         close(process->outputDescriptor);
         close(process->inputDescriptor);
+#endif
         process->running = false;
         process->stopping = false;
         process->forceStopSent = false;
+#ifdef _WIN32
+        state->exitStatus = (int)status;
+#else
         state->exitStatus = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
         appendLog(log, state->exitStatus == 0
             ? "BLE server stopped cleanly"
             : "ERROR  BLE server engine exited unexpectedly");
-    } else if (result == 0 && process->stopping && !process->forceStopSent &&
+    } else if (process->stopping && !process->forceStopSent &&
                GetTime() >= process->stopDeadline) {
         process->forceStopSent = true;
+#ifdef _WIN32
+        (void)TerminateProcess(process->processHandle, 1U);
+#else
         (void)kill(process->processId, SIGKILL);
+#endif
         appendLog(log, "WARNING  Server shutdown timed out; forcing exit");
     }
 }
@@ -537,15 +643,27 @@ static void shutdownServer(ServerProcess_t *process, ServerLog_t *log,
          attempt++) {
         pollServer(process, log, state);
         if (process->running) {
+#ifdef _WIN32
+            Sleep(10U);
+#else
             const struct timespec pause = {.tv_sec = 0, .tv_nsec = 10000000L};
             (void)nanosleep(&pause, NULL);
+#endif
         }
     }
     if (process->running) {
+#ifdef _WIN32
+        (void)TerminateProcess(process->processHandle, 1U);
+        (void)WaitForSingleObject(process->processHandle, INFINITE);
+        CloseHandle(process->outputHandle);
+        CloseHandle(process->inputHandle);
+        CloseHandle(process->processHandle);
+#else
         (void)kill(process->processId, SIGKILL);
         while (waitpid(process->processId, NULL, 0) < 0 && errno == EINTR) {}
         close(process->outputDescriptor);
         close(process->inputDescriptor);
+#endif
         process->running = false;
     }
 }
@@ -558,11 +676,20 @@ static bool sendServerCommand(ServerProcess_t *process, const char *command) {
     size_t offset = 0U;
     const size_t length = strlen(command);
     while (offset < length) {
+#ifdef _WIN32
+        DWORD chunk = 0U;
+        const bool success = WriteFile(process->inputHandle, &command[offset],
+                                       (DWORD)(length - offset), &chunk, NULL);
+        const int written = success ? (int)chunk : -1;
+#else
         const ssize_t written = write(process->inputDescriptor, &command[offset], length - offset);
+#endif
         if (written > 0) {
             offset += (size_t)written;
+#ifndef _WIN32
         } else if (written < 0 && errno == EINTR) {
             continue;
+#endif
         } else {
             return false;
         }
@@ -684,24 +811,35 @@ static void drawHistoryLine(const ServerState_t *state, const float *history,
     DrawCircleV((Vector2){newestX, newestY}, 2.5f, color);
 }
 
-/** Draw a labeled current-capacity gauge. */
-static void drawPipelineGauge(const char *label, uint32_t current,
-                              uint32_t capacity, Rectangle bounds,
-                              Color color) {
-    const float fraction = capacity == 0U ? 0.0f
-        : (float)current / (float)capacity;
+/** Return the largest percentage retained by one visible history series. */
+static float retainedPipelinePeak(const ServerState_t *state,
+                                  const float *history) {
+    float peak = 0.0f;
+    const size_t oldest = (state->historyHead + PIPELINE_HISTORY_SIZE -
+                           state->historyCount) % PIPELINE_HISTORY_SIZE;
+    for (size_t sample = 0U; sample < state->historyCount; sample++) {
+        const float value = history[(oldest + sample) % PIPELINE_HISTORY_SIZE];
+        if (value > peak) peak = value;
+    }
+    return peak;
+}
+
+/** Draw a labeled retained-peak gauge. */
+static void drawPipelineGauge(const char *label, float percentage,
+                              Rectangle bounds, Color color) {
+    if (percentage < 0.0f) percentage = 0.0f;
+    if (percentage > 100.0f) percentage = 100.0f;
     char value[64];
-    const double percentage = capacity == 0U ? 0.0
-        : current >= capacity ? 100.0 : 100.0 * current / capacity;
-    (void)snprintf(value, sizeof(value), "%s %.1f%%", label, percentage);
+    (void)snprintf(value, sizeof(value), "%s %.1f%%", label,
+                   (double)percentage);
     AppDashboardUi_DrawText(value, (int)bounds.x, (int)bounds.y - 2, 10,
                             COLOR_MUTED);
     const Rectangle track = {bounds.x + 94.0f, bounds.y, bounds.width - 94.0f,
                              bounds.height};
     DrawRectangleRounded(track, 1.0f, 8, (Color){35, 45, 65, 255});
-    if (fraction > 0.0f) {
+    if (percentage > 0.0f) {
         Rectangle fill = track;
-        fill.width *= fraction > 1.0f ? 1.0f : fraction;
+        fill.width *= percentage / 100.0f;
         DrawRectangleRounded(fill, 1.0f, 8, color);
     }
 }
@@ -751,10 +889,22 @@ static void drawPipelineVisualization(const ServerState_t *state,
     drawHistoryLine(state, state->queueHistory, graph, 100.0f, 2.0f,
                     COLOR_PURPLE);
 
-    drawPipelineGauge("Q PEAK", state->queueDepth, state->queueCapacity,
+    float queuePeak = retainedPipelinePeak(state, state->queueHistory);
+    float ringPeak = retainedPipelinePeak(state, state->ringHistory);
+    const float liveQueuePeak = capacityPercent(
+        state->sampleQueueHighWater > state->queueDepth
+            ? state->sampleQueueHighWater : state->queueDepth,
+        state->queueCapacity);
+    const float liveRingPeak = capacityPercent(
+        state->sampleRingHighWaterBytes > state->ringBurstBytes
+            ? state->sampleRingHighWaterBytes : state->ringBurstBytes,
+        state->ringBufferSize);
+    if (liveQueuePeak > queuePeak) queuePeak = liveQueuePeak;
+    if (liveRingPeak > ringPeak) ringPeak = liveRingPeak;
+    drawPipelineGauge("Q PEAK", queuePeak,
                       (Rectangle){bounds.x + 12.0f, bounds.y + 78.0f,
                                   bounds.width - 24.0f, 8.0f}, COLOR_PURPLE);
-    drawPipelineGauge("R PEAK", state->ringBurstBytes, state->ringBufferSize,
+    drawPipelineGauge("R PEAK", ringPeak,
                       (Rectangle){bounds.x + 12.0f, bounds.y + 95.0f,
                                   bounds.width - 24.0f, 8.0f}, COLOR_BLUE);
 
@@ -775,12 +925,12 @@ static void drawPipelineVisualization(const ServerState_t *state,
     AppDashboardUi_DrawText(footer, (int)bounds.x + 12,
                             (int)bounds.y + 114, 10, footerColor);
     char loadFooter[128];
-    if (state->threadLoadMaximumCycles != 0U) {
+    if (state->threadLoadMaximumMs != 0U) {
         (void)snprintf(loadFooter, sizeof(loadFooter),
-                       "LOAD %u%%  randomized %u..%u cycles  bursts=%" PRIu64 "%s",
+                       "LOAD %u%%  randomized %u..%u ms  bursts=%" PRIu64 "%s",
                        (unsigned int)state->threadLoadWeight,
-                       (unsigned int)state->threadLoadMinimumCycles,
-                       (unsigned int)state->threadLoadMaximumCycles,
+                       (unsigned int)state->threadLoadMinimumMs,
+                       (unsigned int)state->threadLoadMaximumMs,
                        state->threadLoadActivations,
                        state->threadLoadActive ? "  BUSY" : "");
     } else {
@@ -803,9 +953,11 @@ int main(void) {
     AppDashboardUi_Init(UART_DMA_UI_FONT_FILE,
                         UART_DMA_UI_DISPLAY_FONT_FILE);
 
-    ServerProcess_t process = {
-        .processId = 0, .outputDescriptor = -1, .inputDescriptor = -1,
-    };
+    ServerProcess_t process = {0};
+#ifndef _WIN32
+    process.outputDescriptor = -1;
+    process.inputDescriptor = -1;
+#endif
     ServerState_t state = {0};
     ServerLog_t log;
     AppDashboardLog_Init(&log);
@@ -849,16 +1001,16 @@ int main(void) {
         .bulkBytes = (uint32_t)APP_DASHBOARD_BULK_SIZES[bulkSizeIndex].size,
         .byteIrq = savedSettings.byteIrq,
         .threadLoadWeightPercent = savedSettings.threadLoadWeightPercent,
-        .threadLoadMinimumCycles = savedSettings.threadLoadMinimumCycles,
-        .threadLoadMaximumCycles = savedSettings.threadLoadMaximumCycles,
+        .threadLoadMinimumMs = savedSettings.threadLoadMinimumMs,
+        .threadLoadMaximumMs = savedSettings.threadLoadMaximumMs,
     };
     char loadMinimumText[16];
     char loadMaximumText[16];
     char loadWeightText[4];
     (void)snprintf(loadMinimumText, sizeof(loadMinimumText), "%u",
-                   savedSettings.threadLoadMinimumCycles);
+                   savedSettings.threadLoadMinimumMs);
     (void)snprintf(loadMaximumText, sizeof(loadMaximumText), "%u",
-                   savedSettings.threadLoadMaximumCycles);
+                   savedSettings.threadLoadMaximumMs);
     (void)snprintf(loadWeightText, sizeof(loadWeightText), "%u",
                    savedSettings.threadLoadWeightPercent);
     bool loadMinimumEdit = false;
@@ -871,7 +1023,7 @@ int main(void) {
     unsigned int statsFrame = 0U;
     AppDashboardConfig_PresetToFields(0, opcodeText, sizeof(opcodeText),
                    parametersText, sizeof(parametersText));
-    appendLog(&log, "Ready. Start the server to create a local pseudo-UART.");
+    appendLog(&log, "Ready. Start the server to create a local endpoint.");
 
     while (!WindowShouldClose()) {
         pollServer(&process, &log, &state);
@@ -967,8 +1119,8 @@ int main(void) {
                     (void)sendServerCommand(&process, command);
                     (void)snprintf(command, sizeof(command),
                                    "load %u %u %u\n",
-                                   savedSettings.threadLoadMinimumCycles,
-                                   savedSettings.threadLoadMaximumCycles,
+                                   savedSettings.threadLoadMinimumMs,
+                                   savedSettings.threadLoadMaximumMs,
                                    savedSettings.threadLoadWeightPercent);
                     (void)sendServerCommand(&process, command);
                     state.byteIrqMode = savedSettings.byteIrq;
@@ -976,18 +1128,18 @@ int main(void) {
                 }
             }
         }
-        GuiLabel((Rectangle){44, 289, 122, 38}, "Pseudo-UART");
+        GuiLabel((Rectangle){44, 289, 122, 38}, "Endpoint");
         AppDashboardUi_StatusField((Rectangle){170, 289, 220, 38},
                         state.port[0] != '\0'
                             ? state.port : "Start server to create port");
-        AppDashboardUi_DrawText("Busy", 398, 300, 11, COLOR_MUTED);
+        AppDashboardUi_DrawText("Busy ms", 394, 300, 10, COLOR_MUTED);
         AppDashboardUi_NumberField((Rectangle){438, 289, 110, 38}, loadMinimumText,
                                    sizeof(loadMinimumText), &loadMinimumEdit,
-                                   &loadMinimumDrag, 1000U, UINT32_MAX);
+                                   &loadMinimumDrag, 1U, UINT32_MAX);
         AppDashboardUi_DrawText("..", 554, 300, 12, COLOR_MUTED);
         AppDashboardUi_NumberField((Rectangle){570, 289, 110, 38}, loadMaximumText,
                                    sizeof(loadMaximumText), &loadMaximumEdit,
-                                   &loadMaximumDrag, 1000U, UINT32_MAX);
+                                   &loadMaximumDrag, 1U, UINT32_MAX);
         AppDashboardUi_DrawText("R%", 686, 300, 11, COLOR_MUTED);
         AppDashboardUi_NumberField((Rectangle){712, 289, 54, 38}, loadWeightText,
                                    sizeof(loadWeightText), &loadWeightEdit,
@@ -1007,7 +1159,7 @@ int main(void) {
                          state.port[0] != '\0')) {
             if (state.port[0] != '\0') {
                 SetClipboardText(state.port);
-                appendLog(&log, "Copied pseudo-UART port to clipboard");
+                appendLog(&log, "Copied local endpoint to clipboard");
             }
         }
         const bool previousMode = state.byteIrqMode;
@@ -1183,10 +1335,18 @@ int main(void) {
             *minimumEnd == '\0' && minimumCandidate <= UINT32_MAX &&
             maximumEnd != loadMaximumText && *maximumEnd == '\0' &&
             maximumCandidate <= UINT32_MAX &&
-            minimumCandidate != savedSettings.threadLoadMinimumCycles &&
+            minimumCandidate != savedSettings.threadLoadMinimumMs &&
             minimumCandidate > maximumCandidate) {
             (void)snprintf(loadMaximumText, sizeof(loadMaximumText), "%u",
                            (uint32_t)minimumCandidate);
+        } else if (!loadMaximumEdit && minimumEnd != loadMinimumText &&
+                   *minimumEnd == '\0' && minimumCandidate <= UINT32_MAX &&
+                   maximumEnd != loadMaximumText && *maximumEnd == '\0' &&
+                   maximumCandidate <= UINT32_MAX &&
+                   maximumCandidate != savedSettings.threadLoadMaximumMs &&
+                   maximumCandidate < minimumCandidate) {
+            (void)snprintf(loadMinimumText, sizeof(loadMinimumText), "%u",
+                           (uint32_t)maximumCandidate);
         }
         const bool validLoad = AppDashboardConfig_ParseThreadLoad(
             loadMinimumText, loadMaximumText, loadWeightText,
@@ -1194,12 +1354,12 @@ int main(void) {
         const bool threadLoadChanged = validLoad && !loadMinimumEdit &&
             !loadMaximumEdit && !loadWeightEdit && !loadMinimumDrag.active &&
             !loadMaximumDrag.active && !loadWeightDrag.active &&
-            (loadMinimum != savedSettings.threadLoadMinimumCycles ||
-             loadMaximum != savedSettings.threadLoadMaximumCycles ||
+            (loadMinimum != savedSettings.threadLoadMinimumMs ||
+             loadMaximum != savedSettings.threadLoadMaximumMs ||
              loadWeight != savedSettings.threadLoadWeightPercent);
         if (threadLoadChanged) {
-            savedSettings.threadLoadMinimumCycles = loadMinimum;
-            savedSettings.threadLoadMaximumCycles = loadMaximum;
+            savedSettings.threadLoadMinimumMs = loadMinimum;
+            savedSettings.threadLoadMaximumMs = loadMaximum;
             savedSettings.threadLoadWeightPercent = loadWeight;
             if (process.running) {
                 char command[96];
@@ -1229,9 +1389,9 @@ int main(void) {
                 (void)sendServerCommand(&process, "load 0 0 0\n");
             }
             (void)snprintf(loadMinimumText, sizeof(loadMinimumText), "%u",
-                           savedSettings.threadLoadMinimumCycles);
+                           savedSettings.threadLoadMinimumMs);
             (void)snprintf(loadMaximumText, sizeof(loadMaximumText), "%u",
-                           savedSettings.threadLoadMaximumCycles);
+                           savedSettings.threadLoadMaximumMs);
             (void)snprintf(loadWeightText, sizeof(loadWeightText), "%u",
                            savedSettings.threadLoadWeightPercent);
             appendLog(&log, "SETTINGS  Restored application defaults");
@@ -1247,8 +1407,8 @@ int main(void) {
                 .bulkBytes = (uint32_t)APP_DASHBOARD_BULK_SIZES[bulkSizeIndex].size,
                 .byteIrq = state.byteIrqMode,
                 .threadLoadWeightPercent = savedSettings.threadLoadWeightPercent,
-                .threadLoadMinimumCycles = savedSettings.threadLoadMinimumCycles,
-                .threadLoadMaximumCycles = savedSettings.threadLoadMaximumCycles,
+                .threadLoadMinimumMs = savedSettings.threadLoadMinimumMs,
+                .threadLoadMaximumMs = savedSettings.threadLoadMaximumMs,
             };
             (void)AppClientPreferences_SaveSettings(
                 APP_PREFERENCES_SERVER, &savedSettings);

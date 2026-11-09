@@ -29,9 +29,11 @@ the same identifier and size. A missing or failed acknowledgement closes the
 port after 2.5 seconds and reports that the selected UART is not a BLE UART
 server.
 
-The pseudo-UART makes local development possible without two physical serial
-adapters. On target hardware, replace the platform register and TX DMA hooks with
-the MCU UART/DMA implementation.
+The local endpoint makes development possible without two physical serial
+adapters. Windows presents it as **Local Simulator** through a built-in named
+pipe, so there is no virtual COM driver, port pairing, or administrator setup.
+On target hardware, replace the platform register and TX DMA hooks with the MCU
+UART/DMA implementation.
 
 ## Pure-C client option
 
@@ -77,11 +79,13 @@ On Linux:
 ./build/ble_uart_client_ui
 ```
 
-On Windows, run `ble_uart_client_ui.exe`. Enter a device such as `COM3`.
+On Windows, run `BLE UART Server.exe`, click **Start server**, then run
+`ble_uart_client_ui.exe` with **Local Simulator** selected. Enter a device such
+as `COM3` only when using physical hardware.
 
 ## Graphical server dashboard
 
-On macOS and Linux, `ble_uart_server_ui` gives the continuous FreeRTOS server a
+On macOS, Linux, and Windows, `ble_uart_server_ui` gives the continuous FreeRTOS server a
 matching graphical dashboard. It starts and stops the actual server engine,
 displays and copies the generated pseudo-UART path, counts received commands and
 transmitted events, and shows the live DMA/HCI log. Its **Per-byte IRQ** checkbox
@@ -93,13 +97,17 @@ dashboards.
 Every graphical dashboard splits the retained traffic log from a real-time RX
 pipeline instrument. Blue and cyan traces show the measured bytes per second
 crossing the FreeRTOS producer and consumer tasks during each half-second
-sample, retaining one minute of history. The queue gauge reports occupied
-packet slots and the ring gauge reports the most recent producer wake-up burst.
+sample, retaining one minute of history. The Q/R peak gauges report the largest
+occupancy still visible in that history, so they agree with visible graph spikes
+even after the live buffers have drained.
 The footer reports measured enqueue-to-consume latency and CRC/queue/ring drops.
 Purple **Q%**, amber **R%**, and gray **D%** graph traces show each sampling
 interval's peak queue, ring, and DMA utilization on a normalized 0–100% scale.
 Live ring and DMA occupancy return to zero as soon as their bytes are consumed;
 the peak traces preserve short bursts for later inspection.
+A roughly 255-byte test frame reaches about 24.9% of a 1 KiB ring and nearly
+100% of a 256 B ring. Consumer backlog instead fills the 16-slot packet queue,
+so heavy competing work primarily drives Q toward 100%.
 
 Headroom is derived from observed backlog growth and currently free queue/ring
 capacity. It reads **stable** whenever the consumer is keeping pace. When the
@@ -207,8 +215,9 @@ transfer-complete interrupts occur (approximately `ceil(wire bytes / DMA
 size)`) without changing baud-limited throughput. The native C client applies
 the same IDLE-delimited frame and DMA-transaction accounting as the server, so
 the same frame produces the same ring percentage and IRQ count in either
-direction. Its live gauge holds a short interval peak for one 500 ms display
-sample and returns to zero on the next quiet sample. Both clients drain all
+direction. Its live occupancy returns to zero on the next quiet sample, while
+its peak meters retain the largest Q/R percentages in the visible one-minute
+history. Both clients drain all
 completed DMA transactions already waiting in their serial drivers; ring size
 limits an individual IDLE-delimited frame and never acts as a per-render-frame
 throughput budget. Native logs retain 256 lines; use the mouse wheel over the
@@ -216,7 +225,8 @@ log or click its scrollbar to inspect earlier traffic.
 
 The server dashboard polls live peak occupancy at 10 Hz while retaining graph
 samples at 2 Hz. The two horizontal meters are explicitly labeled **Q PEAK**
-and **R PEAK** and show one decimal place. When ring and DMA utilization are
+and **R PEAK**, show one decimal place, and retain the largest values in the
+visible one-minute history. When ring and DMA utilization are
 equal, the graph draws DMA as a wide gray underlay and ring utilization as an
 amber centerline so neither trace can hide the other.
 
@@ -256,19 +266,30 @@ not overwrite the clients. **Defaults** immediately restores 20 MHz, 4 Mbaud,
 16 KiB ring, 256 B DMA, 2 MiB transfer, DMA + IDLE receive mode, and disables
 random thread load.
 
-The three load fields are always visible in the main panel: minimum busy cycles,
-maximum busy cycles, and random-range weight. A zero maximum disables the task.
+The three load fields are always visible in the main panel: minimum busy
+milliseconds, maximum busy milliseconds, and random-range weight. A zero
+maximum disables the task.
 An empty field normalizes to zero when it loses focus, and legacy saved load
 formats migrate to all-zero disabled values.
 Tab and Shift+Tab move keyboard focus forward and backward through the fields. Vertical mouse
-dragging adjusts min/max in 1,000-cycle steps and R% in one-percent steps. If a
-new minimum exceeds the maximum, the maximum follows it automatically; setting
-maximum to zero afterward remains the explicit disable operation.
+dragging adjusts min/max in 1 ms steps and R% in one-percent steps. If a new
+minimum exceeds the maximum, the maximum follows it upward. If a new maximum
+falls below the minimum, the minimum follows it downward. The endpoints are
+never swapped, and setting maximum to zero remains the explicit disable operation.
 The percentage scales the random offset between minimum and maximum; it is not
 an activation probability. The workload
 runs above the application consumer but below critical RX producer and TX tasks,
 so its measured queue pressure and latency reflect actual FreeRTOS scheduling.
-The CLI equivalents are `load status` and `load MIN MAX PERCENT`.
+While workload is enabled, local transport ingress rises above it but remains
+below the critical producer, ensuring bytes continue entering simulated
+UART/DMA while each IDLE event can preempt ingress and drain the ring. With load
+disabled, ingress returns to normal application priority to preserve symmetric
+wire-rate transfers. Server controls remain above synthetic workload so
+overload can always be disabled.
+After each busy burst the task leaves a fixed 10 ms idle interval, preventing
+long bursts from entering deadline catch-up and permanently starving the
+consumer or server-control tasks.
+The CLI equivalents are `load status` and `load MIN_MS MAX_MS PERCENT`.
 
 Preferences are stored in the platform user configuration directory:
 `~/Library/Application Support/BLE UART/client-port.txt` on macOS,

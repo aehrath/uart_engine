@@ -25,9 +25,13 @@ from ble_protocol import (  # noqa: E402
 from dashboard_config import DMA_BUFFER_SIZES, RING_BUFFER_SIZES  # noqa: E402
 from dashboard_pipeline import PipelineTelemetry  # noqa: E402
 from client_preferences import (  # noqa: E402
-    DashboardSettings, load_port, load_settings, save_port, save_settings,
+    DashboardSettings, couple_busy_range, load_port, load_settings, save_port,
+    save_settings,
 )
 from lpuart_sim import LpuartSimulator  # noqa: E402
+from local_simulator import (  # noqa: E402
+    LOCAL_SIMULATOR_NAME, LOCAL_SIMULATOR_PIPE, LocalSimulatorPort,
+)
 
 
 class ProtocolTests(unittest.TestCase):
@@ -36,6 +40,20 @@ class ProtocolTests(unittest.TestCase):
     def test_crc_known_vector(self):
         """Verify the standard CRC16-CCITT `123456789` check value."""
         self.assertEqual(crc16_ccitt(b"123456789"), 0x29B1)
+
+    def test_busy_range_follows_the_endpoint_being_edited(self):
+        """Move the opposite endpoint instead of swapping an inverted range."""
+        self.assertEqual(couple_busy_range(25, 10, "minimum"), (25, 25))
+        self.assertEqual(couple_busy_range(25, 10, "maximum"), (10, 10))
+
+    def test_windows_local_simulator_has_a_stable_driver_free_endpoint(self):
+        """Keep both Windows clients aligned with the server named pipe."""
+        self.assertEqual(LOCAL_SIMULATOR_NAME, "Local Simulator")
+        self.assertEqual(LOCAL_SIMULATOR_PIPE,
+                         r"\\.\pipe\ble-uart-local-simulator")
+        if sys.platform != "win32":
+            with self.assertRaises(OSError):
+                LocalSimulatorPort()
 
     def test_pipeline_clears_live_buffers_and_retains_peaks(self):
         """Match the server's queue, ring, and DMA percentages for one frame."""
@@ -112,19 +130,19 @@ class ProtocolTests(unittest.TestCase):
                 settings = DashboardSettings(
                     clock=16_000_000, baud=3_000_000, ring=4096,
                     dma=128, bulk=512 * 1024, byte_irq=True,
-                    load_weight=37, load_min_cycles=12_345,
-                    load_max_cycles=98_765)
+                    load_weight=37, load_min_ms=12_345,
+                    load_max_ms=98_765)
                 self.assertTrue(save_settings("client", settings))
                 self.assertEqual(load_settings("client"), settings)
                 self.assertEqual(load_settings("server"), DashboardSettings())
 
                 path.parent.joinpath("client-settings.txt").write_text(
-                    "load_weight=101\nload_min_cycles=9\nload_max_cycles=2\n",
+                    "load_weight=101\nload_min_ms=9\nload_max_ms=2\n",
                     encoding="utf-8")
                 invalid = load_settings("client")
                 self.assertEqual(invalid.load_weight, 0)
-                self.assertEqual(invalid.load_min_cycles, 0)
-                self.assertEqual(invalid.load_max_cycles, 0)
+                self.assertEqual(invalid.load_min_ms, 0)
+                self.assertEqual(invalid.load_max_ms, 0)
 
     def test_pipeline_percentages_are_clamped_to_chart_capacity(self):
         """Keep transient over-capacity samples inside the percentage graph."""
@@ -138,6 +156,23 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(telemetry.queue_history[-1], 100.0)
         self.assertEqual(telemetry.ring_history[-1], 100.0)
         self.assertEqual(telemetry.dma_history[-1], 100.0)
+
+    def test_pipeline_history_retains_peaks_after_live_buffers_drain(self):
+        """Keep Q/R peak gauges aligned with spikes visible in the graph."""
+        telemetry = PipelineTelemetry()
+        telemetry.queue_capacity = 16
+        telemetry.ring_capacity = 1024
+        telemetry.dma_capacity = 128
+        telemetry.record_arrival(255)
+        telemetry.record_produced(255, 1)
+        telemetry.sample_time -= 1.0
+        telemetry.sample()
+        telemetry.sample_time -= 1.0
+        telemetry.sample()
+        self.assertEqual(telemetry.queue_history[-1], 0.0)
+        self.assertEqual(telemetry.ring_history[-1], 0.0)
+        self.assertAlmostEqual(max(telemetry.queue_history), 6.25)
+        self.assertAlmostEqual(max(telemetry.ring_history), 24.90234375)
 
     def test_kw47_lpuart_clock_sampling(self):
         """Match native OSR/SBR selection and sampled packet failures."""

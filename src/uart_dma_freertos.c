@@ -8,6 +8,16 @@
 #include "queue.h"
 #include "semphr.h"
 #include <string.h>
+
+#if defined(_WIN32)
+/** The FreeRTOS Windows simulator's ISR macro returns from non-void callbacks;
+ * these portable hardware-style handlers remain void and request a yield. */
+#define UART_DMA_YIELD_FROM_ISR(woken) do { \
+    if ((woken) != pdFALSE) portYIELD(); \
+} while (0)
+#else
+#define UART_DMA_YIELD_FROM_ISR(woken) portYIELD_FROM_ISR(woken)
+#endif
 #include <stdint.h>
 #include <stdbool.h>
 #include "uart_dma/uart_dma.h"
@@ -97,17 +107,15 @@ void UartDmaThreadLoad_DefaultConfig(UartDmaThreadLoadConfig_t *config) {
     }
     *config = (UartDmaThreadLoadConfig_t){
         .weightPercent = 0U,
-        .minimumCycles = 0U,
-        .maximumCycles = 0U,
-        .systemClockHz = 20000000U,
+        .minimumBusyMs = 0U,
+        .maximumBusyMs = 0U,
     };
 }
 
 bool UartDmaThreadLoad_Configure(const UartDmaThreadLoadConfig_t *config) {
     if (config == NULL || config->weightPercent > 100U ||
-        (config->maximumCycles != 0U &&
-         config->minimumCycles > config->maximumCycles) ||
-        config->systemClockHz == 0U || config->systemClockHz > 1000000000U) {
+        (config->maximumBusyMs != 0U &&
+         config->minimumBusyMs > config->maximumBusyMs)) {
         return false;
     }
     taskENTER_CRITICAL();
@@ -175,42 +183,42 @@ void UartDmaSystem_Init(void) {
 void vThreadLoadTask(void *pvParameters) {
     (void)pvParameters;
     volatile uint32_t busyValue = 0x9E3779B9U;
-    TickType_t lastDecisionTick = xTaskGetTickCount();
     while (1) {
         UartDmaThreadLoadConfig_t config;
         taskENTER_CRITICAL();
         config = threadLoadMetrics.config;
         taskEXIT_CRITICAL();
 
-        if (config.maximumCycles == 0U) {
+        if (config.maximumBusyMs == 0U) {
             vTaskDelay(pdMS_TO_TICKS(50U));
-            lastDecisionTick = xTaskGetTickCount();
             continue;
         }
-        (void)xTaskDelayUntil(&lastDecisionTick,
-                              pdMS_TO_TICKS(THREAD_LOAD_PERIOD_MS));
+        /* Delay relative to the previous burst's completion.  A periodic
+         * xTaskDelayUntil() catches up without blocking when busyMs exceeds
+         * the period, allowing this higher-priority task to starve every
+         * consumer/control task forever.  A real idle interval after each
+         * burst preserves responsiveness at every configured duration. */
+        vTaskDelay(pdMS_TO_TICKS(THREAD_LOAD_PERIOD_MS));
         taskENTER_CRITICAL();
         threadLoadMetrics.decisions++;
         const uint64_t span =
-            (uint64_t)config.maximumCycles - config.minimumCycles;
+            (uint64_t)config.maximumBusyMs - config.minimumBusyMs;
         const uint64_t randomOffset = span == 0U ? 0U
             : (uint64_t)nextThreadLoadRandom() % (span + 1ULL);
-        const uint32_t cycles = config.minimumCycles +
+        const uint32_t busyMs = config.minimumBusyMs +
             (uint32_t)(randomOffset * config.weightPercent / 100U);
         threadLoadMetrics.active = true;
         threadLoadMetrics.activations++;
-        threadLoadMetrics.lastCycles = cycles;
-        threadLoadMetrics.totalCycles += cycles;
+        threadLoadMetrics.lastBusyTargetMs = busyMs;
+        threadLoadMetrics.totalBusyTargetMs += busyMs;
         taskEXIT_CRITICAL();
 
-        const uint64_t durationUs =
-            ((uint64_t)cycles * 1000000ULL + config.systemClockHz - 1ULL) /
-            config.systemClockHz;
+        const uint64_t durationUs = (uint64_t)busyMs * 1000ULL;
         const uint64_t startedUs = UartDma_PlatformTimeUs();
         while (UartDma_PlatformTimeUs() - startedUs < durationUs) {
             /* Volatile arithmetic prevents the host compiler from deleting
              * the deliberately busy interval. Elapsed time, not host loop
-             * iterations, defines the configured target-cycle duration. */
+             * iterations, defines the configured millisecond duration. */
             busyValue ^= busyValue << 13U;
             busyValue ^= busyValue >> 17U;
             busyValue ^= busyValue << 5U;
@@ -295,7 +303,7 @@ void USART_IRQHandler(void) {
         }
     }
 
-    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    UART_DMA_YIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
 void DMA_RX_Complete_IRQHandler(void) {
@@ -313,7 +321,7 @@ void DMA_TX_Complete_IRQHandler(void) {
         xSemaphoreGiveFromISR(xTxDmaSemaphore, &xHigherPriorityTaskWoken);
     }
 
-    portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
+    UART_DMA_YIELD_FROM_ISR(xHigherPriorityTaskWoken);
 }
 
 /** Convert each UART-IDLE-delimited DMA span into a CRC-validated RX message.

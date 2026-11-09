@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark identical deterministic traffic in both pseudo-UART directions."""
+"""Benchmark identical deterministic traffic in both local-link directions."""
 
 from __future__ import annotations
 
@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT / "python"))
 
 import serial  # noqa: E402
 from ble_protocol import H4CrcStreamParser, build_test_transfer_frames  # noqa: E402
+from local_simulator import LOCAL_SIMULATOR_NAME, LocalSimulatorPort  # noqa: E402
 
 
 def read_engine(process: subprocess.Popen[str], lines: queue.Queue[str]) -> None:
@@ -26,24 +27,24 @@ def read_engine(process: subprocess.Popen[str], lines: queue.Queue[str]) -> None
 
 
 def wait_for_port(lines: queue.Queue[str], timeout: float = 5.0) -> str:
-    """Extract the pseudo-UART path announced by the server."""
+    """Extract the local endpoint announced by the server."""
     deadline = time.monotonic() + timeout
-    marker = "type this port manually: "
+    marker = "Local simulator endpoint: "
     while time.monotonic() < deadline:
         line = lines.get(timeout=max(0.01, deadline - time.monotonic()))
         if marker in line:
             return line.split(marker, 1)[1]
-    raise TimeoutError("server did not publish a pseudo-UART")
+    raise TimeoutError("server did not publish a local endpoint")
 
 
-def receive_until(port: serial.Serial, predicate: object, timeout: float) -> tuple[int, int]:
+def receive_until(port: object, predicate: object, timeout: float) -> tuple[int, int]:
     """Parse CRC-framed traffic until predicate accepts a frame."""
     parser = H4CrcStreamParser()
     packets = 0
     wire_bytes = 0
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        data = port.read(64 * 1024)
+        data = port.read(64 * 1024)  # type: ignore[attr-defined]
         wire_bytes += len(data)
         for frame in parser.feed(data):
             packets += 1
@@ -63,6 +64,9 @@ def main() -> int:
     parser.add_argument("--mode", choices=("dma", "irq"), default="dma")
     parser.add_argument("--ring", type=int, default=16 * 1024)
     parser.add_argument("--dma", type=int, default=256)
+    parser.add_argument("--load-min-ms", type=int, default=0)
+    parser.add_argument("--load-max-ms", type=int, default=0)
+    parser.add_argument("--load-weight", type=int, default=0)
     parser.add_argument("--max-ratio", type=float, default=1.15)
     args = parser.parse_args()
     process = subprocess.Popen(
@@ -73,8 +77,10 @@ def main() -> int:
     try:
         device = wait_for_port(lines)
         try:
-            port_context = serial.Serial(
-                device, 4_000_000, timeout=0.05, write_timeout=5.0)
+            port_context = (LocalSimulatorPort(timeout=0.05)
+                            if device == LOCAL_SIMULATOR_NAME else serial.Serial(
+                                device, 4_000_000, timeout=0.05,
+                                write_timeout=5.0))
         except (OSError, serial.SerialException):
             # macOS pseudo-terminals reject IOSSIOSPEED even though their byte
             # transport is not physically baud-limited.
@@ -84,7 +90,9 @@ def main() -> int:
             assert process.stdin is not None
             process.stdin.write(
                 f"baud {args.baud}\nring {args.ring}\n"
-                f"dma-buffer {args.dma}\n{args.mode}\n")
+                f"dma-buffer {args.dma}\n{args.mode}\n"
+                f"load {args.load_min_ms} {args.load_max_ms} "
+                f"{args.load_weight}\n")
             process.stdin.flush()
             time.sleep(0.05)
             frames = build_test_transfer_frames(args.size, identifier=0x4242)

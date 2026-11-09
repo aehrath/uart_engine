@@ -87,19 +87,34 @@ static void drawLine(const AppDashboardPipeline_t *p, const float *history,
     DrawCircleV((Vector2){newestX, newestY}, 2.5f, color);
 }
 
-/** Draw one capacity gauge. */
-static void drawGauge(const char *label, uint32_t current, uint32_t capacity,
+/** Return the largest percentage retained by a circular history. */
+static float retainedPeakPercent(const float *history, size_t count,
+                                 size_t head) {
+    float peak = 0.0f;
+    const size_t oldest = (head + APP_DASHBOARD_PIPELINE_HISTORY - count) %
+        APP_DASHBOARD_PIPELINE_HISTORY;
+    for (size_t sample = 0U; sample < count; sample++) {
+        const float value = history[(oldest + sample) %
+            APP_DASHBOARD_PIPELINE_HISTORY];
+        if (value > peak) peak = value;
+    }
+    return peak;
+}
+
+/** Draw one retained percentage gauge. */
+static void drawGauge(const char *label, float percentage,
                       Rectangle bounds, Color color) {
+    if (percentage < 0.0f) percentage = 0.0f;
+    if (percentage > 100.0f) percentage = 100.0f;
     char value[64];
-    const double percentage = capacity == 0U ? 0.0
-        : current >= capacity ? 100.0 : 100.0 * current / capacity;
-    (void)snprintf(value, sizeof(value), "%s %.1f%%", label, percentage);
+    (void)snprintf(value, sizeof(value), "%s %.1f%%", label,
+                   (double)percentage);
     AppDashboardUi_DrawText(value, (int)bounds.x, (int)bounds.y - 2, 10, COLOR_MUTED);
     const Rectangle track = {bounds.x + 94.0f, bounds.y, bounds.width - 94.0f, bounds.height};
     DrawRectangleRounded(track, 1.0f, 8, (Color){35, 45, 65, 255});
-    if (capacity != 0U && current != 0U) {
+    if (percentage > 0.0f) {
         Rectangle fill = track;
-        fill.width *= (float)current / capacity > 1.0f ? 1.0f : (float)current / capacity;
+        fill.width *= percentage / 100.0f;
         DrawRectangleRounded(fill, 1.0f, 8, color);
     }
 }
@@ -138,10 +153,25 @@ void AppDashboardPipeline_Draw(const AppDashboardPipeline_t *p, Rectangle bounds
     drawLine(p, p->ringHistory, graph, 100.0f, 2.0f,
              (Color){255, 196, 92, 255});
     drawLine(p, p->queueHistory, graph, 100.0f, 2.0f, COLOR_PURPLE);
-    drawGauge("Q PEAK", p->queueDepth, p->queueCapacity,
-              (Rectangle){bounds.x + 12, bounds.y + 78, bounds.width - 24, 8}, COLOR_PURPLE);
-    drawGauge("R PEAK", p->ringBurstBytes, p->ringCapacity,
-              (Rectangle){bounds.x + 12, bounds.y + 95, bounds.width - 24, 8}, COLOR_BLUE);
+    float queuePeak = retainedPeakPercent(
+        p->queueHistory, p->historyCount, p->historyHead);
+    float ringPeak = retainedPeakPercent(
+        p->ringHistory, p->historyCount, p->historyHead);
+    const float liveQueuePeak = capacityPercent(
+        p->queueHighWater > p->queueDepth ? p->queueHighWater : p->queueDepth,
+        p->queueCapacity);
+    const float liveRingPeak = capacityPercent(
+        p->ringHighWaterBytes > p->ringBurstBytes
+            ? p->ringHighWaterBytes : p->ringBurstBytes,
+        p->ringCapacity);
+    if (liveQueuePeak > queuePeak) queuePeak = liveQueuePeak;
+    if (liveRingPeak > ringPeak) ringPeak = liveRingPeak;
+    drawGauge("Q PEAK", queuePeak,
+              (Rectangle){bounds.x + 12, bounds.y + 78, bounds.width - 24, 8},
+              COLOR_PURPLE);
+    drawGauge("R PEAK", ringPeak,
+              (Rectangle){bounds.x + 12, bounds.y + 95, bounds.width - 24, 8},
+              COLOR_BLUE);
     char latency[24], headroom[24], footer[128];
     formatDuration(latency, sizeof(latency), p->latencyUs, false);
     formatDuration(headroom, sizeof(headroom), p->headroomUs, true);

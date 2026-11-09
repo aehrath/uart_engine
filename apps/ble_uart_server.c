@@ -1,8 +1,8 @@
 /** @file
- * @brief Continuous FreeRTOS BLE-side server connected through a pseudo-UART. */
+ * @brief Continuous FreeRTOS BLE-side server using a local byte stream. */
 #include "uart_dma/uart_dma.h"
 #include "lpuart_sim.h"
-#include "pseudo_uart.h"
+#include "server_transport.h"
 #include "serial_ingress.h"
 #include "test_transfer_protocol.h"
 
@@ -10,10 +10,7 @@
 #include "task.h"
 
 #include <errno.h>
-#include <fcntl.h>
 #include <inttypes.h>
-#include <poll.h>
-#include <pthread.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -21,7 +18,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#ifdef _WIN32
+#include <conio.h>
+#include <windows.h>
+#else
+#include <fcntl.h>
 #include <unistd.h>
+#endif
 
 #define UART_IDLE_FLAG       (1UL << 4)
 #define UART_RXNE_FLAG       (1UL << 5)
@@ -31,6 +34,9 @@
 #define DEFAULT_RX_DMA_SIZE  256U
 #define DEFAULT_SYSTEM_CLOCK_HZ 20000000U
 #define DEFAULT_LINE_BAUD       4000000U
+#define SERIAL_INGRESS_TASK_PRIORITY (configMAX_PRIORITIES - 2U)
+#define SERIAL_NORMAL_TASK_PRIORITY  (tskIDLE_PRIORITY + 1U)
+#define SERVER_CONTROL_TASK_PRIORITY (tskIDLE_PRIORITY + 3U)
 
 static UART_TypeDef uartRegisters;
 static DMA_Stream_TypeDef rxDmaRegisters;
@@ -40,7 +46,7 @@ UART_TypeDef *USART_HW = &uartRegisters;
 DMA_Stream_TypeDef *DMA_RX_STREAM = &rxDmaRegisters;
 DMA_Stream_TypeDef *DMA_TX_STREAM = &txDmaRegisters;
 
-static int ptyMaster = -1;
+static AppServerTransport_t localTransport;
 static uint32_t dmaWriteIndex;
 static uint32_t rxDmaTransferSize = DEFAULT_RX_DMA_SIZE;
 static volatile sig_atomic_t stopRequested;
@@ -50,7 +56,7 @@ static uint32_t inboundTestIrqStart;
 static uint32_t inboundTestIrqNextReport;
 static bool inboundTestIrqActive;
 static SemaphoreHandle_t ptyTxToken;
-static pthread_mutex_t uartTimingMutex = PTHREAD_MUTEX_INITIALIZER;
+static SemaphoreHandle_t uartTimingToken;
 static AppLpuartSimulator_t uartReceiver;
 static AppLpuartSimulator_t hostReceiver;
 static uint32_t invalidTestPackets;
@@ -59,11 +65,40 @@ static uint32_t invalidTestFramingErrors;
 static UartDmaPipelineMetrics_t previousPipelineMetrics;
 static uint64_t previousPipelineTimeUs;
 
+/** Baud clock carried across frames decoded from one efficient host read. */
+typedef struct {
+    uint64_t deadlineUs;
+    bool enabled;
+} InboundPacer_t;
+
+/** Serialize timing-model snapshots shared by the simulated tasks. */
+static void lockUartTiming(void) {
+    if (uartTimingToken != NULL) {
+        (void)xSemaphoreTake(uartTimingToken, portMAX_DELAY);
+    }
+}
+
+/** Release the timing-model serialization token. */
+static void unlockUartTiming(void) {
+    if (uartTimingToken != NULL) (void)xSemaphoreGive(uartTimingToken);
+}
+
 /** Provide sub-tick queue latency measurements for the desktop simulation. */
 uint64_t UartDma_PlatformTimeUs(void) {
+#ifdef _WIN32
+    LARGE_INTEGER counter;
+    LARGE_INTEGER frequency;
+    (void)QueryPerformanceCounter(&counter);
+    (void)QueryPerformanceFrequency(&frequency);
+    const uint64_t ticks = (uint64_t)counter.QuadPart;
+    const uint64_t ticksPerSecond = (uint64_t)frequency.QuadPart;
+    return (ticks / ticksPerSecond) * 1000000ULL +
+           (ticks % ticksPerSecond) * 1000000ULL / ticksPerSecond;
+#else
     struct timespec now = {0, 0};
     (void)clock_gettime(CLOCK_MONOTONIC, &now);
     return (uint64_t)now.tv_sec * 1000000ULL + (uint64_t)now.tv_nsec / 1000ULL;
+#endif
 }
 
 /** Print one measured producer/consumer sample for the live dashboard. */
@@ -137,27 +172,26 @@ static void reportUartTiming(void) {
 static void reportThreadLoad(void) {
     UartDmaThreadLoadMetrics_t metrics;
     UartDmaThreadLoad_GetMetrics(&metrics);
-    printf("THREAD LOAD -> weight=%u min_cycles=%u max_cycles=%u"
+    printf("THREAD LOAD -> weight=%u min_ms=%u max_ms=%u"
            " active=%u decisions=%" PRIu64
-           " activations=%" PRIu64 " total_cycles=%" PRIu64
-           " busy_us=%" PRIu64 " last_cycles=%u\n",
+           " activations=%" PRIu64 " target_ms=%" PRIu64
+           " busy_us=%" PRIu64 " last_ms=%u\n",
            (unsigned int)metrics.config.weightPercent,
-           (unsigned int)metrics.config.minimumCycles,
-           (unsigned int)metrics.config.maximumCycles,
+           (unsigned int)metrics.config.minimumBusyMs,
+           (unsigned int)metrics.config.maximumBusyMs,
            metrics.active ? 1U : 0U,
-           metrics.decisions, metrics.activations, metrics.totalCycles,
-           metrics.totalBusyUs, (unsigned int)metrics.lastCycles);
+           metrics.decisions, metrics.activations, metrics.totalBusyTargetMs,
+           metrics.totalBusyUs, (unsigned int)metrics.lastBusyTargetMs);
     fflush(stdout);
 }
 
 /** Apply one complete randomized-load configuration from the control pipe. */
-static bool configureThreadLoad(uint32_t minimumCycles,
-                                uint32_t maximumCycles, uint32_t weight) {
+static bool configureThreadLoad(uint32_t minimumBusyMs,
+                                uint32_t maximumBusyMs, uint32_t weight) {
     const UartDmaThreadLoadConfig_t config = {
         .weightPercent = weight,
-        .minimumCycles = minimumCycles,
-        .maximumCycles = maximumCycles,
-        .systemClockHz = uartReceiver.sourceClockHz,
+        .minimumBusyMs = minimumBusyMs,
+        .maximumBusyMs = maximumBusyMs,
     };
     if (!UartDmaThreadLoad_Configure(&config)) {
         puts("ERROR  Thread load requires weight 0..100 and min<=max unless max is zero");
@@ -170,7 +204,7 @@ static bool configureThreadLoad(uint32_t minimumCycles,
 
 /** Reconfigure the simulated LPUART at a packet boundary. */
 static void configureUartTiming(uint32_t sourceClockHz, uint32_t baud) {
-    (void)pthread_mutex_lock(&uartTimingMutex);
+    lockUartTiming();
     (void)AppLpuartSim_Configure(&uartReceiver, sourceClockHz, baud);
     /* The host UART remains configured for the requested line rate while the
      * KW47 transmitter runs at the rounded BAUD[OSR]/BAUD[SBR] result. */
@@ -184,11 +218,7 @@ static void configureUartTiming(uint32_t sourceClockHz, uint32_t baud) {
         .phase = 0U,
     };
     reportUartTiming();
-    (void)pthread_mutex_unlock(&uartTimingMutex);
-    UartDmaThreadLoadMetrics_t load;
-    UartDmaThreadLoad_GetMetrics(&load);
-    load.config.systemClockHz = sourceClockHz;
-    (void)UartDmaThreadLoad_Configure(&load.config);
+    unlockUartTiming();
 }
 
 /** Running verification state for the chunked deterministic transfer protocol. */
@@ -373,9 +403,28 @@ static void sendDashboardPacket(const char *encodedPacket) {
     fflush(stdout);
 }
 
+/** Reproduce wire arrival time between frames from a batched host read. */
+static void paceInboundFrame(InboundPacer_t *pacer, uint16_t length,
+                             uint32_t baud) {
+    if (pacer == NULL || !pacer->enabled || baud == 0U) return;
+    const uint64_t now = UartDma_PlatformTimeUs();
+    if (pacer->deadlineUs == 0U || now > pacer->deadlineUs + 5000ULL) {
+        pacer->deadlineUs = now;
+    }
+    pacer->deadlineUs += ((uint64_t)length * 8000000ULL + baud - 1ULL) / baud;
+    /* Pace in roughly 5 ms groups.  Sub-millisecond frame-by-frame sleeps
+     * accumulate host scheduler overhead and make RX slower than TX, while a
+     * 5 ms group remains smaller than the 16-packet queue at 4 Mbaud. */
+    if (pacer->deadlineUs > now + 4999ULL) {
+        uint64_t delayMs = (pacer->deadlineUs - now) / 1000ULL;
+        if (delayMs > UINT32_MAX) delayMs = UINT32_MAX;
+        vTaskDelay(pdMS_TO_TICKS((uint32_t)delayMs));
+    }
+}
+
 /** Adapter from serial-ingress callbacks to simulated DMA injection. */
 static void handleSerialFrame(const uint8_t *frame, uint16_t length, void *context) {
-    (void)context;
+    InboundPacer_t *const pacer = context;
     const uint32_t before = UartDma_GetRxInterruptCount();
     uint8_t testFlags = 0U;
     uint32_t testReceivedSize = 0U;
@@ -390,13 +439,13 @@ static void handleSerialFrame(const uint8_t *frame, uint16_t length, void *conte
         invalidTestFramingErrors = 0U;
     }
     static uint8_t sampledFrame[MAX_WIRE_FRAME];
-    (void)pthread_mutex_lock(&uartTimingMutex);
+    lockUartTiming();
     const AppLpuartSimulationResult_t simulation = AppLpuartSim_Receive(
         &uartReceiver, frame, sampledFrame, length);
     const uint32_t clock = uartReceiver.sourceClockHz;
     const uint32_t requested = uartReceiver.requestedBaud;
     const uint32_t actual = uartReceiver.actualBaud;
-    (void)pthread_mutex_unlock(&uartTimingMutex);
+    unlockUartTiming();
     if (!simulation.valid) {
         if (isTestTransfer) {
             invalidTestPackets++;
@@ -434,27 +483,26 @@ static void handleSerialFrame(const uint8_t *frame, uint16_t length, void *conte
     } else {
         reportRxIrqStats(after - before);
     }
+    paceInboundFrame(pacer, length, requested);
 }
 
-/** Write an entire byte span while the caller owns the pseudo-UART TX lock.
+/** Write an entire byte span while the caller owns the local TX lock.
  *
- * The pseudo-terminal is nonblocking. Bulk traffic waits for actual descriptor
- * writability instead of imposing one complete RTOS tick for every partial
- * write. The FreeRTOS-owned serialization token allows other TX tasks to block
- * cooperatively while the independent serial-reader task continues draining
- * simultaneous traffic in the opposite direction.
+ * The local transport is nonblocking. The FreeRTOS-owned serialization token
+ * allows other TX tasks to block cooperatively while the independent reader
+ * task continues draining simultaneous traffic in the opposite direction.
  */
 static bool writeAllUnlocked(const uint8_t *data, size_t size,
                              bool bulkTransfer) {
     size_t written = 0U;
     while (written < size && !stopRequested) {
-        const ssize_t result = write(ptyMaster, &data[written], size - written);
+        const int result = AppServerTransport_Write(
+            &localTransport, &data[written], size - written);
         if (result > 0) {
             written += (size_t)result;
-        } else if (errno == EAGAIN || errno == EINTR) {
+        } else if (result == 0) {
             if (bulkTransfer) {
-                struct pollfd output = {ptyMaster, POLLOUT, 0};
-                (void)poll(&output, 1U, 1);
+                AppServerTransport_WaitWritable(&localTransport, 1U);
             } else {
                 vTaskDelay(pdMS_TO_TICKS(1U));
             }
@@ -466,7 +514,7 @@ static bool writeAllUnlocked(const uint8_t *data, size_t size,
 }
 
 /** Write one complete span without interleaving another server transmission.
- * @param data Bytes to place on the pseudo-UART.
+ * @param data Bytes to place on the local transport.
  * @param size Number of valid bytes in @p data.
  * @param bulkTransfer Whether backpressure should yield without a fixed delay.
  * @return `true` after the complete span has been written.
@@ -503,13 +551,13 @@ static void paceTestTransfer(uint64_t startedUs, uint32_t logicalBytes,
 /** Host implementation of the platform TX DMA hook. */
 void UartDma_PlatformTransmitDma(uint8_t *data, uint16_t size) {
     static uint8_t sampled[MAX_WIRE_FRAME];
-    (void)pthread_mutex_lock(&uartTimingMutex);
+    lockUartTiming();
     const AppLpuartSimulationResult_t simulation = AppLpuartSim_Receive(
         &hostReceiver, data, sampled, size);
     const uint32_t clock = uartReceiver.sourceClockHz;
     const uint32_t requested = uartReceiver.requestedBaud;
     const uint32_t actual = uartReceiver.actualBaud;
-    (void)pthread_mutex_unlock(&uartTimingMutex);
+    unlockUartTiming();
     if (!simulation.valid) {
         printf("WARNING UART SIM TX packet invalid: bytes=%u changed=%u framing=%u clock=%u requested=%u actual=%u\n",
                (unsigned int)size, (unsigned int)simulation.changedBytes,
@@ -546,8 +594,8 @@ static void onHciCommand(uint16_t opcode, uint8_t parameterLength,
             memcpy(&request, parameters, sizeof(request));
             if (memcmp(request.signature, "LOAD", sizeof(request.signature)) != 0 ||
                 !configureThreadLoad(
-                    BleHciWire_FromLe32(request.minimum_cycles_le),
-                    BleHciWire_FromLe32(request.maximum_cycles_le),
+                    BleHciWire_FromLe32(request.minimum_busy_ms_le),
+                    BleHciWire_FromLe32(request.maximum_busy_ms_le),
                     request.weight_percent)) {
                 completionStatus = 0x12U;
             }
@@ -583,19 +631,45 @@ static void onHciCommand(uint16_t opcode, uint8_t parameterLength,
     (void)UartDma_SendPacket(&response, pdMS_TO_TICKS(100U));
 }
 
+/** Read one dashboard-control byte without blocking the scheduler. */
+static int readControlByte(char *byte) {
+#ifdef _WIN32
+    const HANDLE input = GetStdHandle(STD_INPUT_HANDLE);
+    if (input == NULL || input == INVALID_HANDLE_VALUE) return 0;
+    if (GetFileType(input) == FILE_TYPE_CHAR) {
+        if (!_kbhit()) return 0;
+        *byte = (char)_getch();
+        return 1;
+    }
+    DWORD available = 0U;
+    if (!PeekNamedPipe(input, NULL, 0U, NULL, &available, NULL) ||
+        available == 0U) return 0;
+    DWORD received = 0U;
+    return ReadFile(input, byte, 1U, &received, NULL) && received == 1U ? 1 : -1;
+#else
+    const ssize_t count = read(STDIN_FILENO, byte, sizeof(*byte));
+    if (count > 0) return 1;
+    return count < 0 && errno != EAGAIN && errno != EINTR ? -1 : 0;
+#endif
+}
+
 /** Read dashboard/terminal control lines without blocking the scheduler. */
 static void controlReaderTask(void *parameters) {
     (void)parameters;
     char command[2048];
     size_t length = 0U;
+#ifndef _WIN32
     (void)fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK);
+#endif
     while (!stopRequested) {
         char byte;
-        const ssize_t count = read(STDIN_FILENO, &byte, sizeof(byte));
+        const int count = readControlByte(&byte);
         if (count == 1) {
             if (byte == '\n') {
                 command[length] = '\0';
-                if (strcmp(command, "irq") == 0) {
+                if (strcmp(command, "quit") == 0) {
+                    stopRequested = 1;
+                } else if (strcmp(command, "irq") == 0) {
                     setRxMode(UART_DMA_RX_MODE_BYTE_IRQ, false);
                 } else if (strcmp(command, "dma") == 0) {
                     setRxMode(UART_DMA_RX_MODE_DMA_IDLE, false);
@@ -612,22 +686,22 @@ static void controlReaderTask(void *parameters) {
                            (unsigned int)rxDmaTransferSize);
                     fflush(stdout);
                 } else if (strcmp(command, "timing") == 0) {
-                    (void)pthread_mutex_lock(&uartTimingMutex);
+                    lockUartTiming();
                     reportUartTiming();
-                    (void)pthread_mutex_unlock(&uartTimingMutex);
+                    unlockUartTiming();
                 } else if (strcmp(command, "load status") == 0) {
                     reportThreadLoad();
                 } else if (strncmp(command, "load ", 5U) == 0) {
-                    unsigned int minimumCycles = 0U;
-                    unsigned int maximumCycles = 0U;
+                    unsigned int minimumBusyMs = 0U;
+                    unsigned int maximumBusyMs = 0U;
                     unsigned int weight = 0U;
                     char trailing = '\0';
-                    if (sscanf(&command[5], "%u %u %u %c", &minimumCycles,
-                               &maximumCycles, &weight, &trailing) != 3) {
-                        puts("ERROR  Use: load MIN_CYCLES MAX_CYCLES PERCENT");
+                    if (sscanf(&command[5], "%u %u %u %c", &minimumBusyMs,
+                               &maximumBusyMs, &weight, &trailing) != 3) {
+                        puts("ERROR  Use: load MIN_MS MAX_MS PERCENT");
                         fflush(stdout);
                     } else {
-                        (void)configureThreadLoad(minimumCycles, maximumCycles,
+                        (void)configureThreadLoad(minimumBusyMs, maximumBusyMs,
                                                   weight);
                     }
                 } else if (strncmp(command, "clock ", 6U) == 0 ||
@@ -729,9 +803,9 @@ static void outboundTestTask(void *parameters) {
 
         uint32_t offset = 0U;
         const uint64_t startedUs = UartDma_PlatformTimeUs();
-        (void)pthread_mutex_lock(&uartTimingMutex);
+        lockUartTiming();
         const uint32_t transferBaud = uartReceiver.requestedBaud;
-        (void)pthread_mutex_unlock(&uartTimingMutex);
+        unlockUartTiming();
         const uint32_t gaugeTarget = transferBaud / 8U / 60U;
         const uint32_t gaugeStep = gaugeTarget > TEST_TRANSFER_CHUNK_DATA_SIZE
             ? (gaugeTarget / TEST_TRANSFER_CHUNK_DATA_SIZE) *
@@ -783,10 +857,10 @@ static void outboundTestTask(void *parameters) {
             const size_t wireLength = h4Length + sizeof(trailer);
             memcpy(originalWire, &acl, h4Length);
             memcpy(&originalWire[h4Length], &trailer, sizeof(trailer));
-            (void)pthread_mutex_lock(&uartTimingMutex);
+            lockUartTiming();
             const AppLpuartSimulationResult_t simulation = AppLpuartSim_Receive(
                 &hostReceiver, originalWire, sampledWire, wireLength);
-            (void)pthread_mutex_unlock(&uartTimingMutex);
+            unlockUartTiming();
             if (!simulation.valid) {
                 invalidPackets++;
                 changedBytes += (uint32_t)simulation.changedBytes;
@@ -964,18 +1038,33 @@ static void onHciAcl(uint16_t handleFlags, uint16_t dataLength, const uint8_t *d
     }
 }
 
-/** FreeRTOS task that reads the pseudo-terminal and reassembles H4 frames. */
+/** FreeRTOS task that reads the local byte stream and reassembles H4 frames. */
 static void serialReaderTask(void *parameters) {
     (void)parameters;
     static ServerSerialIngress_t ingress;
+    static InboundPacer_t pacer;
+    UBaseType_t currentPriority = SERIAL_NORMAL_TASK_PRIORITY;
     ServerSerialIngress_Init(&ingress);
     static uint8_t input[16U * 1024U];
 
     while (!stopRequested) {
-        const ssize_t count = read(ptyMaster, input, sizeof(input));
+        UartDmaThreadLoadMetrics_t load;
+        UartDmaThreadLoad_GetMetrics(&load);
+        const bool loadEnabled = load.config.maximumBusyMs != 0U;
+        const UBaseType_t desiredPriority = loadEnabled
+            ? SERIAL_INGRESS_TASK_PRIORITY
+            : SERIAL_NORMAL_TASK_PRIORITY;
+        if (desiredPriority != currentPriority) {
+            currentPriority = desiredPriority;
+            vTaskPrioritySet(NULL, currentPriority);
+        }
+        pacer.enabled = loadEnabled;
+        if (!loadEnabled) pacer.deadlineUs = 0U;
+        const int count = AppServerTransport_Read(
+            &localTransport, input, sizeof(input));
         if (count > 0) {
             ServerSerialIngress_Feed(&ingress, input, (size_t)count,
-                                     handleSerialFrame, NULL);
+                                     handleSerialFrame, &pacer);
         } else {
             vTaskDelay(SERIAL_POLL_TICKS);
         }
@@ -984,12 +1073,11 @@ static void serialReaderTask(void *parameters) {
     vTaskEndScheduler();
 }
 
-/** Create the pseudo-UART and run the continuous FreeRTOS scheduler. */
+/** Create the local simulator endpoint and run the FreeRTOS scheduler. */
 int main(void) {
-    char slaveName[128];
-    ptyMaster = PseudoUart_Open(slaveName, sizeof(slaveName));
-    if (ptyMaster < 0) {
-        perror("Unable to create pseudo UART");
+    char endpoint[128];
+    if (!AppServerTransport_Open(&localTransport, endpoint, sizeof(endpoint))) {
+        perror("Unable to create local simulator transport");
         return 1;
     }
 
@@ -1002,38 +1090,40 @@ int main(void) {
     BleHci_SetAclHandler(onHciAcl);
     UartDmaSystem_Init();
     ptyTxToken = xSemaphoreCreateBinary();
-    if (ptyTxToken == NULL) {
-        PseudoUart_Close(ptyMaster);
+    uartTimingToken = xSemaphoreCreateBinary();
+    if (ptyTxToken == NULL || uartTimingToken == NULL) {
+        AppServerTransport_Close(&localTransport);
         return 1;
     }
     (void)xSemaphoreGive(ptyTxToken);
+    (void)xSemaphoreGive(uartTimingToken);
     configureUartTiming(DEFAULT_SYSTEM_CLOCK_HZ, DEFAULT_LINE_BAUD);
     setRxMode(UART_DMA_RX_MODE_DMA_IDLE, false);
 
     if (xTaskCreate(serialReaderTask, "Serial_RX", configMINIMAL_STACK_SIZE + 256U,
-                    NULL, tskIDLE_PRIORITY + 1U, NULL) != pdPASS) {
-        PseudoUart_Close(ptyMaster);
+                    NULL, SERIAL_NORMAL_TASK_PRIORITY, NULL) != pdPASS) {
+        AppServerTransport_Close(&localTransport);
         return 1;
     }
     if (xTaskCreate(controlReaderTask, "Mode_Control", configMINIMAL_STACK_SIZE + 128U,
-                    NULL, tskIDLE_PRIORITY + 1U, NULL) != pdPASS) {
-        PseudoUart_Close(ptyMaster);
+                    NULL, SERVER_CONTROL_TASK_PRIORITY, NULL) != pdPASS) {
+        AppServerTransport_Close(&localTransport);
         return 1;
     }
     if (xTaskCreate(outboundTestTask, "Dashboard_TX", configMINIMAL_STACK_SIZE + 512U,
                     NULL, tskIDLE_PRIORITY + 1U, NULL) != pdPASS) {
-        PseudoUart_Close(ptyMaster);
+        AppServerTransport_Close(&localTransport);
         return 1;
     }
 
     puts("Continuous BLE C UART server is running.");
-    printf("In the Python app, type this port manually: %s\n", slaveName);
-    puts("Pseudo-UART bytes are passed through the configured KW47 LPUART sampler.");
-    puts("Use 'clock HZ', 'baud RATE', and 'load MIN MAX PERCENT' (0% disables).");
+    printf("Local simulator endpoint: %s\n", endpoint);
+    puts("Local bytes are passed through the configured KW47 LPUART sampler.");
+    puts("Use 'clock HZ', 'baud RATE', and 'load MIN_MS MAX_MS PERCENT' (MAX_MS=0 disables).");
     puts("Press Ctrl-C to stop.");
     vTaskStartScheduler();
 
-    PseudoUart_Close(ptyMaster);
+    AppServerTransport_Close(&localTransport);
     puts("BLE C UART server stopped.");
     return 0;
 }

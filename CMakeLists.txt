@@ -100,24 +100,39 @@ endif()
 
 option(UART_DMA_BUILD_SERVER "Build the continuous BLE-side UART server" ON)
 
-if(UNIX AND UART_DMA_BUILD_SERVER)
+if((UNIX OR WIN32) AND UART_DMA_BUILD_SERVER)
     add_executable(ble_uart_server
         apps/ble_uart_server.c
         apps/common/lpuart_sim.c
-        apps/server/pseudo_uart.c
+        apps/server/server_transport.c
         apps/server/serial_ingress.c
     )
+    if(UNIX)
+        target_sources(ble_uart_server PRIVATE apps/server/pseudo_uart.c)
+    endif()
     target_include_directories(ble_uart_server PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/apps/common")
     target_include_directories(ble_uart_server PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/apps/server")
     target_link_libraries(ble_uart_server PRIVATE uart_dma)
-    target_compile_definitions(ble_uart_server PRIVATE _DEFAULT_SOURCE)
+    if(UNIX)
+        target_compile_definitions(ble_uart_server PRIVATE _DEFAULT_SOURCE)
+    endif()
 
     find_library(UTIL_LIBRARY util)
     if(UTIL_LIBRARY)
         target_link_libraries(ble_uart_server PRIVATE "${UTIL_LIBRARY}")
     endif()
 
-    target_compile_options(ble_uart_server PRIVATE -Wall -Wextra -Werror)
+    if(MSVC)
+        target_compile_options(ble_uart_server PRIVATE /W4 /WX)
+    else()
+        target_compile_options(ble_uart_server PRIVATE -Wall -Wextra -Werror)
+    endif()
+    if(MINGW)
+        # Keep the bundled simulator engine self-contained.  In particular,
+        # FreeRTOS' Windows port must not require a separately installed
+        # libwinpthread DLL beside the GUI.
+        target_link_options(ble_uart_server PRIVATE -static -static-libgcc)
+    endif()
 endif()
 
 option(UART_DMA_BUILD_CLIENT "Build the C UART HCI client" ON)
@@ -239,7 +254,7 @@ if(UART_DMA_BUILD_PORTABLE_UI)
         COMMENT "Bundling the shared readable UI font"
     )
 
-    if(UNIX AND TARGET ble_uart_server)
+    if((UNIX OR WIN32) AND TARGET ble_uart_server)
         add_executable(ble_uart_server_ui
             apps/ble_uart_server_ui.c
             apps/common/dashboard_config.c
@@ -255,8 +270,12 @@ if(UART_DMA_BUILD_PORTABLE_UI)
             UART_DMA_UI_FONT_FILE="SpaceGrotesk-Regular.ttf"
             UART_DMA_UI_DISPLAY_FONT_FILE="SpaceGrotesk-Bold.ttf")
         target_compile_features(ble_uart_server_ui PRIVATE c_std_11)
-        target_compile_definitions(ble_uart_server_ui PRIVATE _DEFAULT_SOURCE)
-        target_compile_options(ble_uart_server_ui PRIVATE -Wall -Wextra)
+        if(MSVC)
+            target_compile_options(ble_uart_server_ui PRIVATE /W4)
+        else()
+            target_compile_definitions(ble_uart_server_ui PRIVATE _DEFAULT_SOURCE)
+            target_compile_options(ble_uart_server_ui PRIVATE -Wall -Wextra)
+        endif()
 
         if(APPLE)
             set_target_properties(ble_uart_server_ui PROPERTIES
@@ -272,6 +291,15 @@ if(UART_DMA_BUILD_PORTABLE_UI)
                         "$<TARGET_FILE:ble_uart_server>"
                         "$<TARGET_BUNDLE_DIR:ble_uart_server_ui>/Contents/MacOS/ble_uart_server_engine"
                 COMMENT "Bundling the continuous FreeRTOS BLE server engine"
+            )
+        elseif(WIN32)
+            set_target_properties(ble_uart_server_ui PROPERTIES
+                WIN32_EXECUTABLE TRUE OUTPUT_NAME "BLE UART Server")
+            add_custom_command(TARGET ble_uart_server_ui POST_BUILD
+                COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+                        "$<TARGET_FILE:ble_uart_server>"
+                        "$<TARGET_FILE_DIR:ble_uart_server_ui>/ble_uart_server_engine.exe"
+                COMMENT "Bundling the Windows Local Simulator engine"
             )
         endif()
         add_custom_command(TARGET ble_uart_server_ui POST_BUILD
@@ -328,7 +356,7 @@ if(BUILD_TESTING)
                     -s "${CMAKE_CURRENT_SOURCE_DIR}/python/tests"
                     -p "test_*.py"
         )
-        if(UNIX AND TARGET ble_uart_server)
+        if((UNIX OR WIN32) AND TARGET ble_uart_server)
             add_test(
                 NAME ble_uart_bidirectional_tests
                 COMMAND "${Python3_EXECUTABLE}"
@@ -338,6 +366,13 @@ if(BUILD_TESTING)
                         --ring 16384 --dma 256 --max-ratio 1.20
             )
             set_tests_properties(ble_uart_bidirectional_tests PROPERTIES TIMEOUT 30)
+            add_test(
+                NAME ble_uart_busy_load_tests
+                COMMAND "${Python3_EXECUTABLE}"
+                        "${CMAKE_CURRENT_SOURCE_DIR}/tools/test_busy_load_liveness.py"
+                        "$<TARGET_FILE:ble_uart_server>"
+            )
+            set_tests_properties(ble_uart_busy_load_tests PROPERTIES TIMEOUT 30)
             add_test(
                 NAME ble_uart_buffer_effect_tests
                 COMMAND "${Python3_EXECUTABLE}"

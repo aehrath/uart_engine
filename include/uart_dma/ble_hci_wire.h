@@ -253,10 +253,10 @@ typedef struct BLE_HCI_WIRE_PACKED {
     char signature[4];
     /** Random-range weight from 0 through 100. */
     uint8_t weight_percent;
-    /** Inclusive minimum target CPU cycles in little-endian order. */
-    uint32_t minimum_cycles_le;
-    /** Inclusive maximum cycles; zero disables competing work. */
-    uint32_t maximum_cycles_le;
+    /** Inclusive minimum busy milliseconds in little-endian order. */
+    uint32_t minimum_busy_ms_le;
+    /** Inclusive maximum busy milliseconds; zero disables competing work. */
+    uint32_t maximum_busy_ms_le;
 } BleHciThreadLoadCommandParameters_t;
 
 /** Parameters carried by a synchronized RX-mode vendor event. */

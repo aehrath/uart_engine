@@ -62,21 +62,30 @@ Byte mode counts one receiver IRQ per received wire byte. DMA mode counts
 `ceil(frame bytes / DMA size)` transaction completions. The adjacent **Ring**
 and **DMA** selectors set the IDLE-delimited frame capacity and maximum DMA
 transaction size, respectively.
-The matching inline **Busy min**, **Busy max**, and **R%** fields configure the
+The matching inline **Busy ms** minimum/maximum fields and **R%** configure the
 competing task. Maximum zero disables it; otherwise R% weights the random offset
 from minimum toward maximum. After server identity verification, the Python
 client sends these three values in a typed vendor HCI command. Defaults set all
 three values to zero. Empty numeric fields also become zero when they lose
 focus, and legacy saved load formats migrate to the disabled all-zero state.
 Tab and Shift+Tab move through these and the other editable fields, while dragging vertically changes
-their values (1,000 cycles per step for min/max and one percent for R%). Raising
-minimum past maximum automatically brings maximum up to the same value; maximum
-can still be set back to zero to disable the workload.
+their values (1 ms per step for min/max and one percent for R%). Raising
+minimum past maximum automatically brings maximum up to the same value. Lowering
+maximum below minimum brings minimum down to match instead of swapping the
+values; maximum zero lowers minimum to zero and disables the workload.
+The engine leaves a fixed 10 ms idle interval after each busy burst so a long
+duration creates measurable contention without permanently starving the server.
 The ring menu includes 32 B, 64 B, 128 B, and 256 B alongside its larger sizes,
 matching the small DMA choices.
 The background reader continuously drains configured DMA-sized transactions;
 ring capacity validates each completed H4 frame and does not throttle bytes to
 one ring-capacity span per Tk refresh.
+
+On Windows, **Local Simulator** appears at the top of the port menu. It uses the
+server's built-in named pipe and requires no virtual COM software or elevated
+setup. The pipe only carries bytes: baud pacing, KW47 sampling, DMA grouping,
+IRQ accounting, ring capacity, and randomized task timing remain in the same
+server engine used by physical and POSIX transports.
 
 All four send buttons are half-duplex controls. They disable while this client
 is sending a test transfer and from each incoming test START through its END,
@@ -90,10 +99,13 @@ only when the measured producer rate exceeds the consumer rate.
 The graph also retains queue (**Q%**), ring (**R%**), and DMA (**D%**) peak
 utilization as percentages of their selected capacities, clamped at 100%.
 Short ring and DMA peaks remain visible for one half-second display interval,
-then clear on the next quiet sample.
+then clear on the next quiet sample. The Q/R peak meters retain the largest
+percentages still visible in the one-minute graph history.
 The monitor repaints at 20 Hz, labels its horizontal meters **Q PEAK** and
 **R PEAK**, and shows one-decimal percentages. Overlapping DMA and ring graph
 traces remain separately visible through a wide-gray/amber-centerline style.
+A roughly 255-byte test frame produces about 24.9% R PEAK with a 1 KiB ring and
+nearly 100% with a 256 B ring. Consumer backlog accumulates in Q instead.
 
 The IRQ dashboard count is local to this Python process and accumulates while
 incoming serial bytes are consumed through the selected receive path.

@@ -174,8 +174,9 @@ class PipelineMonitor(tk.Canvas):
             values = (p.producer_bps, p.consumer_bps, p.queue_depth,
                       p.queue_capacity, p.ring_burst, p.ring_capacity,
                       p.latency_us, p.headroom_us, p.crc_drops,
-                      p.queue_drops, p.ring_drops)
-        pbps, cbps, queued, qcap, burst, rcap, latency, headroom, crc, qdrop, rdrop = values
+                      p.queue_drops, p.ring_drops, p.queue_peak, p.ring_peak)
+        (pbps, cbps, queued, qcap, burst, rcap, latency, headroom, crc,
+         qdrop, rdrop, live_queue_peak, live_ring_peak) = values
         self.delete("all")
         width, height = max(1, self.winfo_width()), max(1, self.winfo_height())
         body = font_family()
@@ -220,18 +221,26 @@ class PipelineMonitor(tk.Canvas):
                 self.create_oval(x-2.5, y-2.5, x+2.5, y+2.5,
                                  fill=color, outline=color)
 
-        def gauge(label: str, current: int, capacity: int, y: int, color: str) -> None:
-            percentage = min(100.0, current * 100.0 / capacity) if capacity else 0.0
+        def gauge(label: str, percentage: float, y: int, color: str) -> None:
+            percentage = min(100.0, max(0.0, percentage))
             self.create_text(12, y-2, anchor=tk.NW, fill="#8F9EB5",
                              font=(body, -10), text=f"{label} {percentage:.1f}%")
             gx0, gx1 = 106, width - 12
             self._rounded(gx0, y, gx1, y+8, 4, "#232D41")
-            fraction = min(1.0, current / capacity) if capacity else 0.0
+            fraction = percentage / 100.0
             if fraction:
                 self._rounded(gx0, y, gx0+(gx1-gx0)*fraction, y+8, 4, color)
 
-        gauge("Q PEAK", queued, qcap, 78, "#A78BFA")
-        gauge("R PEAK", burst, rcap, 95, "#4C94FF")
+        queue_peak = max(
+            [0.0, *queue_usage,
+             min(100.0, 100.0 * max(queued, live_queue_peak) / qcap)
+             if qcap else 0.0])
+        ring_peak = max(
+            [0.0, *ring_usage,
+             min(100.0, 100.0 * max(burst, live_ring_peak) / rcap)
+             if rcap else 0.0])
+        gauge("Q PEAK", queue_peak, 78, "#A78BFA")
+        gauge("R PEAK", ring_peak, 95, "#4C94FF")
         color = "#FF7878" if headroom is not None and headroom < 2_000_000 else (
             "#FFC45C" if headroom is not None and headroom < 10_000_000 else "#8F9EB5")
         self.create_text(12, 114, anchor=tk.NW, fill=color, font=(body, -10),

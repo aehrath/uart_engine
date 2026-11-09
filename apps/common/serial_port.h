@@ -11,16 +11,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
-#include <windows.h>
-#endif
-
 /** Open serial-port state with a platform-native handle. */
 typedef struct {
 #ifdef _WIN32
-    /** Windows communications handle. */
-    HANDLE handle;
+    /** Opaque Windows communications or named-pipe handle. */
+    void *handle;
+    /** Whether the handle is the driver-free local simulator named pipe. */
+    bool localSimulator;
 #else
     /** POSIX file descriptor. */
     int descriptor;

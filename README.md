@@ -106,13 +106,14 @@ documentation targets.
 
 ### Platform notes
 
-- The continuous pseudo-UART server and graphical server supervisor build on
-  macOS and Linux because they use POSIX pseudo-terminals.
+- The continuous server and graphical supervisor build on macOS, Linux, and
+  Windows. POSIX builds expose a pseudo-terminal; Windows exposes the built-in
+  driver-free **Local Simulator** endpoint.
 - The portable C graphical client builds on macOS, Linux, and Windows.
 - The Python Tk client runs on macOS, Linux, and Windows and can connect either
   to the local pseudo-UART or to a physical serial adapter.
-- A physical UART is not required for local testing. The server prints a local
-  pseudo-UART slave path for the clients.
+- A physical UART is not required for local testing. Windows users do not need
+  a virtual COM driver, administrator access, or a manually configured port pair.
 
 Typical macOS prerequisites can be installed with:
 
@@ -197,7 +198,7 @@ All options default to `ON` unless the platform cannot support the target.
 | Option | Purpose |
 | --- | --- |
 | `UART_DMA_BUILD_DEMO` | Build the native FreeRTOS UART/DMA round-trip demo. |
-| `UART_DMA_BUILD_SERVER` | Build the continuous POSIX pseudo-UART server. |
+| `UART_DMA_BUILD_SERVER` | Build the continuous local UART simulator (POSIX PTY or Windows named pipe). |
 | `UART_DMA_BUILD_CLIENT` | Build the pure-C command-line UART client. |
 | `UART_DMA_BUILD_PORTABLE_UI` | Build the raylib/raygui graphical dashboards. |
 | `UART_DMA_BUILD_APP` | Build the macOS wrapper for the native demo. |
@@ -233,8 +234,9 @@ build/docs/html/index.html
 ```
 
 On Linux, the graphical applications are normally executables named
-`ble_uart_server_ui` and `ble_uart_client_ui`. On Windows, the portable client
-is emitted as an `.exe`; the POSIX pseudo-UART server is not built.
+`ble_uart_server_ui` and `ble_uart_client_ui`. Windows emits both graphical
+applications as `.exe` files and places the Local Simulator engine beside the
+server dashboard.
 
 ## Run the graphical server and a client
 
@@ -243,9 +245,9 @@ is emitted as an `.exe`; the POSIX pseudo-UART server is not built.
 1. Build the project.
 2. Start the graphical server.
 3. Click **Start server**.
-4. Wait for the **Pseudo-UART** field to display a path such as
-   `/dev/ttys012` or `/dev/pts/5`.
-5. Click **Copy port**, or select and copy the path manually.
+4. On macOS or Linux, wait for the **Pseudo-UART** field to display a path such
+   as `/dev/ttys012` or `/dev/pts/5`, then copy it into the client. On Windows,
+   leave the client selector on **Local Simulator**; there is no path to copy.
 6. Start either the C graphical client or the Python graphical client.
 7. Paste the path into the client's **Port** field.
 8. Confirm **Clock = 20 MHz**, **Baud = 4 M**, **Ring = 16 KiB**, and
@@ -268,9 +270,16 @@ Linux:
 ./build/ble_uart_server_ui
 ```
 
+Windows PowerShell:
+
+```powershell
+& ".\build\BLE UART Server.exe"
+```
+
 The graphical server is a supervisor. Clicking **Start server** launches the
-real `ble_uart_server` engine as a child process, connects nonblocking control
-and log pipes, and displays the pseudo-UART created by that engine.
+real `ble_uart_server` engine as a child process and connects nonblocking
+control and log pipes. POSIX displays the pseudo-UART created by that engine;
+Windows displays the stable **Local Simulator** endpoint.
 
 ### Start the portable C graphical client
 
@@ -292,7 +301,19 @@ Windows:
 .\build\ble_uart_client_ui.exe
 ```
 
-Use a Windows device name such as `COM3` when connecting to physical hardware.
+For local testing, start the server dashboard and leave the client port set to
+**Local Simulator**. No virtual ports need to be installed or paired. Use a
+Windows device name such as `COM3` only when connecting to physical hardware.
+
+### Windows Local Simulator timing
+
+The Windows named pipe is only a byte-stream carrier; it is never treated as a
+clock source. Received bytes still pass through the same configured KW47 LPUART
+sampler, ring buffer, DMA transaction boundaries, FreeRTOS queues, IRQ handlers,
+randomized workload task, and baud pacing used by the POSIX server. Consequently,
+20 MHz / 4 Mbaud timing and buffer behavior are calculated identically on every
+desktop platform. Host scheduling jitter remains measured telemetry rather than
+silently changing the configured simulated baud.
 
 ### Start the Python graphical client
 
@@ -480,7 +501,7 @@ Client controls:
 - **Clock**, **Ring**, and **DMA** configure the local receive simulation.
 - **Per-byte IRQ** selects byte-interrupt receive accounting instead of the
   default DMA/IDLE accounting.
-- **Busy min**, **Busy max**, and **R%** are the three inline competing-thread
+- **Busy ms** minimum/maximum fields and **R%** are the three inline competing-thread
   controls. A zero maximum disables the workload. Client changes are sent to
   the verified server as a typed HCI vendor command.
 - **Defaults** restores and saves the baseline settings listed below.
@@ -500,9 +521,10 @@ focus leaves the field. Older saved load formats are migrated to the disabled
 `0 / 0 / 0%` state instead of accidentally enabling background work.
 Within the busy-work group, Tab and Shift+Tab move forward and backward through
 the three fields. Drag upward or downward inside a field to increase or decrease
-it; min/max move in 1,000-cycle steps and R% moves in one-percent steps. Raising
-the minimum above the current maximum raises the maximum to match. You can still
-set maximum to `0` explicitly to disable the workload.
+it; min/max move in 1 ms steps and R% moves in one-percent steps. Raising
+the minimum above the current maximum raises the maximum to match. Lowering the
+maximum below the current minimum lowers the minimum to match, including when
+maximum is set to `0` to disable the workload. Endpoints are never swapped.
 
 ### HCI command builder
 
@@ -608,7 +630,7 @@ The server reads the following newline-terminated commands from standard input:
 | `tx HEX_BYTES` | Queue one H4 packet represented as hexadecimal bytes. |
 | `test BYTES` | Start a deterministic server-to-client test transfer. |
 | `load status` | Print the current randomized task configuration and measured activity. |
-| `load MIN MAX PERCENT` | Set the minimum and maximum busy cycles and the random-range weight. A zero maximum disables the task. |
+| `load MIN_MS MAX_MS PERCENT` | Set the minimum and maximum busy milliseconds and the random-range weight. A zero maximum disables the task. |
 
 Do not resize the ring or DMA transaction while an inbound test transfer is
 active. The engine rejects that reconfiguration because buffer geometry must
@@ -662,7 +684,7 @@ response, prints its CRC result, and exits with a nonzero status on failure.
 | DMA | 32 B, 64 B, 128 B, 256 B, 512 B, 1 KiB, 4 KiB | 256 B |
 | Block | 16 KiB, 64 KiB, 128 KiB, 512 KiB, 1, 2, 4, 8, 16 MiB | 2 MiB |
 | IRQ mode | DMA + IDLE or Per-byte IRQ | DMA + IDLE |
-| Random load | Minimum busy cycles, maximum busy cycles, random weight 0–100% | 0, 0, 0% (disabled) |
+| Random load | Minimum busy ms, maximum busy ms, random weight 0–100% | 0, 0, 0% (disabled) |
 
 ### Randomized full-system thread load
 
@@ -674,14 +696,21 @@ applied:
 
 ```text
 random offset = random(0, maximum - minimum) * R% / 100
-busy cycles   = minimum + random offset
-busy time     = busy cycles / selected system clock
+busy time ms  = minimum + random offset
 ```
 
 The task runs at `tskIDLE_PRIORITY + 2`: above the application consumer and
 ordinary server helper tasks, but below the UART producer and TX tasks. This
 models unrelated work in a complete embedded system that delays packet
 consumption without unrealistically blocking the critical receive producer.
+While synthetic workload is enabled, desktop transport ingress rises above that
+workload but remains one level below the critical producer. Bytes therefore keep
+reaching simulated DMA and each IDLE event can preempt ingress to drain the
+ring, rather than waiting harmlessly in the host PTY or named pipe. With load
+disabled, ingress returns to normal application priority so ordinary transfers
+retain their symmetric wire-rate behavior. Server controls remain above
+synthetic workload so overload can be disabled or the engine stopped
+immediately.
 Queue pressure, measured latency, headroom, and genuine queue/ring drops are
 therefore allowed to emerge from scheduling.
 
@@ -689,12 +718,18 @@ At `0%`, every burst stays at the minimum. At `100%`, the complete minimum-to-
 maximum range is available. Intermediate percentages progressively widen the
 random range toward the maximum; they are not an activation probability or CPU
 duty-cycle target. Equal nonzero minimum and maximum values create fixed-length
-busy bursts. The selected system clock converts cycles to elapsed time.
+busy bursts. Busy milliseconds are wall-clock durations and therefore remain
+unchanged when the simulated LPUART system clock is changed.
 
-For example, `load 50000 250000 35` uses a minimum of 50,000 cycles and allows
-35 percent of the 200,000-cycle random span. `load 0 0 0` disables the task.
-`load status` reports the configured values, burst count, total cycles, measured
-busy microseconds, most recent burst, and current busy state.
+The load task leaves a fixed 10 ms idle interval after every completed burst.
+This prevents a burst longer than 10 ms from entering deadline catch-up and
+permanently starving the receiver, server controls, or shutdown path. Longer
+busy values still raise contention and buffer pressure as intended.
+
+For example, `load 2 10 35` uses a minimum of 2 ms and allows 35 percent of the
+8 ms random span. `load 0 0 0` disables the task. `load status` reports the
+configured values, burst count, total target milliseconds, measured busy
+microseconds, most recent burst, and current busy state.
 
 ### KW47 LPUART model
 
@@ -772,17 +807,25 @@ The lower dashboard monitor distinguishes current rates from buffer pressure:
 - Purple **Q%** is peak completed-packet queue utilization.
 - Amber **R%** is peak circular-ring utilization.
 - Gray **D%** is peak DMA transaction utilization.
-- **Q PEAK** shows packet queue occupancy as a percentage of 16 slots.
-- **R PEAK** shows ring occupancy as a percentage of selected ring capacity.
+- **Q PEAK** shows the highest packet queue occupancy retained in the visible
+  one-minute history, as a percentage of 16 slots.
+- **R PEAK** shows the highest ring occupancy retained in the visible one-minute
+  history, as a percentage of selected ring capacity.
 - **LATENCY** is measured enqueue-to-consume time.
 - **HEADROOM** is measured time to buffer exhaustion when producer throughput
   exceeds consumer throughput; otherwise it reads `stable`.
 - **DROPS** lists CRC, queue, and ring drops.
 
 All buffer series use percentages of their own configured capacity and clamp at
-100 percent. Short ring and DMA peaks remain visible for one half-second sample
-and clear on the following quiet sample. History retains 120 half-second
+100 percent. Live occupancy clears on the following quiet sample, while the two
+peak meters agree with the highest Q/R spikes still visible in 120 half-second
 samples, or approximately one minute.
+
+Ring pressure is per IDLE-delimited wire frame, not accumulated consumer
+backlog. A roughly 255-byte test frame therefore produces about **24.9% R PEAK**
+with a 1 KiB ring and nearly 100% with a 256 B ring. When busy work blocks the
+consumer, completed-frame backlog accumulates in the 16-slot packet queue, so
+**Q PEAK** is the meter expected to climb toward 100%.
 
 The server polls detailed pipeline state at 10 Hz and aggregates graph points
 at 2 Hz. The Python monitor repaints at 20 Hz while using the same half-second

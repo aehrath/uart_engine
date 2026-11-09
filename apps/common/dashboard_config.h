@@ -62,7 +62,7 @@ void AppDashboardConfig_PresetToFields(size_t presetIndex,
                                        char *parameters,
                                        size_t parameterSize);
 
-/** Parse min/max busy-cycle fields and a 0..100 workload weight. */
+/** Parse min/max busy-millisecond fields and a 0..100 workload weight. */
 bool AppDashboardConfig_ParseThreadLoad(
     const char *minimumText, const char *maximumText, const char *weightText,
     uint32_t *minimum, uint32_t *maximum, uint32_t *weight);

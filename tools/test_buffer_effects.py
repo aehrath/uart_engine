@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "python"))
 
 import serial  # noqa: E402
 from ble_protocol import H4CrcStreamParser, build_test_transfer_frames  # noqa: E402
+from local_simulator import LOCAL_SIMULATOR_NAME, LocalSimulatorPort  # noqa: E402
 
 
 def _read_output(process: subprocess.Popen[str], lines: queue.Queue[str]) -> None:
@@ -39,21 +40,23 @@ def _wait_line(lines: queue.Queue[str], marker: str, timeout: float = 5.0) -> st
     raise TimeoutError(f"server did not report {marker!r}")
 
 
-def _open_port(device: str) -> serial.Serial:
+def _open_port(device: str) -> object:
     """Open a pseudo-UART while tolerating macOS custom-baud rejection."""
+    if device == LOCAL_SIMULATOR_NAME:
+        return LocalSimulatorPort(timeout=0.05)
     try:
         return serial.Serial(device, 4_000_000, timeout=0.05, write_timeout=2.0)
     except (OSError, serial.SerialException):
         return serial.Serial(device, 115_200, timeout=0.05, write_timeout=2.0)
 
 
-def _completion_received(port: serial.Serial, identifier: int,
+def _completion_received(port: object, identifier: int,
                          timeout: float) -> bool:
     """Return whether a matching successful transfer completion arrived."""
     parser = H4CrcStreamParser()
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        for frame in parser.feed(port.read(4096)):
+        for frame in parser.feed(port.read(4096)):  # type: ignore[attr-defined]
             if frame.test_completion == (identifier, 0, 128):
                 return True
     return False
@@ -68,8 +71,8 @@ def run_case(server: pathlib.Path, ring: int, dma: int,
     lines: queue.Queue[str] = queue.Queue()
     threading.Thread(target=_read_output, args=(process, lines), daemon=True).start()
     try:
-        port_line = _wait_line(lines, "type this port manually: ")
-        device = port_line.split("type this port manually: ", 1)[1]
+        port_line = _wait_line(lines, "Local simulator endpoint: ")
+        device = port_line.split("Local simulator endpoint: ", 1)[1]
         identifier = 0x5100 + ring + dma
         frame = next(iter(build_test_transfer_frames(128, identifier)))
         with _open_port(device) as port:

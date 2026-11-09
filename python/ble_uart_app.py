@@ -22,7 +22,8 @@ from ble_protocol import (
     parse_hex,
 )
 from client_preferences import (
-    DashboardSettings, load_port, load_settings, save_port, save_settings,
+    DashboardSettings, couple_busy_range, load_port, load_settings, save_port,
+    save_settings,
 )
 from serial_ports import available_ports
 from dashboard_config import (
@@ -38,6 +39,7 @@ from dashboard_ui import (
     RoundedToggle, configure_styles,
 )
 from lpuart_sim import LpuartSimulator
+from local_simulator import LOCAL_SIMULATOR_NAME, LocalSimulatorPort
 
 
 def run_gui() -> None:
@@ -85,7 +87,7 @@ def run_gui() -> None:
             self.connecting = False
             self.log_line_count = 0
 
-            default_port = "COM3" if sys.platform == "win32" else (
+            default_port = "Local Simulator" if sys.platform == "win32" else (
                 "/dev/ttys006" if sys.platform == "darwin" else "/dev/ttyUSB0")
             self.saved_settings = load_settings("client")
             def selected_label(choices: tuple[tuple[str, int], ...],
@@ -115,9 +117,9 @@ def run_gui() -> None:
             self.dma_buffer_var = tk.StringVar(value=selected_label(
                 DMA_BUFFER_SIZES, self.saved_settings.dma, "256 B"))
             self.load_min_var = tk.StringVar(
-                value=str(self.saved_settings.load_min_cycles))
+                value=str(self.saved_settings.load_min_ms))
             self.load_max_var = tk.StringVar(
-                value=str(self.saved_settings.load_max_cycles))
+                value=str(self.saved_settings.load_max_ms))
             self.load_weight_var = tk.StringVar(
                 value=str(self.saved_settings.load_weight))
             self.ring_buffer_size = dict(RING_BUFFER_SIZES)[self.ring_buffer_var.get()]
@@ -238,8 +240,8 @@ def run_gui() -> None:
             self.connect_button = RoundedActionButton(
                 connection, "Connect", self.toggle_connection, width=144, height=38)
             self.connect_button.place(x=752, y=3)
-            ttk.Label(connection, text="Busy", style="Muted.TLabel").place(
-                x=370, y=3, width=34, height=38)
+            ttk.Label(connection, text="Busy ms", style="Muted.TLabel").place(
+                x=366, y=3, width=42, height=38)
             load_min = RoundedEntry(connection, self.load_min_var)
             load_min.place(x=408, y=3, width=110, height=38)
             ttk.Label(connection, text="..", style="Muted.TLabel").place(
@@ -251,8 +253,8 @@ def run_gui() -> None:
             load_weight = RoundedEntry(connection, self.load_weight_var)
             load_weight.place(x=682, y=3, width=54, height=38)
             load_fields = (
-                (load_min.entry, self.load_min_var, 1000, 0xFFFFFFFF, "minimum"),
-                (load_max.entry, self.load_max_var, 1000, 0xFFFFFFFF, "maximum"),
+                (load_min.entry, self.load_min_var, 1, 0xFFFFFFFF, "minimum"),
+                (load_max.entry, self.load_max_var, 1, 0xFFFFFFFF, "maximum"),
                 (load_weight.entry, self.load_weight_var, 1, 100, "weight"),
             )
             for entry, variable, step, limit, source in load_fields:
@@ -425,8 +427,8 @@ def run_gui() -> None:
                 bulk=dict(TEST_TRANSFER_SIZES)[self.bulk_size_var.get()],
                 byte_irq=self.byte_irq_var.get(),
                 load_weight=self.saved_settings.load_weight,
-                load_min_cycles=self.saved_settings.load_min_cycles,
-                load_max_cycles=self.saved_settings.load_max_cycles)
+                load_min_ms=self.saved_settings.load_min_ms,
+                load_max_ms=self.saved_settings.load_max_ms)
             save_settings("client", self.saved_settings)
 
         def _bind_numeric_drag(self, entry: tk.Entry, variable: tk.StringVar,
@@ -460,6 +462,13 @@ def run_gui() -> None:
                         maximum = 0
                     if value > maximum:
                         self.load_max_var.set(str(value))
+                elif source == "maximum":
+                    try:
+                        minimum = int(self.load_min_var.get() or "0", 10)
+                    except ValueError:
+                        minimum = 0
+                    if value < minimum:
+                        self.load_min_var.set(str(value))
                 return "break"
 
             def release(event: tk.Event) -> str | None:
@@ -487,9 +496,10 @@ def run_gui() -> None:
             except ValueError:
                 self.log_notice("ERROR  Busy values must be decimal integers", "ERROR")
                 return
-            if source == "minimum" and minimum > maximum:
-                maximum = minimum
-                self.load_max_var.set(str(maximum))
+            minimum, maximum = couple_busy_range(
+                minimum, maximum, source or "")
+            self.load_min_var.set(str(minimum))
+            self.load_max_var.set(str(maximum))
             if not (0 <= weight <= 100 and 0 <= minimum <= 0xFFFFFFFF
                     and 0 <= maximum <= 0xFFFFFFFF
                     and (maximum == 0 or minimum <= maximum)):
@@ -497,8 +507,8 @@ def run_gui() -> None:
                     "ERROR  Use max=0 to disable, otherwise min<=max and R%=0..100",
                     "ERROR")
                 return
-            self.saved_settings.load_min_cycles = minimum
-            self.saved_settings.load_max_cycles = maximum
+            self.saved_settings.load_min_ms = minimum
+            self.saved_settings.load_max_ms = maximum
             self.saved_settings.load_weight = weight
             self._save_settings()
             if self.serial_port is not None and not self.handshake_pending:
@@ -509,14 +519,14 @@ def run_gui() -> None:
             settings = self.saved_settings
             parameters = (b"LOAD"
                           + bytes((settings.load_weight,))
-                          + settings.load_min_cycles.to_bytes(4, "little")
-                          + settings.load_max_cycles.to_bytes(4, "little"))
+                          + settings.load_min_ms.to_bytes(4, "little")
+                          + settings.load_max_ms.to_bytes(4, "little"))
             frame = build_hci_command(0xFC02, parameters)
             self.write_frame(
                 frame,
-                f"server busy work: {settings.load_min_cycles}.."
-                f"{settings.load_max_cycles} cycles, R%={settings.load_weight}"
-                + (" (disabled)" if settings.load_max_cycles == 0 else ""))
+                f"server busy work: {settings.load_min_ms}.."
+                f"{settings.load_max_ms} ms, R%={settings.load_weight}"
+                + (" (disabled)" if settings.load_max_ms == 0 else ""))
 
         def restore_default_settings(self) -> None:
             """Restore and immediately apply the documented defaults."""
@@ -540,8 +550,8 @@ def run_gui() -> None:
             self.transport_var.set(
                 "DMA + IDLE" if self.serial_port is not None else "OFFLINE")
             self.saved_settings = defaults
-            self.load_min_var.set(str(defaults.load_min_cycles))
-            self.load_max_var.set(str(defaults.load_max_cycles))
+            self.load_min_var.set(str(defaults.load_min_ms))
+            self.load_max_var.set(str(defaults.load_max_ms))
             self.load_weight_var.set(str(defaults.load_weight))
             self._save_settings()
             if self.serial_port is not None and not self.handshake_pending:
@@ -636,8 +646,10 @@ def run_gui() -> None:
                 simulated_baud = False
                 error: Exception | None = None
                 try:
-                    opened = serial.Serial(port_name, requested_baud, timeout=0.1,
-                                           write_timeout=2.0)
+                    opened = (LocalSimulatorPort(timeout=0.1)
+                              if port_name == LOCAL_SIMULATOR_NAME
+                              else serial.Serial(port_name, requested_baud, timeout=0.1,
+                                                 write_timeout=2.0))
                 except (ValueError, OSError, serial.SerialException) as first_error:
                     error = first_error
                     if port_name.startswith(("/dev/ttys", "/dev/pts/")):
@@ -769,7 +781,7 @@ def run_gui() -> None:
                         data += port.read(waiting)
                     if data:
                         self.rx_queue.put(("data", (data, time.monotonic_ns())))
-                except serial.SerialException as error:
+                except (OSError, serial.SerialException) as error:
                     if not self.stop_reader.is_set():
                         self.rx_queue.put(("error", error))
                     return
@@ -936,7 +948,7 @@ def run_gui() -> None:
                 self.tx_packets += 1
                 self.tx_packets_var.set(str(self.tx_packets))
                 self.log_line("TX", frame[:-2], f"[CRC {frame[-2:].hex().upper()}] {detail}")
-            except serial.SerialException as error:
+            except (OSError, serial.SerialException) as error:
                 self.log_notice(f"ERROR  Serial write failed: {error}", "ERROR")
                 if self.handshake_pending:
                     self.disconnect(
@@ -1032,7 +1044,7 @@ def run_gui() -> None:
                     if port is not None:
                         port.flush()
                     self.rx_queue.put(("tx_done", total_size))
-                except serial.SerialException as error:
+                except (OSError, serial.SerialException) as error:
                     self.rx_queue.put(("error", error))
 
             threading.Thread(target=send_worker, daemon=True).start()

@@ -127,8 +127,8 @@ void AppClientPreferences_DefaultSettings(AppDashboardSettings_t *settings) {
         .bulkBytes = 2U * 1024U * 1024U,
         .byteIrq = false,
         .threadLoadWeightPercent = 0U,
-        .threadLoadMinimumCycles = 0U,
-        .threadLoadMaximumCycles = 0U,
+        .threadLoadMinimumMs = 0U,
+        .threadLoadMaximumMs = 0U,
     };
 }
 
@@ -157,20 +157,20 @@ bool AppClientPreferences_LoadSettings(AppPreferencesScope_t scope,
         else if (sscanf(line, "dma=%u", &value) == 1) loaded.dmaBytes = value;
         else if (sscanf(line, "bulk=%u", &value) == 1) loaded.bulkBytes = value;
         else if (sscanf(line, "byte_irq=%u", &value) == 1) loaded.byteIrq = value != 0U;
-        else if (sscanf(line, "load_model=%u", &value) == 1) currentLoadModel = value == 2U;
+        else if (sscanf(line, "load_model=%u", &value) == 1) currentLoadModel = value == 3U;
         else if (sscanf(line, "load_weight=%u", &value) == 1) loaded.threadLoadWeightPercent = value;
-        else if (sscanf(line, "load_min_cycles=%u", &value) == 1) loaded.threadLoadMinimumCycles = value;
-        else if (sscanf(line, "load_max_cycles=%u", &value) == 1) loaded.threadLoadMaximumCycles = value;
+        else if (sscanf(line, "load_min_ms=%u", &value) == 1) loaded.threadLoadMinimumMs = value;
+        else if (sscanf(line, "load_max_ms=%u", &value) == 1) loaded.threadLoadMaximumMs = value;
     }
     (void)fclose(file);
     if (!currentLoadModel || loaded.threadLoadWeightPercent > 100U ||
-        (loaded.threadLoadMaximumCycles != 0U &&
-         loaded.threadLoadMinimumCycles > loaded.threadLoadMaximumCycles)) {
+        (loaded.threadLoadMaximumMs != 0U &&
+         loaded.threadLoadMinimumMs > loaded.threadLoadMaximumMs)) {
         AppDashboardSettings_t defaults;
         AppClientPreferences_DefaultSettings(&defaults);
         loaded.threadLoadWeightPercent = defaults.threadLoadWeightPercent;
-        loaded.threadLoadMinimumCycles = defaults.threadLoadMinimumCycles;
-        loaded.threadLoadMaximumCycles = defaults.threadLoadMaximumCycles;
+        loaded.threadLoadMinimumMs = defaults.threadLoadMinimumMs;
+        loaded.threadLoadMaximumMs = defaults.threadLoadMaximumMs;
     }
     *settings = loaded;
     return true;
@@ -185,10 +185,10 @@ bool AppClientPreferences_SaveSettings(AppPreferencesScope_t scope,
     if (file == NULL) return false;
     const int written = fprintf(file,
         "clock=%u\nbaud=%u\nring=%u\ndma=%u\nbulk=%u\nbyte_irq=%u\n"
-        "load_model=2\nload_weight=%u\nload_min_cycles=%u\nload_max_cycles=%u\n",
+        "load_model=3\nload_weight=%u\nload_min_ms=%u\nload_max_ms=%u\n",
         settings->systemClockHz, settings->baud, settings->ringBytes,
         settings->dmaBytes, settings->bulkBytes, settings->byteIrq ? 1U : 0U,
-        settings->threadLoadWeightPercent, settings->threadLoadMinimumCycles,
-        settings->threadLoadMaximumCycles);
+        settings->threadLoadWeightPercent, settings->threadLoadMinimumMs,
+        settings->threadLoadMaximumMs);
     return fclose(file) == 0 && written > 0;
 }

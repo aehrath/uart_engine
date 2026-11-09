@@ -13,4 +13,8 @@ def available_ports() -> Iterable[tuple[str, str]]:
         from serial.tools import list_ports
     except ImportError:
         return []
-    return [(port.device, port.description) for port in list_ports.comports()]
+    ports = [(port.device, port.description) for port in list_ports.comports()]
+    import sys
+    if sys.platform == "win32":
+        ports.insert(0, ("Local Simulator", "Built-in driver-free local server"))
+    return ports

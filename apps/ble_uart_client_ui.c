@@ -172,19 +172,19 @@ static bool sendThreadLoadConfig(AppSerialPort_t *port, TrafficLog_t *log,
     const BleHciThreadLoadCommandParameters_t parameters = {
         .signature = {'L', 'O', 'A', 'D'},
         .weight_percent = (uint8_t)settings->threadLoadWeightPercent,
-        .minimum_cycles_le = BleHciWire_ToLe32(
-            settings->threadLoadMinimumCycles),
-        .maximum_cycles_le = BleHciWire_ToLe32(
-            settings->threadLoadMaximumCycles),
+        .minimum_busy_ms_le = BleHciWire_ToLe32(
+            settings->threadLoadMinimumMs),
+        .maximum_busy_ms_le = BleHciWire_ToLe32(
+            settings->threadLoadMaximumMs),
     };
     if (!sendCommand(port, log, BLE_HCI_THREAD_LOAD_OPCODE,
                      (const uint8_t *)&parameters, sizeof(parameters))) {
         return false;
     }
-    appendLog(log, "LOAD  Server busy weight %u%%, randomized %u..%u cycles",
+    appendLog(log, "LOAD  Server busy weight %u%%, randomized %u..%u ms",
               settings->threadLoadWeightPercent,
-              settings->threadLoadMinimumCycles,
-              settings->threadLoadMaximumCycles);
+              settings->threadLoadMinimumMs,
+              settings->threadLoadMaximumMs);
     return true;
 }
 
@@ -491,7 +491,7 @@ int main(void) {
         &producedSinceSample, &consumedSinceSample
     };
 #ifdef _WIN32
-    char portText[128] = "COM3";
+    char portText[128] = "Local Simulator";
 #elif defined(__APPLE__)
     char portText[128] = "/dev/ttys006";
 #else
@@ -541,16 +541,16 @@ int main(void) {
         .bulkBytes = (uint32_t)APP_DASHBOARD_BULK_SIZES[bulkSizeIndex].size,
         .byteIrq = savedSettings.byteIrq,
         .threadLoadWeightPercent = savedSettings.threadLoadWeightPercent,
-        .threadLoadMinimumCycles = savedSettings.threadLoadMinimumCycles,
-        .threadLoadMaximumCycles = savedSettings.threadLoadMaximumCycles,
+        .threadLoadMinimumMs = savedSettings.threadLoadMinimumMs,
+        .threadLoadMaximumMs = savedSettings.threadLoadMaximumMs,
     };
     char loadMinimumText[16];
     char loadMaximumText[16];
     char loadWeightText[4];
     (void)snprintf(loadMinimumText, sizeof(loadMinimumText), "%u",
-                   savedSettings.threadLoadMinimumCycles);
+                   savedSettings.threadLoadMinimumMs);
     (void)snprintf(loadMaximumText, sizeof(loadMaximumText), "%u",
-                   savedSettings.threadLoadMaximumCycles);
+                   savedSettings.threadLoadMaximumMs);
     (void)snprintf(loadWeightText, sizeof(loadWeightText), "%u",
                    savedSettings.threadLoadWeightPercent);
     bool loadMinimumEdit = false;
@@ -723,14 +723,14 @@ int main(void) {
         GuiLabel((Rectangle){44, 247, 50, 38}, "Port");
         AppDashboardUi_TextBox((Rectangle){96, 247, 310, 38}, portText,
                              sizeof(portText), &portEdit);
-        AppDashboardUi_DrawText("Busy", 414, 258, 11, COLOR_MUTED);
+        AppDashboardUi_DrawText("Busy ms", 410, 258, 10, COLOR_MUTED);
         AppDashboardUi_NumberField((Rectangle){452, 247, 110, 38}, loadMinimumText,
                                    sizeof(loadMinimumText), &loadMinimumEdit,
-                                   &loadMinimumDrag, 1000U, UINT32_MAX);
+                                   &loadMinimumDrag, 1U, UINT32_MAX);
         AppDashboardUi_DrawText("..", 568, 258, 12, COLOR_MUTED);
         AppDashboardUi_NumberField((Rectangle){584, 247, 110, 38}, loadMaximumText,
                                    sizeof(loadMaximumText), &loadMaximumEdit,
-                                   &loadMaximumDrag, 1000U, UINT32_MAX);
+                                   &loadMaximumDrag, 1U, UINT32_MAX);
         AppDashboardUi_DrawText("R%", 700, 258, 11, COLOR_MUTED);
         AppDashboardUi_NumberField((Rectangle){726, 247, 54, 38}, loadWeightText,
                                    sizeof(loadWeightText), &loadWeightEdit,
@@ -916,10 +916,18 @@ int main(void) {
             *minimumEnd == '\0' && minimumCandidate <= UINT32_MAX &&
             maximumEnd != loadMaximumText && *maximumEnd == '\0' &&
             maximumCandidate <= UINT32_MAX &&
-            minimumCandidate != savedSettings.threadLoadMinimumCycles &&
+            minimumCandidate != savedSettings.threadLoadMinimumMs &&
             minimumCandidate > maximumCandidate) {
             (void)snprintf(loadMaximumText, sizeof(loadMaximumText), "%u",
                            (uint32_t)minimumCandidate);
+        } else if (!loadMaximumEdit && minimumEnd != loadMinimumText &&
+                   *minimumEnd == '\0' && minimumCandidate <= UINT32_MAX &&
+                   maximumEnd != loadMaximumText && *maximumEnd == '\0' &&
+                   maximumCandidate <= UINT32_MAX &&
+                   maximumCandidate != savedSettings.threadLoadMaximumMs &&
+                   maximumCandidate < minimumCandidate) {
+            (void)snprintf(loadMinimumText, sizeof(loadMinimumText), "%u",
+                           (uint32_t)maximumCandidate);
         }
         const bool validLoad = AppDashboardConfig_ParseThreadLoad(
             loadMinimumText, loadMaximumText, loadWeightText,
@@ -927,12 +935,12 @@ int main(void) {
         const bool threadLoadChanged = validLoad && !loadMinimumEdit &&
             !loadMaximumEdit && !loadWeightEdit && !loadMinimumDrag.active &&
             !loadMaximumDrag.active && !loadWeightDrag.active &&
-            (loadMinimum != savedSettings.threadLoadMinimumCycles ||
-             loadMaximum != savedSettings.threadLoadMaximumCycles ||
+            (loadMinimum != savedSettings.threadLoadMinimumMs ||
+             loadMaximum != savedSettings.threadLoadMaximumMs ||
              loadWeight != savedSettings.threadLoadWeightPercent);
         if (threadLoadChanged) {
-            savedSettings.threadLoadMinimumCycles = loadMinimum;
-            savedSettings.threadLoadMaximumCycles = loadMaximum;
+            savedSettings.threadLoadMinimumMs = loadMinimum;
+            savedSettings.threadLoadMaximumMs = loadMaximum;
             savedSettings.threadLoadWeightPercent = loadWeight;
             threadLoadApplied = !connectionReady || sendThreadLoadConfig(
                 &serial, &log, &savedSettings);
@@ -981,9 +989,9 @@ int main(void) {
                 savedSettings.baud);
             appendLog(&log, "SETTINGS  Restored application defaults");
             (void)snprintf(loadMinimumText, sizeof(loadMinimumText), "%u",
-                           savedSettings.threadLoadMinimumCycles);
+                           savedSettings.threadLoadMinimumMs);
             (void)snprintf(loadMaximumText, sizeof(loadMaximumText), "%u",
-                           savedSettings.threadLoadMaximumCycles);
+                           savedSettings.threadLoadMaximumMs);
             (void)snprintf(loadWeightText, sizeof(loadWeightText), "%u",
                            savedSettings.threadLoadWeightPercent);
             threadLoadApplied = !connectionReady || sendThreadLoadConfig(
@@ -1000,8 +1008,8 @@ int main(void) {
                 .bulkBytes = (uint32_t)APP_DASHBOARD_BULK_SIZES[bulkSizeIndex].size,
                 .byteIrq = log.byteIrqMode,
                 .threadLoadWeightPercent = savedSettings.threadLoadWeightPercent,
-                .threadLoadMinimumCycles = savedSettings.threadLoadMinimumCycles,
-                .threadLoadMaximumCycles = savedSettings.threadLoadMaximumCycles,
+                .threadLoadMinimumMs = savedSettings.threadLoadMinimumMs,
+                .threadLoadMaximumMs = savedSettings.threadLoadMaximumMs,
             };
             (void)AppClientPreferences_SaveSettings(
                 APP_PREFERENCES_CLIENT, &savedSettings);
